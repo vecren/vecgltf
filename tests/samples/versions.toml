@@ -1,0 +1,12 @@
+repository = "https://github.com/KhronosGroup/glTF-Sample-Assets"
+commit = "edc7c9e67c639d230715049ee31f9a96a6babbbe"
+
+[[models]]
+file = "CesiumMan.glb"
+source = "Models/CesiumMan/glTF-Binary/CesiumMan.glb"
+license = "CesiumMan.LICENSE.md"
+
+[[models]]
+file = "AnimatedMorphCube.glb"
+source = "Models/AnimatedMorphCube/glTF-Binary/AnimatedMorphCube.glb"
+license = "AnimatedMorphCube.LICENSE.md"

@@ -1,0 +1,44 @@
+[package]
+name = "vecgltf"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vecgltf"
+module = "vecgltf"
+archive = "vecgltf"
+sources = ["src/lib.cppm", "src/Asset/Math.cppm", "src/Asset/Asset.cppm", "src/Load/Load.cppm", "src/Load/Load.cpp", "src/Load/External.cpp", "src/Scene/Scene.cppm", "src/Render/Render.cppm", "src/Render/Spirv.cppm", "src/Render/Textures.cppm", "src/Render/Environment.cppm"]
+
+[profile.base]
+exceptions = false
+rtti = false
+
+[dependencies]
+rstd-std = { version = "0.1.5", pub = true }
+rstd-nostd = { version = "0.1.5", usage = "link" }
+vrento = { version = "0.1.0", pub = true }
+lito-spirv = { version = "0.1.0" }
+
+[build-tools.glslang]
+path = "glslangValidator"
+
+[[test]]
+name = "vecgltf"
+module = "vecgltf.tests"
+sources = [
+  "tests/main.cppm",
+  "tests/output.cppm",
+  "tests/asset.cppm",
+  "tests/scene.cppm",
+  "tests/render.cppm",
+  "tests/controls.cppm",
+  "tests/window.cppm",
+  "examples/viewer/panel.cppm",
+  "examples/viewer/model.cppm",
+]
+
+[dev-dependencies]
+rstd-test = { version = "0.1.5" }
+vui-render = { version = "0.1.0" }
+vui-sdl = { version = "0.1.0" }
+vui-controls = { version = "0.1.0" }

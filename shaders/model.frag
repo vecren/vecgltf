@@ -1,0 +1,101 @@
+#version 450
+layout(location=0) in vec3 world_normal;
+layout(location=1) in vec4 vertex_color;
+layout(location=2) in vec3 world_position;
+layout(location=3) in vec4 world_tangent;
+layout(location=4) in vec2 texcoord0;
+layout(location=5) in vec2 texcoord1;
+layout(location=6) flat in float winding;
+layout(location=0) out vec4 result;
+layout(set=0,binding=0) uniform Frame {vec4 eye;vec4 options;mat4 inverse_view_projection;} frame;
+layout(set=0,binding=1) uniform sampler2D specular_environment;
+layout(set=0,binding=2) uniform sampler2D diffuse_environment;
+layout(set=0,binding=3) uniform sampler2D brdf_lut;
+layout(set=1,binding=0) uniform sampler2D base_texture;
+layout(set=1,binding=1) uniform sampler2D physical_texture;
+layout(set=1,binding=2) uniform sampler2D normal_texture;
+layout(set=1,binding=3) uniform sampler2D occlusion_texture;
+layout(set=1,binding=4) uniform sampler2D emissive_texture;
+layout(set=1,binding=5) uniform Material {
+    vec4 base;
+    vec4 emissive;
+    vec4 factors;
+    vec4 flags;
+    vec4 offset_scale[5];
+    vec4 rotation_uv[5];
+} material;
+const float pi=3.14159265359;
+vec2 uv(int index) {
+    vec4 transform=material.offset_scale[index];
+    vec4 rotation=material.rotation_uv[index];
+    vec2 coord=(rotation.z<0.5 ? texcoord0:texcoord1)*transform.zw;
+    return transform.xy+mat2(rotation.x,rotation.y,-rotation.y,rotation.x)*coord;
+}
+vec3 mapped_normal(vec3 normal) {
+    if(material.rotation_uv[2].w==0) return normal;
+    vec3 map=texture(normal_texture,uv(2)).xyz*2-1;
+    map.xy*=material.factors.z;
+    vec3 tangent,bitangent;
+    if(material.rotation_uv[2].z==0 && material.rotation_uv[2].x==1 && all(equal(material.offset_scale[2].zw,vec2(1)))) {
+        tangent=normalize(world_tangent.xyz-normal*dot(normal,world_tangent.xyz));
+        bitangent=cross(normal,tangent)*world_tangent.w;
+    } else {
+        vec3 dp1=dFdx(world_position),dp2=dFdy(world_position);
+        vec2 duv1=dFdx(uv(2)),duv2=dFdy(uv(2));
+        float determinant=duv1.x*duv2.y-duv1.y*duv2.x;
+        if(abs(determinant)<1e-12) return normal;
+        tangent=normalize((dp1*duv2.y-dp2*duv1.y)/determinant);
+        tangent=normalize(tangent-normal*dot(normal,tangent));
+        bitangent=normalize((dp2*duv1.x-dp1*duv2.x)/determinant);
+        bitangent=normalize(bitangent-normal*dot(normal,bitangent)-tangent*dot(tangent,bitangent));
+    }
+    return normalize(mat3(tangent,bitangent,normal)*map);
+}
+vec2 environment_uv(vec3 direction) {
+    return vec2(atan(direction.z,direction.x)/(2*pi)+0.5,acos(clamp(direction.y,-1,1))/pi);
+}
+vec3 tone_map(vec3 color) {
+    color*=frame.options.x;
+    return clamp((color*(2.51*color+0.03))/(color*(2.43*color+0.59)+0.14),0,1);
+}
+void main() {
+    bool front=gl_FrontFacing!=(winding<0);
+    if(!front && material.flags.z==0) discard;
+    vec4 base=material.base*vertex_color*texture(base_texture,uv(0));
+    if(material.flags.x==1 && base.a<material.flags.y) discard;
+    float alpha=material.flags.x==2 ? base.a:1;
+    int debug_view=int(frame.options.y);
+    if(debug_view==1) {result=vec4(base.rgb,alpha);return;}
+    if(material.flags.w!=0 && debug_view==0) { result=vec4(tone_map(base.rgb),alpha);return; }
+    vec3 n=mapped_normal(normalize(world_normal));
+    if(!front) n=-n;
+    vec3 v=normalize(frame.eye.xyz-world_position);
+    vec3 l=normalize(vec3(0.3,0.7,1));
+    vec3 h=normalize(v+l);
+    vec4 physical=texture(physical_texture,uv(1));
+    float metallic=clamp(material.factors.x*physical.b,0,1);
+    float roughness=clamp(material.factors.y*physical.g,0.04,1);
+    float nl=max(dot(n,l),0),nv=max(dot(n,v),0.001),nh=max(dot(n,h),0),vh=max(dot(v,h),0);
+    vec3 f0=mix(vec3(0.04),base.rgb,metallic);
+    vec3 fresnel=f0+(1-f0)*pow(1-vh,5);
+    float a=roughness*roughness,a2=a*a;
+    float denom=nh*nh*(a2-1)+1;
+    float distribution=a2/(pi*denom*denom);
+    float visibility=0.5/max(nl*sqrt(nv*nv*(1-a2)+a2)+nv*sqrt(nl*nl*(1-a2)+a2),0.0001);
+    vec3 diffuse=(1-fresnel)*(1-metallic)*base.rgb/pi;
+    vec3 color=(diffuse+distribution*visibility*fresnel)*nl*3;
+    float occlusion=mix(1,texture(occlusion_texture,uv(3)).r,material.factors.w);
+    vec3 reflected=reflect(-v,n);
+    vec3 irradiance=texture(diffuse_environment,environment_uv(n)).rgb;
+    vec3 prefiltered=textureLod(specular_environment,environment_uv(reflected),roughness*frame.options.w).rgb;
+    vec2 integrated=texture(brdf_lut,vec2(nv,roughness)).rg;
+    vec3 ambient_fresnel=f0+(max(vec3(1-roughness),f0)-f0)*pow(1-nv,5);
+    color+=((1-ambient_fresnel)*(1-metallic)*base.rgb*irradiance+prefiltered*(f0*integrated.x+integrated.y))*occlusion;
+    color+=material.emissive.rgb*texture(emissive_texture,uv(4)).rgb;
+    if(debug_view==1) color=base.rgb;
+    if(debug_view==2) color=n*0.5+0.5;
+    if(debug_view==3) color=vec3(metallic);
+    if(debug_view==4) color=vec3(roughness);
+    if(debug_view==5) color=material.emissive.rgb*texture(emissive_texture,uv(4)).rgb;
+    result=vec4(debug_view==0 ? tone_map(color):color,alpha);
+}
