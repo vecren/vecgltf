@@ -39,6 +39,7 @@ sources = [
 
 [dev-dependencies]
 rstd-test = { version = "0.1.5" }
+rstd-log = { version = "0.1.5" }
 vui-render = { version = "0.1.0" }
 vui-sdl = { version = "0.1.0" }
 vui-controls = { version = "0.1.0" }

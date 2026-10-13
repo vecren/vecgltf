@@ -31,18 +31,22 @@ struct RenderCore {
   vk::DeviceSession session;
   vk::BufferManager buffers;
   Option<vk::TextureContext> image_device;
-  registry::DescriptorLayoutRegistry descriptor_layouts;
+  registry::DescriptorLayoutRegistry &descriptor_layouts;
   registry::DescriptorSystem descriptors;
   res::DescriptorLayoutHandle frame_layout, material_layout, storage_layout;
   Option<vk::BufferAllocation> frame_buffer, zero_buffer;
-  vvk::RenderPass pass;
-  vvk::PipelineLayout layout;
-  vk::PipelineParameters pipeline;
-  vk::PipelineParameters transparent, background;
+  Option<registry::PipelineLayoutResult> layout;
+  Vec<res::PipelineRecipeHandle> recipes;
+  vk::GraphicsScopeCache scopes;
   bool recording{};
   explicit RenderCore(vk::DeviceSession device)
       : session(rstd::move(device)), buffers(session.device()),
-        image_device(None()) {}
+        image_device(None()),
+        descriptor_layouts(session.graphics_resources().descriptors) {}
+  ~RenderCore() {
+    for (const auto &recipe : recipes)
+      session.graphics_resources().pipelines.ReleaseRecipe(recipe);
+  }
 };
 struct PreparedPrimitive {
   vk::BufferAllocation vertices;
@@ -94,15 +98,28 @@ struct PreparedData {
   PreparedData(Arc<RenderCore> owner, Arc<Asset> source)
       : core(rstd::move(owner)), asset(rstd::move(source)) {}
 };
+struct DrawConstants {
+  Mat4 mvp;
+  Vec4 model[3];
+  unsigned skin_offset{}, weight_offset{}, morph_count{}, vertex_count{};
+};
+static_assert(sizeof(DrawConstants) == 128);
+
+struct ModelDraw {
+  unsigned mesh{}, primitive{}, material{};
+  DrawConstants constants;
+  bool transparent{};
+};
 struct RenderInputs {
   Arc<PreparedData> prepared;
   vrento::texture::TextureViewRef depth;
   vrento::texture::SubmissionReceipt receipt;
   Option<Arc<PreparedEnvironment>> environment;
   Option<vk::BufferUploadBatchLease> uploads;
+  Vec<ModelDraw> draws;
+  bool background{};
   Option<vk::BufferAllocation> poses;
   Option<registry::PreparedDescriptorBinding> pose_binding;
-  vvk::Framebuffer framebuffer;
   RenderInputs(Arc<PreparedData> source,
                vrento::texture::TextureViewRef depth_view,
                vrento::texture::SubmissionReceipt submission)
@@ -118,13 +135,6 @@ struct RenderInputs {
     prepared->core->recording = false;
   }
 };
-struct DrawConstants {
-  Mat4 mvp;
-  Vec4 model[3];
-  unsigned skin_offset{}, weight_offset{}, morph_count{}, vertex_count{};
-};
-static_assert(sizeof(DrawConstants) == 128);
-
 template <rstd::size_t N>
 auto shader(const unsigned (&code)[N], vrento::ShaderType stage)
     -> vk::Uni_ShaderSpv {
@@ -142,52 +152,6 @@ bool initialize(RenderCore &core) {
   if (image_device.is_err())
     return false;
   core.image_device = Some(image_device.unwrap());
-  const auto &device = core.session.device().handle();
-  VkAttachmentDescription attachments[2]{};
-  attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
-  attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-  attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attachments[0].initialLayout = attachments[0].finalLayout =
-      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  attachments[1].format = VK_FORMAT_D32_SFLOAT;
-  attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-  attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-  for (auto &attachment : attachments) {
-    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  }
-  VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-  VkAttachmentReference depth{1,
-                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-  VkSubpassDescription subpass{};
-  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  subpass.colorAttachmentCount = 1;
-  subpass.pColorAttachments = &color;
-  subpass.pDepthStencilAttachment = &depth;
-  VkSubpassDependency dependency{};
-  dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-  dependency.dstSubpass = 0;
-  dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-  dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-  dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-  VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-  pass.attachmentCount = 2;
-  pass.pAttachments = attachments;
-  pass.subpassCount = 1;
-  pass.pSubpasses = &subpass;
-  pass.dependencyCount = 1;
-  pass.pDependencies = &dependency;
-  if (core.session.observe_result(device.CreateRenderPass(pass, core.pass)) !=
-      VK_SUCCESS)
-    return false;
   vk::DescriptorSetInfo frame_info, material_info;
   frame_info.bindings.push({0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                             VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
@@ -216,27 +180,50 @@ bool initialize(RenderCore &core) {
   if (storage_layout.is_err())
     return false;
   core.storage_layout = storage_layout.unwrap();
-  VkDescriptorSetLayout layouts[]{
-      *(**core.descriptor_layouts.Resolve(core.frame_layout)).layout,
-      *(**core.descriptor_layouts.Resolve(core.material_layout)).layout,
-      *(**core.descriptor_layouts.Resolve(core.storage_layout)).layout,
-      *(**core.descriptor_layouts.Resolve(core.storage_layout)).layout};
-  VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0,
-                            sizeof(DrawConstants)};
-  VkPipelineLayoutCreateInfo layout{
-      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-  layout.pushConstantRangeCount = 1;
-  layout.pPushConstantRanges = &range;
-  layout.setLayoutCount = 4;
-  layout.pSetLayouts = layouts;
-  if (core.session.observe_result(
-          device.CreatePipelineLayout(layout, core.layout)) != VK_SUCCESS)
+  registry::PipelineLayoutRequest layout_request;
+  layout_request.descriptor_sets.push(frame_info.clone());
+  layout_request.descriptor_sets.push(material_info.clone());
+  layout_request.descriptor_sets.push(storage.clone());
+  layout_request.descriptor_sets.push(storage.clone());
+  layout_request.push_constants.push(
+      {VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawConstants)});
+  auto &graphics = core.session.graphics_resources();
+  auto layout = graphics.layouts.Ensure(core.session.device(), layout_request,
+                                        core.descriptor_layouts);
+  if (layout.is_err())
     return false;
-  vk::GraphicsPipeline pipeline;
-  pipeline.setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+  core.layout = Some(layout.unwrap());
+  vk::GraphicsPipeline defaults;
+  vk::PipelineResourceRequest pipeline;
+  pipeline.pipeline_layout = core.layout->handle;
+  pipeline.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  pipeline.depth = defaults.depth;
+  pipeline.raster = defaults.raster;
+  pipeline.multisample = defaults.multisample;
   pipeline.depth.depthTestEnable = VK_TRUE;
   pipeline.depth.depthWriteEnable = VK_TRUE;
   pipeline.depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+  pipeline.has_depth_attachment = true;
+  pipeline.color_initial_layout = pipeline.color_final_layout =
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  pipeline.depth_initial_layout = pipeline.depth_final_layout =
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  pipeline.color_load_op = pipeline.depth_load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  pipeline.color_blend.colorWriteMask = 15;
+  auto add = [&](vk::PipelineResourceRequest value) {
+    auto signature = vk::MakeRenderPassResourceDesc(value);
+    auto recipe =
+        graphics.pipelines.RegisterRecipe(rstd::move(value), graphics.layouts);
+    if (recipe.is_none())
+      return false;
+    auto ready = graphics.pipelines.EnsureRecipe(core.session.device(), *recipe,
+                                                 signature, graphics.passes,
+                                                 graphics.layouts);
+    if (ready.is_none())
+      return false;
+    core.recipes.push(rstd::move(recipe).unwrap());
+    return true;
+  };
   VkVertexInputBindingDescription binding{0, sizeof(Vertex),
                                           VK_VERTEX_INPUT_RATE_VERTEX};
   VkVertexInputAttributeDescription attributes[]{
@@ -250,18 +237,14 @@ bool initialize(RenderCore &core) {
       {6, 0, VK_FORMAT_R32G32B32A32_UINT, __builtin_offsetof(Vertex, joints)},
       {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
        __builtin_offsetof(Vertex, weights)}};
-  pipeline.addInputBindingDescription(
-      slice<VkVertexInputBindingDescription>::from_raw_parts(&binding,
-                                                             usize(1)));
-  pipeline.addInputAttributeDescription(
-      slice<VkVertexInputAttributeDescription>::from_raw_parts(attributes,
-                                                               usize(8)));
-  pipeline.addStage(
+  pipeline.vertex_bindings.push(VkVertexInputBindingDescription(binding));
+  for (const auto &attribute : attributes)
+    pipeline.vertex_attrs.push(VkVertexInputAttributeDescription(attribute));
+  pipeline.shader_stages.push(
       shader(shaders::model_vertex.words, vrento::ShaderType::VERTEX));
-  pipeline.addStage(
+  pipeline.shader_stages.push(
       shader(shaders::model_fragment.words, vrento::ShaderType::FRAGMENT));
-  if (!pipeline.create(core.session.device(), *core.pass, *core.layout,
-                       core.pipeline))
+  if (!add(pipeline.clone()))
     return false;
   VkPipelineColorBlendAttachmentState blend{};
   blend.blendEnable = VK_TRUE;
@@ -272,12 +255,9 @@ bool initialize(RenderCore &core) {
   blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
   blend.alphaBlendOp = VK_BLEND_OP_ADD;
   blend.colorWriteMask = 15;
-  pipeline.setColorBlendStates(
-      slice<VkPipelineColorBlendAttachmentState>::from_raw_parts(&blend,
-                                                                 usize(1)));
+  pipeline.color_blend = blend;
   pipeline.depth.depthWriteEnable = VK_FALSE;
-  if (!pipeline.create(core.session.device(), *core.pass, *core.layout,
-                       core.transparent))
+  if (!add(rstd::move(pipeline)))
     return false;
   core.frame_buffer = core.buffers.Allocate(
       {sizeof(FrameParameters),
@@ -297,14 +277,23 @@ bool initialize(RenderCore &core) {
                           usize(sizeof(zero))))
           .is_none())
     return false;
-  vk::GraphicsPipeline background;
-  background.setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-  background.addStage(
+  vk::PipelineResourceRequest background;
+  background.pipeline_layout = core.layout->handle;
+  background.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  background.depth = defaults.depth;
+  background.raster = defaults.raster;
+  background.multisample = defaults.multisample;
+  background.has_depth_attachment = true;
+  background.color_blend.colorWriteMask = 15;
+  background.color_initial_layout = background.color_final_layout =
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  background.depth_initial_layout = background.depth_final_layout =
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  background.shader_stages.push(
       shader(shaders::background_vertex.words, vrento::ShaderType::VERTEX));
-  background.addStage(
+  background.shader_stages.push(
       shader(shaders::background_fragment.words, vrento::ShaderType::FRAGMENT));
-  if (!background.create(core.session.device(), *core.pass, *core.layout,
-                         core.background))
+  if (!add(rstd::move(background)))
     return false;
   return true;
 }
@@ -326,6 +315,121 @@ auto bind_storage(RenderCore &core, const vk::BufferAllocation &buffer,
   return Ok(result.unwrap());
 }
 
+constexpr vrento::rg::GraphSerial model_kind = 0x5647434c54464401ull;
+struct ModelPrepared {
+  Arc<RenderInputs> inputs;
+  Vec<registry::PipelineResourceResult> pipelines;
+  auto Record(vk::GraphRecordContext &context) const
+      -> Result<empty, vk::GraphExecutionError> {
+    auto &core = *inputs->prepared->core;
+    auto native = vk::native_recording(context.submission, core.session);
+    if (native.is_err())
+      return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Record,
+                                         {},
+                                         {},
+                                         VK_SUCCESS,
+                                         Some(native.unwrap_err())});
+    auto cmd = native.unwrap();
+    const auto &d = core.session.device().handle().Dispatch();
+    vvk::CommandBuffer command(cmd, d);
+    auto layout = *core.layout->physical->layout;
+    registry::DescriptorBindingRecordState binding_state;
+    (*inputs->environment)->descriptor->Record(command, layout, binding_state);
+    if (inputs->background) {
+      d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          *pipelines[usize(2)].pipeline->pipeline.handle);
+      d.vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+    inputs->pose_binding->Record(command, layout, binding_state);
+    for (const auto &draw : inputs->draws) {
+      const auto &gpu = at(at(inputs->prepared->meshes, draw.mesh).primitives,
+                           draw.primitive);
+      d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          *pipelines[usize(draw.transparent ? 1 : 0)]
+                               .pipeline->pipeline.handle);
+      at(inputs->prepared->materials, draw.material)
+          .descriptor.Record(command, layout, binding_state);
+      gpu.morph_binding->Record(command, layout, binding_state);
+      d.vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(draw.constants), &draw.constants);
+      auto buffer = gpu.vertices.buffer();
+      auto offset = gpu.vertices.offset();
+      d.vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
+      if (gpu.indices) {
+        d.vkCmdBindIndexBuffer(cmd, gpu.indices->buffer(),
+                               gpu.indices->offset(), VK_INDEX_TYPE_UINT32);
+        d.vkCmdDrawIndexed(cmd, gpu.index_count, 1, 0, 0, 0);
+      } else
+        d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
+    }
+    return Ok(empty{});
+  }
+};
+struct ModelBackend {
+  Arc<RenderInputs> inputs;
+  auto Prepare(const vrento::rg::PassDescription &,
+               const vk::GraphPrepareContext &context)
+      -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError>;
+};
+struct ModelScopes {
+  Arc<RenderCore> core;
+  auto Prepare(const vrento::rg::GraphicsDescription &description,
+               const vk::GraphPrepareContext &context)
+      -> Result<Arc<dyn<vk::PreparedGraphicsScope>>, vk::GraphExecutionError> {
+    return core->scopes.Prepare(description, context);
+  }
+};
+} // namespace vecgltf
+
+namespace rstd {
+template <>
+struct Impl<vrento::vulkan::PreparedVulkanPass, vecgltf::ModelPrepared>
+    : ImplBase<vecgltf::ModelPrepared> {
+  auto Record(vrento::vulkan::GraphRecordContext &context) const
+      -> Result<empty, vrento::vulkan::GraphExecutionError> {
+    return self().Record(context);
+  }
+};
+template <>
+struct Impl<vrento::vulkan::VulkanPassBackend, vecgltf::ModelBackend>
+    : ImplBase<vecgltf::ModelBackend> {
+  auto Prepare(const vrento::rg::PassDescription &pass,
+               const vrento::vulkan::GraphPrepareContext &context)
+      -> Result<sync::Arc<dyn<vrento::vulkan::PreparedVulkanPass>>,
+                vrento::vulkan::GraphExecutionError> {
+    return self().Prepare(pass, context);
+  }
+};
+template <>
+struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
+    : ImplBase<vecgltf::ModelScopes> {
+  auto Prepare(const vrento::rg::GraphicsDescription &description,
+               const vrento::vulkan::GraphPrepareContext &context)
+      -> Result<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>,
+                vrento::vulkan::GraphExecutionError> {
+    return self().Prepare(description, context);
+  }
+};
+} // namespace rstd
+namespace vecgltf {
+auto ModelBackend::Prepare(const vrento::rg::PassDescription &pass,
+                           const vk::GraphPrepareContext &context)
+    -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError> {
+  if (!pass.parameters.is_empty() || !context.scope)
+    return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Schema});
+  auto &graphics = context.session.graphics_resources();
+  Vec<registry::PipelineResourceResult> pipelines;
+  for (const auto &recipe : inputs->prepared->core->recipes) {
+    auto prepared = graphics.pipelines.EnsureRecipe(
+        context.session.device(), recipe, (*context.scope)->Info().signature,
+        graphics.passes, graphics.layouts);
+    if (!prepared)
+      return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
+    pipelines.push(rstd::move(prepared).unwrap());
+  }
+  return Ok(Arc<dyn<vk::PreparedVulkanPass>>::make(
+      ModelPrepared{inputs.clone(), rstd::move(pipelines)}));
+}
 } // namespace vecgltf
 
 export namespace vecgltf {
@@ -334,6 +438,12 @@ struct RenderOptions {
   float exposure{1};
   DebugView debug{};
   bool background{};
+};
+struct RenderTarget {
+  vrento::texture::TextureViewRef color;
+  Option<vrento::texture::TextureViewRef> depth;
+  vrento::rg::AttachmentLoad color_load{vrento::rg::AttachmentLoad::Clear};
+  vrento::rg::AttachmentLoad depth_load{vrento::rg::AttachmentLoad::Clear};
 };
 class PreparedAsset {
   friend class Renderer;
@@ -416,11 +526,12 @@ public:
         !add(rstd::move(background)))
       return Err(render_error("environment"_str, "image upload failed"_str));
     registry::DescriptorImageBinding images[4];
-    for (unsigned i = 0; i < 4; ++i)
-      images[i] = {i + 1,
-                   vk::sampled_image(at(environment->textures, i)->view,
-                                     at(environment->textures, i)->sampler)
-                       .unwrap()};
+    for (unsigned i = 0; i < 4; ++i) {
+      auto sampled = vk::sampled_image(at(environment->textures, i)->view,
+                                       at(environment->textures, i)->sampler)
+                         .unwrap();
+      images[i] = {i + 1, sampled.image, sampled.layout};
+    }
     registry::DescriptorBufferBinding frame{0, core_->frame_buffer->buffer(),
                                             core_->frame_buffer->offset(),
                                             sizeof(FrameParameters)};
@@ -524,8 +635,8 @@ public:
         if (image.is_none())
           return Err(render_error("prepare texture"_str,
                                   "image allocation or upload failed"_str));
-        images[i] = {i,
-                     vk::sampled_image(image->view, image->sampler).unwrap()};
+        auto sampled = vk::sampled_image(image->view, image->sampler).unwrap();
+        images[i] = {i, sampled.image, sampled.layout};
       }
       auto buffer = upload(&parameters, sizeof(parameters),
                            vk::BufferUploadClass::Uniform);
@@ -627,6 +738,14 @@ public:
               const PreparedAsset &prepared, const SceneInstance &instance,
               const View &view, RenderOptions options = {})
       -> Result<empty, Error> {
+    return record(work, RenderTarget{rstd::move(target)}, prepared, instance,
+                  view, options);
+  }
+  auto record(vrento::texture::Submission &work, RenderTarget destination,
+              const PreparedAsset &prepared, const SceneInstance &instance,
+              const View &view, RenderOptions options = {})
+      -> Result<empty, Error> {
+    auto target = destination.color;
     if (!target.valid() || &*prepared.data_->core != &*core_ ||
         prepared.generation() != instance.asset().generation)
       return Err(render_error("render"_str,
@@ -637,28 +756,26 @@ public:
                               ErrorKind::Busy));
     const auto &target_desc = target.texture().description();
     auto range = target.description().range;
-    if (target_desc.format != vrento::TextureFormat::RGBA8 ||
-        range.mip_count != 1 || range.layer_count != 1)
+    if ((target_desc.format != vrento::TextureFormat::RGBA8 &&
+         target_desc.format != vrento::TextureFormat::RGBA8_SRGB) ||
+        target_desc.samples != 1 || range.mip_count != 1 ||
+        range.layer_count != 1)
       return Err(render_error("record"_str, "unsupported target view"_str));
     auto size = vrento::texture::mip_extent(target_desc, range.first_mip);
-    auto resized = resize({size.width, size.height});
-    if (resized.is_err())
-      return resized;
-    auto access = work.commands()->UseTexture(
-        {target, vrento::texture::Access::ColorAttachment,
-         vrento::texture::Stages::Color, true});
-    if (access.is_err())
-      return Err(texture_error(access.unwrap_err()));
+    if (destination.depth.is_none()) {
+      auto resized = resize({size.width, size.height});
+      if (resized.is_err())
+        return resized;
+    }
+    auto depth = destination.depth ? *destination.depth : *depth_;
     auto native_command = vk::native_recording(work, core_->session);
     if (native_command.is_err())
       return Err(texture_error(native_command.unwrap_err()));
     auto command_buffer = native_command.unwrap();
-    auto target_view = vk::native_view(target);
-    if (target_view.is_err())
-      return Err(texture_error(target_view.unwrap_err()));
-    auto inputs = Box<RenderInputs>::make(prepared.data_.clone(), *depth_,
-                                          work.receipt());
+    auto inputs =
+        Arc<RenderInputs>::make(prepared.data_.clone(), depth, work.receipt());
     inputs->environment = Some(environment_->clone());
+    inputs->background = options.background;
     struct PoseOffsets {
       unsigned skin{invalid_index}, weights{};
     };
@@ -708,26 +825,7 @@ public:
     if (pose_binding.is_err())
       return Err(pose_binding.unwrap_err());
     inputs->pose_binding = Some(pose_binding.unwrap());
-    auto depth_access = work.commands()->UseTexture(
-        {*depth_, vrento::texture::Access::DepthAttachment,
-         vrento::texture::Stages::Depth, true});
-    if (depth_access.is_err())
-      return Err(texture_error(depth_access.unwrap_err()));
-    VkImageView attachments[]{target_view.unwrap(),
-                              vk::native_view(*depth_).unwrap()};
-    VkFramebufferCreateInfo framebuffer{
-        VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    framebuffer.renderPass = *core_->pass;
-    framebuffer.attachmentCount = 2;
-    framebuffer.pAttachments = attachments;
-    framebuffer.width = extent_.width;
-    framebuffer.height = extent_.height;
-    framebuffer.layers = 1;
-    const auto &device = core_->session.device().handle();
-    const auto &d = device.Dispatch();
-    if (core_->session.observe_result(device.CreateFramebuffer(
-            framebuffer, inputs->framebuffer)) != VK_SUCCESS)
-      return Err(render_error("render"_str, "framebuffer creation failed"_str));
+    const auto &d = core_->session.device().handle().Dispatch();
     vvk::CommandBuffer command(command_buffer, d);
     FrameParameters frame_parameters{
         {view.eye.x, view.eye.y, view.eye.z, 1},
@@ -777,29 +875,6 @@ public:
       if (result.is_err())
         return result;
     }
-    VkClearValue clear[2]{};
-    clear[1].depthStencil = {1, 0};
-    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    begin.renderPass = *core_->pass;
-    begin.framebuffer = *inputs->framebuffer;
-    begin.renderArea = {{0, 0}, extent_};
-    begin.clearValueCount = 2;
-    begin.pClearValues = clear;
-    auto cmd = command_buffer;
-    d.vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport viewport{0, 0, float(extent_.width), float(extent_.height),
-                        0, 1};
-    VkRect2D scissor{{0, 0}, extent_};
-    d.vkCmdSetViewport(cmd, 0, 1, &viewport);
-    d.vkCmdSetScissor(cmd, 0, 1, &scissor);
-    registry::DescriptorBindingRecordState binding_state;
-    (*environment_)->descriptor->Record(command, *core_->layout, binding_state);
-    if (options.background) {
-      d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          *core_->background.handle);
-      d.vkCmdDraw(cmd, 3, 1, 0, 0);
-    }
-    inputs->pose_binding->Record(command, *core_->layout, binding_state);
     const auto &asset = instance.asset();
     struct Draw {
       unsigned node{}, primitive{};
@@ -842,35 +917,140 @@ public:
                                 world.m[8 + row], world.m[12 + row]};
       const auto &primitive = at(mesh.primitives, p);
       const auto &gpu = at(gpu_mesh.primitives, p);
-      d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          draw.transparent ? *core_->transparent.handle
-                                           : *core_->pipeline.handle);
-      at(prepared.data_->materials, primitive.material)
-          .descriptor.Record(command, *core_->layout, binding_state);
-      gpu.morph_binding->Record(command, *core_->layout, binding_state);
       constants.skin_offset = at(pose_offsets, n).skin;
       constants.weight_offset = at(pose_offsets, n).weights;
       constants.morph_count = unsigned(count(primitive.morphs));
       constants.vertex_count = gpu.vertex_count;
-      d.vkCmdPushConstants(cmd, *core_->layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(constants), &constants);
-      auto buffer = gpu.vertices.buffer();
-      auto offset = gpu.vertices.offset();
-      d.vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
-      if (gpu.indices) {
-        d.vkCmdBindIndexBuffer(cmd, gpu.indices->buffer(),
-                               gpu.indices->offset(), VK_INDEX_TYPE_UINT32);
-        d.vkCmdDrawIndexed(cmd, gpu.index_count, 1, 0, 0, 0);
-      } else
-        d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
+      inputs->draws.push(
+          {mesh_index, p, primitive.material, constants, draw.transparent});
     }
-    d.vkCmdEndRenderPass(cmd);
+    vrento::rg::PassDescription pass;
+    pass.id = {1};
+    pass.kind = model_kind;
+    vk::GraphBindings bindings(1);
+    Vec<vrento::texture::TextureViewRef> references;
+    auto bind = [&](vrento::texture::TextureViewRef view) {
+      for (usize i{}; i < references.len(); ++i)
+        if (references[i].texture().identity() == view.texture().identity() &&
+            references[i].description() == view.description())
+          return vrento::rg::ResourceId{i.to_primitive() + 1, 1};
+      vrento::rg::ResourceId id{references.len().to_primitive() + 1, 1};
+      bindings
+          .bind(id,
+                Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view)))
+          .unwrap();
+      references.push(rstd::move(view));
+      return id;
+    };
+    auto color_id = bind(target), depth_id = bind(depth);
+    auto attachment = [&](vrento::rg::ResourceId id,
+                          vrento::rg::GraphUsage usage,
+                          vrento::rg::GraphStage stages,
+                          vrento::rg::AttachmentLoad load, unsigned aspect) {
+      vrento::rg::ResourceUse use{id, 1, vrento::rg::GraphAccess::Write, usage,
+                                  stages};
+      use.range.aspect = aspect;
+      if (load == vrento::rg::AttachmentLoad::Load) {
+        auto read = use;
+        read.version = 0;
+        read.access = vrento::rg::GraphAccess::Read;
+        pass.uses.push(rstd::move(read));
+      }
+      pass.uses.push(rstd::move(use));
+    };
+    attachment(color_id, vrento::rg::GraphUsage::ColorAttachment,
+               vrento::rg::GraphStage::Color, destination.color_load, 1);
+    attachment(depth_id, vrento::rg::GraphUsage::DepthAttachment,
+               vrento::rg::GraphStage::Depth, destination.depth_load, 2);
+    vrento::rg::GraphicsDescription graphics;
+    graphics.color =
+        Some(vrento::rg::GraphAttachment{color_id, 1, destination.color_load});
+    graphics.depth =
+        Some(vrento::rg::GraphAttachment{depth_id, 1, destination.depth_load});
+    graphics.depth->clear[usize()] = 1;
+    pass.graphics = Some(graphics);
+    auto sampled_use = [&](const vrento::texture::TextureViewRef &view) {
+      auto id = bind(view);
+      for (const auto &use : pass.uses)
+        if (use.resource == id)
+          return;
+      vrento::rg::ResourceUse use{id, 0, vrento::rg::GraphAccess::Read,
+                                  vrento::rg::GraphUsage::Sampled,
+                                  vrento::rg::GraphStage::Fragment};
+      const auto range = view.description().range;
+      use.range.mip_count = range.mip_count;
+      use.range.layer_count = range.layer_count;
+      pass.uses.push(rstd::move(use));
+    };
+    for (const auto &source : prepared.data_->images)
+      sampled_use(source.source->view);
+    for (const auto &source : (*environment_)->textures)
+      sampled_use(source->view);
+    Vec<rstd::uint64_t> allocations;
+    auto next_binding = references.len().to_primitive() + 1;
+    auto buffer_use = [&](const vk::BufferAllocation &allocation,
+                          vrento::rg::GraphUsage usage,
+                          vrento::rg::GraphStage stages) {
+      for (auto identity : allocations)
+        if (identity == allocation.identity())
+          return;
+      allocations.push(rstd::uint64_t(allocation.identity()));
+      vrento::rg::ResourceId id{next_binding++, 1};
+      bindings
+          .bind(id,
+                Arc<dyn<vk::GraphBinding>>::make(vk::GraphUploadedBufferBinding(
+                    core_->session, allocation.clone())))
+          .unwrap();
+      vrento::rg::ResourceUse use{id, 0, vrento::rg::GraphAccess::Read, usage,
+                                  stages};
+      use.range.size = allocation.size();
+      pass.uses.push(rstd::move(use));
+    };
+    buffer_use(*core_->frame_buffer, vrento::rg::GraphUsage::Uniform,
+               vrento::rg::GraphStage::Fragment);
+    buffer_use(*core_->zero_buffer, vrento::rg::GraphUsage::Storage,
+               vrento::rg::GraphStage::Vertex);
+    buffer_use(*inputs->poses, vrento::rg::GraphUsage::Storage,
+               vrento::rg::GraphStage::Vertex);
+    for (const auto &material : prepared.data_->materials)
+      buffer_use(material.parameters, vrento::rg::GraphUsage::Uniform,
+                 vrento::rg::GraphStage::Fragment);
+    for (const auto &mesh : prepared.data_->meshes)
+      for (const auto &primitive : mesh.primitives) {
+        buffer_use(primitive.vertices, vrento::rg::GraphUsage::Vertex,
+                   vrento::rg::GraphStage::Vertex);
+        if (primitive.indices)
+          buffer_use(*primitive.indices, vrento::rg::GraphUsage::Index,
+                     vrento::rg::GraphStage::Vertex);
+        if (primitive.morphs)
+          buffer_use(*primitive.morphs, vrento::rg::GraphUsage::Storage,
+                     vrento::rg::GraphStage::Vertex);
+      }
+    core_->scopes.collect();
+    vk::VulkanPassBackends backends;
+    backends.set_scopes(
+        Box<dyn<vk::GraphicsScopeBackend>>::make(ModelScopes{core_.clone()}));
+    backends
+        .bind(
+            model_kind, 1,
+            Box<dyn<vk::VulkanPassBackend>>::make(ModelBackend{inputs.clone()}))
+        .unwrap();
+    auto result = vk::record_vulkan_pass(core_->session, rstd::move(pass),
+                                         bindings, backends, work);
+    if (result.is_err()) {
+      const auto error = result.unwrap_err();
+      if (error.texture)
+        return Err(texture_error(*error.texture));
+      return Err(render_error("model pass"_str,
+                              rstd::format("stage={} native={}",
+                                           unsigned(error.stage), error.native)
+                                  .as_str()));
+    }
     auto sampled =
         work.commands()->UseTexture({target, vrento::texture::Access::Sampled,
                                      vrento::texture::Stages::Fragment});
     if (sampled.is_err())
       return Err(texture_error(sampled.unwrap_err()));
-    work.retain(rstd::move(inputs));
     ++statistics_.recorded_frames;
     return Ok(empty{});
   }

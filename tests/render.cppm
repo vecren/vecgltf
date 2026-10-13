@@ -8,8 +8,10 @@ import vecgltf.render;
 import vecgltf.environment;
 import vui.render;
 import rstd.test;
+import rstd.log;
 import :output;
 using namespace vecgltf;
+using namespace rstd::literals;
 
 namespace vecgltf_test::render {
 Arc<Asset> triangle(Vec4 color = {1, 0, 0, 1}, bool reverse = false) {
@@ -45,7 +47,110 @@ void near(unsigned actual, unsigned expected) {
   rstd_assert(actual + 2 >= expected && actual <= expected + 2);
 }
 
+TEST(Render, SharedDepth) {
+  auto session =
+      vrento::vulkan::DeviceSession::create({.validation = true}).unwrap();
+  auto queue = vrento::vulkan::TextureContext::create(session).unwrap();
+  auto first = Renderer::create(session, {64, 64}).unwrap();
+  auto second = Renderer::create(session, {64, 64}).unwrap();
+  auto front = triangle(), back = triangle({0, 0, 1, 1});
+  for (auto &vertex : at(at(back->meshes, 0).primitives, 0).vertices)
+    vertex.position.z = -0.5f;
+  auto front_gpu = first.prepare(front.clone()).unwrap();
+  auto back_gpu = second.prepare(back.clone()).unwrap();
+  SceneInstance front_scene(front.clone()), back_scene(back.clone());
+  View camera{
+      look_at({0, 0, 2}, {0, 0, 0}), perspective(0.8f, 1, 0.1f, 10), {0, 0, 2}};
+  vrento::texture::TextureDesc color_desc;
+  color_desc.extent = {64, 64};
+  color_desc.format = vrento::TextureFormat::RGBA8_SRGB;
+  color_desc.usage = vrento::texture::Usage::ColorAttachment |
+                     vrento::texture::Usage::Sampled |
+                     vrento::texture::Usage::TransferSource;
+  auto color =
+      queue.CreateView(queue.CreateTexture(color_desc).unwrap(), {}).unwrap();
+  auto depth_desc = color_desc;
+  depth_desc.format = vrento::TextureFormat::D32F;
+  depth_desc.usage = vrento::texture::Usage::DepthAttachment;
+  auto depth = queue
+                   .CreateView(queue.CreateTexture(depth_desc).unwrap(),
+                               {vrento::texture::Dimension::D2,
+                                {vrento::texture::Aspect::Depth}})
+                   .unwrap();
+  auto work = queue.Begin().unwrap();
+  first
+      .record(work,
+              RenderTarget{color, Some(vrento::texture::TextureViewRef(depth))},
+              front_gpu, front_scene, camera, {1, DebugView::BaseColor})
+      .unwrap();
+  auto created = session.graphics_resources().pipelines.stats().creations;
+  second
+      .record(work,
+              RenderTarget{color, Some(vrento::texture::TextureViewRef(depth)),
+                           vrento::rg::AttachmentLoad::Load,
+                           vrento::rg::AttachmentLoad::Load},
+              back_gpu, back_scene, camera, {1, DebugView::BaseColor})
+      .unwrap();
+  rstd_assert(session.graphics_resources().pipelines.stats().creations ==
+              created);
+  {
+    vui::gpu::Renderer ui;
+    ui.initialize(session, false).unwrap();
+    vui::UiSession document;
+    vui::NodeStyle style;
+    style.layout.width = style.layout.height = Some(vui::Scalar(16));
+    style.background = {0, 1, 0, 1};
+    auto node = document.document().create<vui::Rectangle>(style).unwrap();
+    document.document().mount(node).unwrap();
+    document.advance({}, {1, {}}, {{64, 64}, 1, 1}).unwrap();
+    ui.record(work, document.plan_frame().unwrap(), color).unwrap();
+    ui.shutdown().unwrap();
+  }
+  work.commands()
+      ->UseTexture({color, vrento::texture::Access::TransferSource,
+                    vrento::texture::Stages::Transfer})
+      .unwrap();
+  VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer_info.size = 64 * 64 * 4;
+  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  auto buffer = session.device()
+                    .memory_allocator()
+                    .create_buffer(buffer_info, vvk::MemoryRequest::Readback())
+                    .unwrap();
+  VkBufferImageCopy copy{};
+  copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.imageExtent = {64, 64, 1};
+  const auto &dispatch = session.device().handle().Dispatch();
+  auto command = vrento::vulkan::native_recording(work, session).unwrap();
+  dispatch.vkCmdCopyImageToBuffer(
+      command, vrento::vulkan::native_texture(color.texture()).unwrap(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.handle(), 1, &copy);
+  VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  host.buffer = buffer.handle();
+  host.size = VK_WHOLE_SIZE;
+  dispatch.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                                &host, 0, nullptr);
+  auto done = queue.Submit(rstd::move(work)).unwrap();
+  queue.wait(done).unwrap();
+  queue.Poll().unwrap();
+  auto memory = buffer.allocation();
+  auto mapped = memory.map().unwrap();
+  memory.invalidate().unwrap();
+  auto *pixels = static_cast<unsigned char *>(mapped.data());
+  rstd_assert(pixels[(32 * 64 + 32) * 4] == 255 &&
+              pixels[(32 * 64 + 32) * 4 + 2] == 0);
+  rstd_assert(pixels[(8 * 64 + 8) * 4] == 0 &&
+              pixels[(8 * 64 + 8) * 4 + 1] == 255);
+  rstd_assert(session.validation_errors() == 0);
+}
 TEST(Render, Integration) {
+  static rstd::log::EnvLogger logger("info"_str);
+  rstd::log::set_logger(logger);
+  rstd::log::set_max_level(rstd::log::LevelFilter::Info);
   auto constant = [] {
     HdrImage image{4, 2};
     for (unsigned i = 0; i < 8; ++i) {
