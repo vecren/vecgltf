@@ -321,7 +321,7 @@ auto bind_storage(RenderCore &core, const vk::BufferAllocation &buffer,
     return Ok(result.unwrap());
 }
 
-constexpr vrento::rg::GraphSerial model_kind = 0x5647434c54464401ull;
+constexpr vrento::vulkan::GraphSerial model_kind = 0x5647434c54464401ull;
 struct ModelPrepared {
     Arc<RenderInputs> inputs;
     Vec<registry::PipelineResourceResult> pipelines;
@@ -375,13 +375,13 @@ struct ModelPrepared {
 };
 struct ModelBackend {
     Arc<RenderInputs> inputs;
-    auto Prepare(const vrento::rg::PassDescription &,
+    auto Prepare(const vrento::vulkan::PassDescription &,
                  const vk::GraphPrepareContext &context)
         -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError>;
 };
 struct ModelScopes {
     Arc<RenderCore> core;
-    auto Prepare(const vrento::rg::GraphicsDescription &description,
+    auto Prepare(const vrento::vulkan::GraphicsDescription &description,
                  const vk::GraphPrepareContext &context)
         -> Result<Arc<dyn<vk::PreparedGraphicsScope>>,
                   vk::GraphExecutionError> {
@@ -402,7 +402,7 @@ struct Impl<vrento::vulkan::PreparedVulkanPass, vecgltf::ModelPrepared>
 template <>
 struct Impl<vrento::vulkan::VulkanPassBackend, vecgltf::ModelBackend>
     : ImplBase<vecgltf::ModelBackend> {
-    auto Prepare(const vrento::rg::PassDescription &pass,
+    auto Prepare(const vrento::vulkan::PassDescription &pass,
                  const vrento::vulkan::GraphPrepareContext &context)
         -> Result<sync::Arc<dyn<vrento::vulkan::PreparedVulkanPass>>,
                   vrento::vulkan::GraphExecutionError> {
@@ -412,7 +412,7 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vecgltf::ModelBackend>
 template <>
 struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
     : ImplBase<vecgltf::ModelScopes> {
-    auto Prepare(const vrento::rg::GraphicsDescription &description,
+    auto Prepare(const vrento::vulkan::GraphicsDescription &description,
                  const vrento::vulkan::GraphPrepareContext &context)
         -> Result<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>,
                   vrento::vulkan::GraphExecutionError> {
@@ -421,7 +421,7 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
 };
 } // namespace rstd
 namespace vecgltf {
-auto ModelBackend::Prepare(const vrento::rg::PassDescription &pass,
+auto ModelBackend::Prepare(const vrento::vulkan::PassDescription &pass,
                            const vk::GraphPrepareContext &context)
     -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError> {
     if (!pass.parameters.is_empty() || !context.scope)
@@ -456,8 +456,8 @@ struct RenderOptions {
 struct RenderTarget {
     vrento::texture::TextureViewRef color;
     Option<vrento::texture::TextureViewRef> depth;
-    vrento::rg::AttachmentLoad color_load{vrento::rg::AttachmentLoad::Clear};
-    vrento::rg::AttachmentLoad depth_load{vrento::rg::AttachmentLoad::Clear};
+    vrento::vulkan::AttachmentLoad color_load{vrento::vulkan::AttachmentLoad::Clear};
+    vrento::vulkan::AttachmentLoad depth_load{vrento::vulkan::AttachmentLoad::Clear};
 };
 class PreparedAsset {
     friend class Renderer;
@@ -1042,7 +1042,7 @@ class Renderer {
             inputs->draws.push({mesh_index, p, primitive.material, constants,
                                 draw.transparent});
         }
-        vrento::rg::PassDescription pass;
+        vrento::vulkan::PassDescription pass;
         pass.id = {1};
         pass.kind = model_kind;
         vk::GraphBindings bindings(1);
@@ -1052,8 +1052,8 @@ class Renderer {
                 if (references[i].texture().identity() ==
                         view.texture().identity() &&
                     references[i].description() == view.description())
-                    return vrento::rg::ResourceId{i.to_primitive() + 1, 1};
-            vrento::rg::ResourceId id{references.len().to_primitive() + 1, 1};
+                    return vrento::vulkan::ResourceId{i.to_primitive() + 1, 1};
+            vrento::vulkan::ResourceId id{references.len().to_primitive() + 1, 1};
             bindings
                 .bind(id, Arc<dyn<vk::GraphBinding>>::make(
                               vk::GraphTextureBinding(view)))
@@ -1062,31 +1062,31 @@ class Renderer {
             return id;
         };
         auto color_id = bind(target), depth_id = bind(depth);
-        auto attachment = [&](vrento::rg::ResourceId id,
-                              vrento::rg::GraphUsage usage,
-                              vrento::rg::GraphStage stages,
-                              vrento::rg::AttachmentLoad load,
+        auto attachment = [&](vrento::vulkan::ResourceId id,
+                              vrento::vulkan::PassUsage usage,
+                              vrento::vulkan::PassStages stages,
+                              vrento::vulkan::AttachmentLoad load,
                               unsigned aspect) {
-            vrento::rg::ResourceUse use{id, 1, vrento::rg::GraphAccess::Write,
+            vrento::vulkan::PassResourceUse use{id, 1, vrento::vulkan::GraphAccess::Write,
                                         usage, stages};
             use.range.aspect = aspect;
-            if (load == vrento::rg::AttachmentLoad::Load) {
+            if (load == vrento::vulkan::AttachmentLoad::Load) {
                 auto read = use;
                 read.version = 0;
-                read.access = vrento::rg::GraphAccess::Read;
+                read.access = vrento::vulkan::GraphAccess::Read;
                 pass.uses.push(rstd::move(read));
             }
             pass.uses.push(rstd::move(use));
         };
-        attachment(color_id, vrento::rg::GraphUsage::ColorAttachment,
-                   vrento::rg::GraphStage::Color, destination.color_load, 1);
-        attachment(depth_id, vrento::rg::GraphUsage::DepthAttachment,
-                   vrento::rg::GraphStage::Depth, destination.depth_load, 2);
-        vrento::rg::GraphicsDescription graphics;
+        attachment(color_id, vrento::vulkan::PassUsage::ColorAttachment,
+                   vrento::vulkan::PassStages::Color, destination.color_load, 1);
+        attachment(depth_id, vrento::vulkan::PassUsage::DepthAttachment,
+                   vrento::vulkan::PassStages::Depth, destination.depth_load, 2);
+        vrento::vulkan::GraphicsDescription graphics;
         graphics.color = Some(
-            vrento::rg::GraphAttachment{color_id, 1, destination.color_load});
+            vrento::vulkan::GraphAttachment{color_id, 1, destination.color_load});
         graphics.depth = Some(
-            vrento::rg::GraphAttachment{depth_id, 1, destination.depth_load});
+            vrento::vulkan::GraphAttachment{depth_id, 1, destination.depth_load});
         graphics.depth->clear[usize()] = 1;
         pass.graphics = Some(graphics);
         auto sampled_use = [&](const vrento::texture::TextureViewRef &view) {
@@ -1094,9 +1094,9 @@ class Renderer {
             for (const auto &use : pass.uses)
                 if (use.resource == id)
                     return;
-            vrento::rg::ResourceUse use{id, 0, vrento::rg::GraphAccess::Read,
-                                        vrento::rg::GraphUsage::Sampled,
-                                        vrento::rg::GraphStage::Fragment};
+            vrento::vulkan::PassResourceUse use{id, 0, vrento::vulkan::GraphAccess::Read,
+                                        vrento::vulkan::PassUsage::Sampled,
+                                        vrento::vulkan::PassStages::Fragment};
             const auto range = view.description().range;
             use.range.mip_count = range.mip_count;
             use.range.layer_count = range.layer_count;
@@ -1109,44 +1109,44 @@ class Renderer {
         Vec<rstd::uint64_t> allocations;
         auto next_binding = references.len().to_primitive() + 1;
         auto buffer_use = [&](const vk::BufferAllocation &allocation,
-                              vrento::rg::GraphUsage usage,
-                              vrento::rg::GraphStage stages) {
+                              vrento::vulkan::PassUsage usage,
+                              vrento::vulkan::PassStages stages) {
             for (auto identity : allocations)
                 if (identity == allocation.identity())
                     return;
             allocations.push(rstd::uint64_t(allocation.identity()));
-            vrento::rg::ResourceId id{next_binding++, 1};
+            vrento::vulkan::ResourceId id{next_binding++, 1};
             bindings
                 .bind(id, Arc<dyn<vk::GraphBinding>>::make(
                               vk::GraphUploadedBufferBinding(
                                   core_->session, allocation.clone())))
                 .unwrap();
-            vrento::rg::ResourceUse use{id, 0, vrento::rg::GraphAccess::Read,
+            vrento::vulkan::PassResourceUse use{id, 0, vrento::vulkan::GraphAccess::Read,
                                         usage, stages};
             use.range.size = allocation.size();
             pass.uses.push(rstd::move(use));
         };
-        buffer_use(*inputs->frame_buffer, vrento::rg::GraphUsage::Uniform,
-                   vrento::rg::GraphStage::Fragment);
-        buffer_use(*core_->zero_buffer, vrento::rg::GraphUsage::Storage,
-                   vrento::rg::GraphStage::Vertex);
-        buffer_use(*inputs->poses, vrento::rg::GraphUsage::Storage,
-                   vrento::rg::GraphStage::Vertex);
+        buffer_use(*inputs->frame_buffer, vrento::vulkan::PassUsage::Uniform,
+                   vrento::vulkan::PassStages::Fragment);
+        buffer_use(*core_->zero_buffer, vrento::vulkan::PassUsage::Storage,
+                   vrento::vulkan::PassStages::Vertex);
+        buffer_use(*inputs->poses, vrento::vulkan::PassUsage::Storage,
+                   vrento::vulkan::PassStages::Vertex);
         for (const auto &material : prepared.data_->materials)
-            buffer_use(material.parameters, vrento::rg::GraphUsage::Uniform,
-                       vrento::rg::GraphStage::Fragment);
+            buffer_use(material.parameters, vrento::vulkan::PassUsage::Uniform,
+                       vrento::vulkan::PassStages::Fragment);
         for (const auto &mesh : prepared.data_->meshes)
             for (const auto &primitive : mesh.primitives) {
-                buffer_use(primitive.vertices, vrento::rg::GraphUsage::Vertex,
-                           vrento::rg::GraphStage::Vertex);
+                buffer_use(primitive.vertices, vrento::vulkan::PassUsage::Vertex,
+                           vrento::vulkan::PassStages::Vertex);
                 if (primitive.indices)
                     buffer_use(*primitive.indices,
-                               vrento::rg::GraphUsage::Index,
-                               vrento::rg::GraphStage::Vertex);
+                               vrento::vulkan::PassUsage::Index,
+                               vrento::vulkan::PassStages::Vertex);
                 if (primitive.morphs)
                     buffer_use(*primitive.morphs,
-                               vrento::rg::GraphUsage::Storage,
-                               vrento::rg::GraphStage::Vertex);
+                               vrento::vulkan::PassUsage::Storage,
+                               vrento::vulkan::PassStages::Vertex);
             }
         core_->scopes.collect();
         vk::VulkanPassBackends backends;

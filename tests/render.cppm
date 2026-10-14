@@ -394,8 +394,8 @@ TEST(Render, SharedDepth) {
         .record(work,
                 RenderTarget{color,
                              Some(vrento::texture::TextureViewRef(depth)),
-                             vrento::rg::AttachmentLoad::Load,
-                             vrento::rg::AttachmentLoad::Load},
+                             vrento::vulkan::AttachmentLoad::Load,
+                             vrento::vulkan::AttachmentLoad::Load},
                 back_gpu, back_scene, camera, {1, DebugView::BaseColor})
         .unwrap();
     rstd_assert(session.graphics_resources().pipelines.stats().creations ==
@@ -482,8 +482,8 @@ TEST(Render, SharedDepth) {
             resized_work,
             RenderTarget{resized_color,
                          Some(vrento::texture::TextureViewRef(resized_depth)),
-                         vrento::rg::AttachmentLoad::Load,
-                         vrento::rg::AttachmentLoad::Load},
+                         vrento::vulkan::AttachmentLoad::Load,
+                         vrento::vulkan::AttachmentLoad::Load},
             back_gpu, back_scene, camera, {1, DebugView::BaseColor})
         .unwrap();
     queue.wait(queue.Submit(rstd::move(resized_work)).unwrap()).unwrap();
