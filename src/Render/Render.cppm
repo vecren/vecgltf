@@ -330,11 +330,11 @@ struct ModelPrepared {
         auto &core = *inputs->prepared->core;
         auto native = vk::native_recording(context.submission, core.session);
         if (native.is_err())
-            return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Record,
-                                               {},
-                                               {},
-                                               VK_SUCCESS,
-                                               Some(native.unwrap_err())});
+            return Err(vk::GraphExecutionError{
+                vk::GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(native.unwrap_err())});
         auto cmd = native.unwrap();
         const auto &d = core.session.device().handle().Dispatch();
         vvk::CommandBuffer command(cmd, d);
@@ -375,15 +375,14 @@ struct ModelPrepared {
 };
 struct ModelBackend {
     Arc<RenderInputs> inputs;
-    auto Prepare(const vrento::vulkan::PassDescription &,
-                 const vk::GraphPrepareContext &context)
-        -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError>;
+    auto Prepare(const vrento::vulkan::PassDescription &, const vk::GraphPrepareContext &context)
+        -> Result<vrento::Preparation<Arc<dyn<vk::PreparedVulkanPass>>>, vk::GraphExecutionError>;
 };
 struct ModelScopes {
     Arc<RenderCore> core;
     auto Prepare(const vrento::vulkan::GraphicsDescription &description,
                  const vk::GraphPrepareContext &context)
-        -> Result<Arc<dyn<vk::PreparedGraphicsScope>>,
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::PreparedGraphicsScope>>>,
                   vk::GraphExecutionError> {
         return core->scopes.Prepare(description, context);
     }
@@ -404,7 +403,7 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vecgltf::ModelBackend>
     : ImplBase<vecgltf::ModelBackend> {
     auto Prepare(const vrento::vulkan::PassDescription &pass,
                  const vrento::vulkan::GraphPrepareContext &context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::PreparedVulkanPass>>,
+        -> Result<vrento::Preparation<sync::Arc<dyn<vrento::vulkan::PreparedVulkanPass>>>,
                   vrento::vulkan::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
@@ -414,8 +413,9 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
     : ImplBase<vecgltf::ModelScopes> {
     auto Prepare(const vrento::vulkan::GraphicsDescription &description,
                  const vrento::vulkan::GraphPrepareContext &context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>,
-                  vrento::vulkan::GraphExecutionError> {
+        -> Result<
+            vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>>,
+            vrento::vulkan::GraphExecutionError> {
         return self().Prepare(description, context);
     }
 };
@@ -423,7 +423,7 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
 namespace vecgltf {
 auto ModelBackend::Prepare(const vrento::vulkan::PassDescription &pass,
                            const vk::GraphPrepareContext &context)
-    -> Result<Arc<dyn<vk::PreparedVulkanPass>>, vk::GraphExecutionError> {
+    -> Result<vrento::Preparation<Arc<dyn<vk::PreparedVulkanPass>>>, vk::GraphExecutionError> {
     if (!pass.parameters.is_empty() || !context.scope)
         return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Schema});
     Vec<registry::PipelineResourceResult> pipelines;
@@ -431,14 +431,12 @@ auto ModelBackend::Prepare(const vrento::vulkan::PassDescription &pass,
         auto prepared = inputs->prepared->core->preparation->prepare(
             recipe, (*context.scope)->Info().signature);
         if (prepared.is_err())
-            return Err(
-                vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
+            return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
         auto value = prepared.unwrap();
+        if (value.status == registry::PipelineReadiness::Pending)
+            return Ok(vrento::PendingPreparation{});
         if (value.status != registry::PipelineReadiness::Ready)
-            return Err(vk::GraphExecutionError{
-                value.status == registry::PipelineReadiness::Pending
-                    ? vk::GraphExecutionStage::Pending
-                    : vk::GraphExecutionStage::Prepare});
+            return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
         pipelines.push(value.pipeline.take().unwrap());
     }
     return Ok(Arc<dyn<vk::PreparedVulkanPass>>::make(
@@ -1161,14 +1159,16 @@ class Renderer {
                                              bindings, backends, work);
         if (result.is_err()) {
             const auto error = result.unwrap_err();
-            if (error.texture)
-                return Err(texture_error(*error.texture));
-            return Err(
-                render_error("model pass"_str,
-                             rstd::format("stage={} native={}",
-                                          unsigned(error.stage), error.native)
-                                 .as_str()));
+            if (error.texture_error())
+                return Err(texture_error(*error.texture_error()));
+            return Err(render_error(
+                "model pass"_str,
+                rstd::format("stage={} native={}", unsigned(error.stage), error.native_result())
+                    .as_str()));
         }
+        if (*result == vk::FrameProgress::Pending)
+            return Err(
+                render_error("model pass"_str, "pass preparation pending"_str, ErrorKind::Pending));
         auto sampled = work.commands()->UseTexture(
             {target, vrento::texture::Access::Sampled,
              vrento::texture::Stages::Fragment});
