@@ -30,6 +30,7 @@ enum class ErrorKind {
 struct Error {
     ErrorKind kind;
     String source, location, message;
+    Option<Arc<dyn<rstd::error::Error>>> cause;
 };
 struct Diagnostic {
     String location, message;

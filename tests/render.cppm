@@ -225,8 +225,16 @@ TEST(Render, DeferredPreparation) {
     auto next_pixels = read_pixels(session, queue, next);
     near(u8(old_pixels[usize((32 * 64 + 32) * 4)]).to_primitive(), 255);
     near(u8(next_pixels[usize((32 * 64 + 32) * 4)]).to_primitive(), 255);
+    rstd_assert(renderer.graph_statistics().graph_compiles == 2);
     renderer.close();
-    rstd_assert(renderer.prepare_target(next).is_err());
+    auto closed = renderer.prepare_target(next).unwrap_err();
+    rstd_assert(closed.cause.is_some());
+    rstd_assert(
+        closed.message.as_str().contains("pipeline preparation closed"_str));
+    auto cause = closed.cause.take().unwrap();
+    rstd_assert(rstd::format("{}", cause.as_ptr().as_ptr().as_ref())
+                    .as_str()
+                    .contains("pipeline preparation closed"_str));
     rstd_assert(session.validation_errors() == 0);
 }
 TEST(Render, QueuedDynamicInputs) {
@@ -328,9 +336,12 @@ TEST(Render, QueuedDynamicInputs) {
             .unwrap();
         last = queue.Submit(rstd::move(work)).unwrap();
         rstd_assert(!last.poll().unwrap());
+        rstd_assert(renderer.graph_statistics().graph_compiles == 1);
+        rstd_assert(renderer.graph_statistics().native_completed == 1);
         rstd_assert(session.graphics_resources().pipelines.stats().creations ==
                     pipelines);
     }
+    renderer.close();
     auto uploaded = renderer.upload_statistics();
     rstd_assert(uploaded.recorded_copies[0] == baseline.recorded_copies[0]);
     rstd_assert(uploaded.recorded_copies[1] == baseline.recorded_copies[1]);
@@ -492,6 +503,21 @@ TEST(Render, SharedDepth) {
     near(u8(resized_pixels[usize((48 * 32 + 16) * 4)]).to_primitive(), 255);
     rstd_assert(session.graphics_resources().pipelines.stats().creations ==
                 warm_creations);
+    rstd_assert(first.graph_statistics().graph_compiles == 2);
+    rstd_assert(second.graph_statistics().graph_compiles == 2);
+    auto cleared = queue.Begin().unwrap();
+    second
+        .record(
+            cleared,
+            RenderTarget{resized_color,
+                         Some(vrento::texture::TextureViewRef(resized_depth))},
+            back_gpu, back_scene, camera, {1, DebugView::BaseColor})
+        .unwrap();
+    rstd_assert(second.graph_statistics().graph_compiles == 3);
+    queue.wait(queue.Submit(rstd::move(cleared)).unwrap()).unwrap();
+    auto cleared_pixels = read_pixels(session, queue, resized_color);
+    near(u8(cleared_pixels[usize((48 * 32 + 16) * 4)]).to_primitive(), 0);
+    near(u8(cleared_pixels[usize((48 * 32 + 16) * 4 + 2)]).to_primitive(), 255);
     rstd_assert(session.validation_errors() == 0);
 }
 TEST(Render, Integration) {

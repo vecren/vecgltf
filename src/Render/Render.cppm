@@ -9,23 +9,41 @@ import vecgltf.shaders;
 import vecgltf.textures;
 import vecgltf.environment;
 
+using namespace rstd::literals;
+
 namespace vecgltf {
 namespace vk = vrento::vulkan;
 namespace res = vrento::resource;
 namespace registry = vrento::resource_registry;
-using namespace rstd::literals;
 
 auto render_error(ref<str> location, ref<str> message,
                   ErrorKind kind = ErrorKind::Device) -> Error {
     return {kind, String(), String::make(location), String::make(message)};
 }
+template <class T>
+auto backend_error(ref<str> location, T error,
+                   ErrorKind kind = ErrorKind::Device) -> Error {
+    auto message = rstd::format("{}", error);
+    return {kind, String(), String::make(location), rstd::move(message),
+            Some(Arc<dyn<rstd::error::Error>>::make(rstd::move(error)))};
+}
 auto texture_error(vrento::texture::Error error) -> Error {
-    return render_error(
-        "texture"_str,
-        rstd::format("kind={} native={}", unsigned(error.kind), error.native)
-            .as_str(),
-        error.kind == vrento::texture::ErrorKind::Busy ? ErrorKind::Busy
-                                                       : ErrorKind::Device);
+    return backend_error("texture"_str, error,
+                         error.kind == vrento::texture::ErrorKind::Busy
+                             ? ErrorKind::Busy
+                             : ErrorKind::Device);
+}
+auto graph_error(vk::GraphExecutionError error) -> Error {
+    auto kind = error.texture_error() && error.texture_error()->kind ==
+                                             vrento::texture::ErrorKind::Busy
+                    ? ErrorKind::Busy
+                    : ErrorKind::Device;
+    return backend_error("model pass"_str, rstd::move(error), kind);
+}
+auto graph_error(vrento::fg::Error error) -> Error {
+    return graph_error(vk::GraphExecutionError{
+        vk::GraphExecutionStage::Graph, error.pass, error.resource,
+        vk::GraphExecutionCause::Graph(error)});
 }
 struct RenderCore {
     vk::DeviceSession session;
@@ -39,6 +57,7 @@ struct RenderCore {
     Vec<res::PipelineRecipeHandle> recipes;
     Option<vk::PipelinePreparationQueue> preparation;
     vk::GraphicsScopeCache scopes;
+    Vec<registry::PipelineResourceResult> warmed;
     Option<vrento::texture::SubmissionReceipt> latest;
     explicit RenderCore(vk::DeviceSession device)
         : session(rstd::move(device)), buffers(session.device()),
@@ -110,26 +129,24 @@ struct ModelDraw {
     DrawConstants constants;
     bool transparent{};
 };
-struct RenderInputs {
+struct ModelFrameResources {
     Arc<PreparedData> prepared;
     vrento::texture::TextureViewRef depth;
     vrento::texture::SubmissionReceipt receipt;
     Option<Arc<PreparedEnvironment>> environment;
     Option<vk::BufferUploadBatchLease> uploads;
-    Vec<ModelDraw> draws;
-    bool background{};
     Option<vk::BufferAllocation> poses, frame_buffer;
     Option<registry::PreparedDescriptorBinding> frame_binding;
     Option<registry::PreparedDescriptorBinding> pose_binding;
-    RenderInputs(Arc<PreparedData> source,
-                 vrento::texture::TextureViewRef depth_view,
-                 vrento::texture::SubmissionReceipt submission)
+    ModelFrameResources(Arc<PreparedData> source,
+                        vrento::texture::TextureViewRef depth_view,
+                        vrento::texture::SubmissionReceipt submission)
         : prepared(rstd::move(source)), depth(rstd::move(depth_view)),
           receipt(rstd::move(submission)) {
         prepared->core->latest =
             Some(vrento::texture::SubmissionReceipt(receipt));
     }
-    ~RenderInputs() {
+    ~ModelFrameResources() {
         if (uploads && !receipt.submitted() &&
             !prepared->core->session.lost()) {
             if (!prepared->core->buffers.RestoreUploads(
@@ -137,6 +154,11 @@ struct RenderInputs {
                 rstd::panic("cannot restore cancelled model uploads");
         }
     }
+};
+struct ModelFrameData {
+    Arc<ModelFrameResources> resources;
+    Vec<ModelDraw> draws;
+    bool background{};
 };
 template <rstd::size_t N>
 auto shader(const unsigned (&code)[N], vrento::ShaderType stage)
@@ -148,16 +170,19 @@ auto shader(const unsigned (&code)[N], vrento::ShaderType stage)
     return result;
 }
 
-bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
+auto initialize(RenderCore &core, vk::PipelinePreparationMode mode)
+    -> Result<empty, Error> {
     auto preparation = vk::PipelinePreparationQueue::create(core.session, mode);
     if (preparation.is_err())
-        return false;
+        return Err(
+            backend_error("pipeline worker"_str, preparation.unwrap_err()));
     core.preparation = Some(preparation.unwrap());
     if (!core.buffers.init())
-        return false;
+        return Err(
+            render_error("buffer manager"_str, "initialization failed"_str));
     auto image_device = vk::TextureContext::create(core.session);
     if (image_device.is_err())
-        return false;
+        return Err(texture_error(image_device.unwrap_err()));
     core.image_device = Some(image_device.unwrap());
     vk::DescriptorSetInfo frame_info, material_info;
     frame_info.bindings.push({0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
@@ -176,8 +201,12 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
         core.descriptor_layouts.Ensure(core.session.device(), frame_info);
     auto material_layout =
         core.descriptor_layouts.Ensure(core.session.device(), material_info);
-    if (frame_layout.is_err() || material_layout.is_err())
-        return false;
+    if (frame_layout.is_err())
+        return Err(
+            backend_error("frame layout"_str, frame_layout.unwrap_err()));
+    if (material_layout.is_err())
+        return Err(
+            backend_error("material layout"_str, material_layout.unwrap_err()));
     core.frame_layout = frame_layout.unwrap();
     core.material_layout = material_layout.unwrap();
     vk::DescriptorSetInfo storage;
@@ -186,7 +215,8 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
     auto storage_layout =
         core.descriptor_layouts.Ensure(core.session.device(), storage);
     if (storage_layout.is_err())
-        return false;
+        return Err(
+            backend_error("pipeline layout"_str, storage_layout.unwrap_err()));
     core.storage_layout = storage_layout.unwrap();
     registry::PipelineLayoutRequest layout_request;
     layout_request.descriptor_sets.push(frame_info.clone());
@@ -199,7 +229,7 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
     auto layout = graphics.layouts.Ensure(core.session.device(), layout_request,
                                           core.descriptor_layouts);
     if (layout.is_err())
-        return false;
+        return Err(backend_error("pipeline layout"_str, layout.unwrap_err()));
     core.layout = Some(layout.unwrap());
     vk::GraphicsPipeline defaults;
     vk::PipelineResourceRequest pipeline;
@@ -219,19 +249,27 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
     pipeline.color_load_op = pipeline.depth_load_op =
         VK_ATTACHMENT_LOAD_OP_CLEAR;
     pipeline.color_blend.colorWriteMask = 15;
-    auto add = [&](vk::PipelineResourceRequest value) {
+    auto add = [&](vk::PipelineResourceRequest value) -> Result<empty, Error> {
         auto signature = vk::MakeRenderPassResourceDesc(value);
         auto recipe = graphics.pipelines.RegisterRecipe(rstd::move(value),
                                                         graphics.layouts);
         if (recipe.is_none())
-            return false;
+            return Err(
+                render_error("pipeline recipe"_str, "registration failed"_str));
         auto handle = recipe.unwrap();
         core.recipes.push(res::PipelineRecipeHandle(handle));
         auto ready = core.preparation->prepare(handle, signature);
-        if (ready.is_err() ||
-            ready.unwrap().status == registry::PipelineReadiness::Failed)
-            return false;
-        return true;
+        if (ready.is_err())
+            return Err(backend_error("pipeline"_str, ready.unwrap_err()));
+        auto prepared = ready.unwrap();
+        if (prepared.error)
+            return Err(
+                backend_error("pipeline"_str, prepared.error.take().unwrap()));
+        if (prepared.status == registry::PipelineReadiness::Failed)
+            return Err(render_error("pipeline"_str, "preparation failed"_str));
+        if (prepared.pipeline)
+            core.warmed.push(prepared.pipeline.take().unwrap());
+        return Ok(empty{});
     };
     VkVertexInputBindingDescription binding{0, sizeof(Vertex),
                                             VK_VERTEX_INPUT_RATE_VERTEX};
@@ -256,8 +294,9 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
         shader(shaders::model_vertex.words, vrento::ShaderType::VERTEX));
     pipeline.shader_stages.push(
         shader(shaders::model_fragment.words, vrento::ShaderType::FRAGMENT));
-    if (!add(pipeline.clone()))
-        return false;
+    auto opaque = add(pipeline.clone());
+    if (opaque.is_err())
+        return opaque;
     VkPipelineColorBlendAttachmentState blend{};
     blend.blendEnable = VK_TRUE;
     blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -269,8 +308,9 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
     blend.colorWriteMask = 15;
     pipeline.color_blend = blend;
     pipeline.depth.depthWriteEnable = VK_FALSE;
-    if (!add(rstd::move(pipeline)))
-        return false;
+    auto transparent = add(rstd::move(pipeline));
+    if (transparent.is_err())
+        return transparent;
     core.zero_buffer = core.buffers.Allocate(
         {16, core.session.device().limits().minStorageBufferOffsetAlignment,
          vk::BufferUploadClass::Storage});
@@ -282,7 +322,8 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
                             reinterpret_cast<const rstd::uint8_t *>(&zero),
                             usize(sizeof(zero))))
             .is_none())
-        return false;
+        return Err(
+            render_error("zero buffer"_str, "allocation or upload failed"_str));
     vk::PipelineResourceRequest background;
     background.pipeline_layout = core.layout->handle;
     background.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -299,9 +340,7 @@ bool initialize(RenderCore &core, vk::PipelinePreparationMode mode) {
         shader(shaders::background_vertex.words, vrento::ShaderType::VERTEX));
     background.shader_stages.push(shader(shaders::background_fragment.words,
                                          vrento::ShaderType::FRAGMENT));
-    if (!add(rstd::move(background)))
-        return false;
-    return true;
+    return add(rstd::move(background));
 }
 auto bind_storage(RenderCore &core, const vk::BufferAllocation &buffer,
                   unsigned set)
@@ -316,18 +355,17 @@ auto bind_storage(RenderCore &core, const vk::BufferAllocation &buffer,
                                                                  usize(1)),
         registry::DescriptorBindingReuse::Shared);
     if (result.is_err())
-        return Err(render_error("storage binding"_str,
-                                result.unwrap_err().message.as_str()));
+        return Err(backend_error("storage binding"_str, result.unwrap_err()));
     return Ok(result.unwrap());
 }
 
 constexpr vrento::vulkan::GraphSerial model_kind = 0x5647434c54464401ull;
 struct ModelPrepared {
-    Arc<RenderInputs> inputs;
-    Vec<registry::PipelineResourceResult> pipelines;
+    Arc<ModelFrameData> inputs;
+    Arc<Vec<registry::PipelineResourceResult>> pipelines;
     auto Record(vk::GraphRecordContext &context) const
         -> Result<empty, vk::GraphExecutionError> {
-        auto &core = *inputs->prepared->core;
+        auto &core = *inputs->resources->prepared->core;
         auto native = vk::native_recording(context.submission, core.session);
         if (native.is_err())
             return Err(vk::GraphExecutionError{
@@ -340,21 +378,23 @@ struct ModelPrepared {
         vvk::CommandBuffer command(cmd, d);
         auto layout = *core.layout->physical->layout;
         registry::DescriptorBindingRecordState binding_state;
-        inputs->frame_binding->Record(command, layout, binding_state);
+        inputs->resources->frame_binding->Record(command, layout,
+                                                 binding_state);
         if (inputs->background) {
-            d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                *pipelines[usize(2)].pipeline->pipeline.handle);
+            d.vkCmdBindPipeline(
+                cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                *(*pipelines)[usize(2)].pipeline->pipeline.handle);
             d.vkCmdDraw(cmd, 3, 1, 0, 0);
         }
-        inputs->pose_binding->Record(command, layout, binding_state);
+        inputs->resources->pose_binding->Record(command, layout, binding_state);
         for (const auto &draw : inputs->draws) {
-            const auto &gpu =
-                at(at(inputs->prepared->meshes, draw.mesh).primitives,
-                   draw.primitive);
+            const auto &gpu = at(
+                at(inputs->resources->prepared->meshes, draw.mesh).primitives,
+                draw.primitive);
             d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                *pipelines[usize(draw.transparent ? 1 : 0)]
+                                *(*pipelines)[usize(draw.transparent ? 1 : 0)]
                                      .pipeline->pipeline.handle);
-            at(inputs->prepared->materials, draw.material)
+            at(inputs->resources->prepared->materials, draw.material)
                 .descriptor.Record(command, layout, binding_state);
             gpu.morph_binding->Record(command, layout, binding_state);
             d.vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
@@ -373,10 +413,64 @@ struct ModelPrepared {
         return Ok(empty{});
     }
 };
-struct ModelBackend {
-    Arc<RenderInputs> inputs;
-    auto Prepare(const vrento::vulkan::PassDescription &, const vk::GraphPrepareContext &context)
-        -> Result<vrento::Preparation<Arc<dyn<vk::PreparedVulkanPass>>>, vk::GraphExecutionError>;
+struct ModelPassDesc {
+    using PassDescriptor = ModelPassDesc;
+    vk::VulkanPassIO io;
+    vk::RenderPassResourceDesc signature;
+};
+struct ModelPass {
+    using FrameData = ModelFrameData;
+    Arc<RenderCore> core;
+    Arc<Vec<registry::PipelineResourceResult>> pipelines;
+    auto Instantiate(const vk::GraphPrepareContext &context,
+                     Arc<FrameData> frame) const
+        -> Result<vrento::Preparation<Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError> {
+        if (!context.scope)
+            return Err(
+                vk::GraphExecutionError{vk::GraphExecutionStage::Schema});
+        return Ok(Arc<dyn<vk::VulkanPass>>::make(
+            ModelPrepared{rstd::move(frame), pipelines.clone()}));
+    }
+};
+struct ModelPassFactory {
+    using Pass = ModelPass;
+    Arc<RenderCore> core;
+    auto Compile(const ModelPassDesc &desc,
+                 const vk::PassExecutionInfo &execution,
+                 const vk::PassCompileContext &)
+        -> Result<vrento::Preparation<Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError> {
+        Vec<registry::PipelineResourceResult> pipelines;
+        for (const auto &recipe : core->recipes) {
+            auto prepared = core->preparation->prepare(recipe, desc.signature);
+            if (prepared.is_err())
+                return Err(vk::GraphExecutionError{
+                    vk::GraphExecutionStage::Prepare,
+                    execution.id,
+                    {},
+                    vk::GraphExecutionCause::Resource(
+                        res::ResourceErrorSnapshot(prepared.unwrap_err()))});
+            auto value = prepared.unwrap();
+            if (value.error)
+                return Err(vk::GraphExecutionError{
+                    vk::GraphExecutionStage::Prepare,
+                    execution.id,
+                    {},
+                    vk::GraphExecutionCause::Resource(
+                        res::ResourceErrorSnapshot(
+                            value.error.take().unwrap()))});
+            if (value.status == registry::PipelineReadiness::Pending)
+                return Ok(vrento::PendingPreparation{});
+            if (!value.pipeline)
+                return Err(vk::GraphExecutionError{
+                    vk::GraphExecutionStage::Prepare, execution.id});
+            pipelines.push(value.pipeline.take().unwrap());
+        }
+        return Ok(Arc<dyn<vk::VulkanPass>>::make(ModelPass{
+            core.clone(), Arc<Vec<registry::PipelineResourceResult>>::make(
+                              rstd::move(pipelines))}));
+    }
 };
 struct ModelScopes {
     Arc<RenderCore> core;
@@ -391,24 +485,6 @@ struct ModelScopes {
 
 namespace rstd {
 template <>
-struct Impl<vrento::vulkan::PreparedVulkanPass, vecgltf::ModelPrepared>
-    : ImplBase<vecgltf::ModelPrepared> {
-    auto Record(vrento::vulkan::GraphRecordContext &context) const
-        -> Result<empty, vrento::vulkan::GraphExecutionError> {
-        return self().Record(context);
-    }
-};
-template <>
-struct Impl<vrento::vulkan::VulkanPassBackend, vecgltf::ModelBackend>
-    : ImplBase<vecgltf::ModelBackend> {
-    auto Prepare(const vrento::vulkan::PassDescription &pass,
-                 const vrento::vulkan::GraphPrepareContext &context)
-        -> Result<vrento::Preparation<sync::Arc<dyn<vrento::vulkan::PreparedVulkanPass>>>,
-                  vrento::vulkan::GraphExecutionError> {
-        return self().Prepare(pass, context);
-    }
-};
-template <>
 struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
     : ImplBase<vecgltf::ModelScopes> {
     auto Prepare(const vrento::vulkan::GraphicsDescription &description,
@@ -420,30 +496,6 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
     }
 };
 } // namespace rstd
-namespace vecgltf {
-auto ModelBackend::Prepare(const vrento::vulkan::PassDescription &pass,
-                           const vk::GraphPrepareContext &context)
-    -> Result<vrento::Preparation<Arc<dyn<vk::PreparedVulkanPass>>>, vk::GraphExecutionError> {
-    if (!pass.parameters.is_empty() || !context.scope)
-        return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Schema});
-    Vec<registry::PipelineResourceResult> pipelines;
-    for (const auto &recipe : inputs->prepared->core->recipes) {
-        auto prepared = inputs->prepared->core->preparation->prepare(
-            recipe, (*context.scope)->Info().signature);
-        if (prepared.is_err())
-            return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
-        auto value = prepared.unwrap();
-        if (value.status == registry::PipelineReadiness::Pending)
-            return Ok(vrento::PendingPreparation{});
-        if (value.status != registry::PipelineReadiness::Ready)
-            return Err(vk::GraphExecutionError{vk::GraphExecutionStage::Prepare});
-        pipelines.push(value.pipeline.take().unwrap());
-    }
-    return Ok(Arc<dyn<vk::PreparedVulkanPass>>::make(
-        ModelPrepared{inputs.clone(), rstd::move(pipelines)}));
-}
-} // namespace vecgltf
-
 export namespace vecgltf {
 enum class DebugView { None, BaseColor, Normal, Metallic, Roughness, Emissive };
 struct RenderOptions {
@@ -478,6 +530,25 @@ class Renderer {
     Option<vrento::texture::TextureViewRef> depth_;
     VkExtent2D extent_{};
     RendererStatistics statistics_;
+    Option<vk::Renderer> compiler_;
+    struct GraphShape {
+        struct Resource {
+            vrento::fg::ResourceId id;
+            vrento::fg::ResourceKind kind;
+            rstd::uint64_t bytes{};
+            unsigned mips{1}, layers{1};
+            bool imported{true};
+            VkFormat format{VK_FORMAT_UNDEFINED};
+            unsigned width{}, height{}, aspects{1};
+            friend bool operator==(const Resource &,
+                                   const Resource &) = default;
+        };
+        Vec<Resource> resources;
+        vk::PassExecutionInfo pass;
+        friend bool operator==(const GraphShape &,
+                               const GraphShape &) = default;
+    };
+    Option<GraphShape> graph_shape_;
     explicit Renderer(Arc<RenderCore> core) : core_(rstd::move(core)) {}
 
   public:
@@ -492,9 +563,9 @@ class Renderer {
         if (!session.valid())
             return Err(render_error("create"_str, "invalid device"_str));
         auto core = Arc<RenderCore>::make(rstd::move(session));
-        if (!initialize(*core, mode))
-            return Err(render_error("create"_str,
-                                    "could not create model pipeline"_str));
+        auto initialized = initialize(*core, mode);
+        if (initialized.is_err())
+            return Err(initialized.unwrap_err());
         Renderer result(rstd::move(core));
         auto environment = result.set_environment(default_environment());
         if (environment.is_err())
@@ -505,6 +576,9 @@ class Renderer {
         return Ok(rstd::move(result));
     }
     const RendererStatistics &statistics() const { return statistics_; }
+    auto graph_statistics() const -> vk::RendererStatistics {
+        return compiler_ ? compiler_->statistics() : vk::RendererStatistics{};
+    }
     auto upload_statistics() const -> vk::BufferUploadStatistics {
         return core_->buffers.statistics();
     }
@@ -522,32 +596,38 @@ class Renderer {
                                         ErrorKind::InvalidAsset));
         auto processed = preprocess_environment(rstd::move(source));
         auto environment = Arc<PreparedEnvironment>::make(core_.clone());
-        auto add = [&](Vec<HdrImage> images, bool wrap = true) {
+        auto add = [&](Vec<HdrImage> images,
+                       bool wrap = true) -> Result<empty, Error> {
             auto result = upload_environment_image(
                 dyn<vrento::texture::TextureDevice>::from_ref(
                     *core_->image_device)
                     .as_mut_ref(),
                 rstd::move(images), wrap);
             if (result.is_err())
-                return false;
+                return Err(texture_error(result.unwrap_err()));
             environment->textures.push(
                 Arc<vrento::texture::PreparedImage>::make(
                     rstd::move(result).unwrap()));
-            return true;
+            return Ok(empty{});
         };
-        if (!add(rstd::move(processed.specular)))
-            return Err(
-                render_error("environment"_str, "specular upload failed"_str));
+        auto specular = add(rstd::move(processed.specular));
+        if (specular.is_err())
+            return specular;
         Vec<HdrImage> diffuse;
         diffuse.push(rstd::move(processed.diffuse));
         Vec<HdrImage> brdf;
         brdf.push(rstd::move(processed.brdf));
         Vec<HdrImage> background;
         background.push(rstd::move(processed.background));
-        if (!add(rstd::move(diffuse)) || !add(rstd::move(brdf), false) ||
-            !add(rstd::move(background)))
-            return Err(
-                render_error("environment"_str, "image upload failed"_str));
+        auto diffuse_ready = add(rstd::move(diffuse));
+        if (diffuse_ready.is_err())
+            return diffuse_ready;
+        auto brdf_ready = add(rstd::move(brdf), false);
+        if (brdf_ready.is_err())
+            return brdf_ready;
+        auto background_ready = add(rstd::move(background));
+        if (background_ready.is_err())
+            return background_ready;
         environment_ = Some(rstd::move(environment));
         ++statistics_.environment_preparations;
         return Ok(empty{});
@@ -577,10 +657,10 @@ class Renderer {
             return allocation;
         };
         auto texture = [&](unsigned index,
-                           bool srgb) -> Option<PreparedTexture> {
+                           bool srgb) -> Result<PreparedTexture, Error> {
             for (const auto &existing : data->textures)
                 if (existing.texture == index && existing.srgb == srgb)
-                    return Some(PreparedTexture(existing));
+                    return Ok(PreparedTexture(existing));
             unsigned image_index = index == invalid_index
                                        ? invalid_index
                                        : at(data->asset->textures, index).image;
@@ -601,7 +681,7 @@ class Renderer {
                                         : at(data->asset->images, image_index),
                                     srgb);
                 if (prepared.is_err())
-                    return None();
+                    return Err(texture_error(prepared.unwrap_err()));
                 image = Some(Arc<vrento::texture::PreparedImage>::make(
                     prepared.unwrap()));
                 data->images.push({image_index, srgb, image->clone()});
@@ -611,11 +691,11 @@ class Renderer {
                     ? Sampler{}
                     : at(data->asset->textures, index).sampler)});
             if (sampler.is_err())
-                return None();
+                return Err(texture_error(sampler.unwrap_err()));
             PreparedTexture result{index, srgb, (*image)->view,
                                    sampler.unwrap()};
             data->textures.push(PreparedTexture(result));
-            return Some(rstd::move(result));
+            return Ok(rstd::move(result));
         };
         for (const auto &material : data->asset->materials) {
             const TextureBinding *bindings[]{
@@ -643,10 +723,8 @@ class Renderer {
                     float(binding.uv),
                     binding.texture == invalid_index ? 0.0f : 1.0f};
                 auto image = texture(binding.texture, i == 0 || i == 4);
-                if (image.is_none())
-                    return Err(
-                        render_error("prepare texture"_str,
-                                     "image allocation or upload failed"_str));
+                if (image.is_err())
+                    return Err(image.unwrap_err());
                 auto sampled =
                     vk::sampled_image(image->view, image->sampler).unwrap();
                 images[i] = {i, sampled.image, sampled.layout};
@@ -667,9 +745,8 @@ class Renderer {
                     &buffer_binding, usize(1)),
                 registry::DescriptorBindingReuse::Shared);
             if (descriptor.is_err())
-                return Err(
-                    render_error("prepare material"_str,
-                                 descriptor.unwrap_err().message.as_str()));
+                return Err(backend_error("prepare material"_str,
+                                         descriptor.unwrap_err()));
             data->materials.push(
                 {rstd::move(buffer).unwrap(), descriptor.unwrap()});
         }
@@ -781,11 +858,22 @@ class Renderer {
         for (const auto &recipe : core_->recipes) {
             auto result = core_->preparation->prepare(recipe, signature, retry);
             if (result.is_err())
-                return Err(render_error("prepare target"_str,
-                                        "pipeline task failed"_str));
+                return Err(
+                    backend_error("prepare target"_str, result.unwrap_err()));
             auto value = result.unwrap();
+            if (value.error)
+                return Err(backend_error("prepare target"_str,
+                                         value.error.take().unwrap()));
             if (value.status == registry::PipelineReadiness::Failed)
-                return Ok(registry::PipelineReadiness::Failed);
+                return Err(render_error("prepare target"_str,
+                                        "pipeline preparation failed"_str));
+            if (value.pipeline) {
+                bool retained{};
+                for (const auto &cached : core_->warmed)
+                    retained |= cached.handle == value.pipeline->handle;
+                if (!retained)
+                    core_->warmed.push(value.pipeline.take().unwrap());
+            }
             if (value.status == registry::PipelineReadiness::Pending)
                 status = value.status;
         }
@@ -846,14 +934,22 @@ class Renderer {
                 return resized;
         }
         auto depth = destination.depth ? *destination.depth : *depth_;
+        struct RecordingGuard {
+            vrento::texture::Submission &work;
+            bool accepted{};
+            ~RecordingGuard() {
+                if (!accepted)
+                    work.discard();
+            }
+        } recording{work};
         auto native_command = vk::native_recording(work, core_->session);
         if (native_command.is_err())
             return Err(texture_error(native_command.unwrap_err()));
         auto command_buffer = native_command.unwrap();
-        auto inputs = Arc<RenderInputs>::make(prepared.data_.clone(), depth,
-                                              work.receipt());
-        inputs->environment = Some(environment_->clone());
-        inputs->background = options.background;
+        auto resources = Arc<ModelFrameResources>::make(prepared.data_.clone(),
+                                                        depth, work.receipt());
+        resources->environment = Some(environment_->clone());
+        ModelFrameData inputs{resources.clone(), {}, options.background};
         struct PoseOffsets {
             unsigned skin{invalid_index}, weights{};
         };
@@ -887,23 +983,23 @@ class Renderer {
             return Err(render_error(
                 "pose"_str, "pose data exceeds device storage range"_str,
                 ErrorKind::Limit));
-        inputs->poses = core_->buffers.Allocate(
+        resources->poses = core_->buffers.Allocate(
             {pose_bytes,
              core_->session.device().limits().minStorageBufferOffsetAlignment,
              vk::BufferUploadClass::Storage});
-        if (inputs->poses.is_none() ||
+        if (resources->poses.is_none() ||
             core_->buffers
-                .QueueWrite(*inputs->poses,
+                .QueueWrite(*resources->poses,
                             slice<rstd::uint8_t>::from_raw_parts(
                                 reinterpret_cast<const rstd::uint8_t *>(
                                     pose_data.data()),
                                 usize(pose_bytes)))
                 .is_none())
             return Err(render_error("pose"_str, "pose upload failed"_str));
-        auto pose_binding = bind_storage(*core_, *inputs->poses, 2);
+        auto pose_binding = bind_storage(*core_, *resources->poses, 2);
         if (pose_binding.is_err())
             return Err(pose_binding.unwrap_err());
-        inputs->pose_binding = Some(pose_binding.unwrap());
+        resources->pose_binding = Some(pose_binding.unwrap());
         const auto &d = core_->session.device().handle().Dispatch();
         vvk::CommandBuffer command(command_buffer, d);
         FrameParameters frame_parameters{
@@ -913,15 +1009,15 @@ class Renderer {
             (view.projection * view.view)
                 .inverse()
                 .unwrap_or(Mat4::Identity())};
-        inputs->frame_buffer = core_->buffers.Allocate(
+        resources->frame_buffer = core_->buffers.Allocate(
             {sizeof(FrameParameters),
              core_->session.device().limits().minUniformBufferOffsetAlignment,
              vk::BufferUploadClass::Uniform});
-        if (!inputs->frame_buffer)
+        if (!resources->frame_buffer)
             return Err(
                 render_error("frame"_str, "frame allocation failed"_str));
         if (core_->buffers
-                .QueueWrite(*inputs->frame_buffer,
+                .QueueWrite(*resources->frame_buffer,
                             slice<rstd::uint8_t>::from_raw_parts(
                                 reinterpret_cast<const rstd::uint8_t *>(
                                     &frame_parameters),
@@ -931,15 +1027,16 @@ class Renderer {
                 render_error("frame"_str, "view parameter upload failed"_str));
         registry::DescriptorImageBinding images[4];
         for (unsigned i = 0; i < 4; ++i) {
-            auto sampled = vk::sampled_image(
-                               at((*inputs->environment)->textures, i)->view,
-                               at((*inputs->environment)->textures, i)->sampler)
-                               .unwrap();
+            auto sampled =
+                vk::sampled_image(
+                    at((*resources->environment)->textures, i)->view,
+                    at((*resources->environment)->textures, i)->sampler)
+                    .unwrap();
             images[i] = {i + 1, sampled.image, sampled.layout};
         }
         registry::DescriptorBufferBinding frame{
-            0, inputs->frame_buffer->buffer(), inputs->frame_buffer->offset(),
-            sizeof(FrameParameters)};
+            0, resources->frame_buffer->buffer(),
+            resources->frame_buffer->offset(), sizeof(FrameParameters)};
         auto descriptor = core_->descriptors.Prepare(
             core_->session.device(), 0,
             **core_->descriptor_layouts.Resolve(core_->frame_layout),
@@ -949,17 +1046,17 @@ class Renderer {
                                                                      usize(1)),
             registry::DescriptorBindingReuse::Shared);
         if (descriptor.is_err())
-            return Err(render_error("frame descriptor"_str,
-                                    descriptor.unwrap_err().message.as_str()));
-        inputs->frame_binding = Some(descriptor.unwrap());
+            return Err(
+                backend_error("frame descriptor"_str, descriptor.unwrap_err()));
+        resources->frame_binding = Some(descriptor.unwrap());
         vk::RecordedBufferUploads recorded;
         if (core_->buffers.HasPendingUploads()) {
             if (!core_->buffers.RecordPendingUploads(command, recorded))
                 return Err(
                     render_error("upload"_str, "buffer recording failed"_str));
-            inputs->uploads =
+            resources->uploads =
                 core_->buffers.CommitRecordedUploads(rstd::move(recorded));
-            if (!inputs->uploads)
+            if (!resources->uploads)
                 return Err(render_error("upload"_str,
                                         "buffer upload lease failed"_str));
         }
@@ -1037,10 +1134,11 @@ class Renderer {
             constants.weight_offset = at(pose_offsets, n).weights;
             constants.morph_count = unsigned(count(primitive.morphs));
             constants.vertex_count = gpu.vertex_count;
-            inputs->draws.push({mesh_index, p, primitive.material, constants,
-                                draw.transparent});
+            inputs.draws.push({mesh_index, p, primitive.material, constants,
+                               draw.transparent});
         }
-        vrento::vulkan::PassDescription pass;
+        GraphShape shape;
+        auto &pass = shape.pass;
         pass.id = {1};
         pass.kind = model_kind;
         vk::GraphBindings bindings(1);
@@ -1052,14 +1150,26 @@ class Renderer {
                     references[i].description() == view.description())
                     return vrento::vulkan::ResourceId{i.to_primitive() + 1, 1};
             vrento::vulkan::ResourceId id{references.len().to_primitive() + 1, 1};
-            bindings
-                .bind(id, Arc<dyn<vk::GraphBinding>>::make(
-                              vk::GraphTextureBinding(view)))
-                .unwrap();
+            auto binding =
+                Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view));
+            auto info = binding->Info();
+            bindings.bind(id, rstd::move(binding)).unwrap();
+            const auto &desc = view.texture().description();
+            const auto range = view.description().range;
+            const auto extent =
+                vrento::texture::mip_extent(desc, range.first_mip);
+            shape.resources.push({id, vrento::fg::ResourceKind::Texture, 0,
+                                  range.mip_count, range.layer_count, true,
+                                  vk::ToVkType(desc.format), extent.width,
+                                  extent.height, info.aspects});
             references.push(rstd::move(view));
             return id;
         };
         auto color_id = bind(target), depth_id = bind(depth);
+        shape.resources[usize()].imported =
+            destination.color_load == vk::AttachmentLoad::Load;
+        shape.resources[usize(1)].imported =
+            destination.depth_load == vk::AttachmentLoad::Load;
         auto attachment = [&](vrento::vulkan::ResourceId id,
                               vrento::vulkan::PassUsage usage,
                               vrento::vulkan::PassStages stages,
@@ -1122,13 +1232,15 @@ class Renderer {
             vrento::vulkan::PassResourceUse use{id, 0, vrento::vulkan::GraphAccess::Read,
                                         usage, stages};
             use.range.size = allocation.size();
+            shape.resources.push(
+                {id, vrento::fg::ResourceKind::Buffer, allocation.size()});
             pass.uses.push(rstd::move(use));
         };
-        buffer_use(*inputs->frame_buffer, vrento::vulkan::PassUsage::Uniform,
+        buffer_use(*resources->frame_buffer, vrento::vulkan::PassUsage::Uniform,
                    vrento::vulkan::PassStages::Fragment);
         buffer_use(*core_->zero_buffer, vrento::vulkan::PassUsage::Storage,
                    vrento::vulkan::PassStages::Vertex);
-        buffer_use(*inputs->poses, vrento::vulkan::PassUsage::Storage,
+        buffer_use(*resources->poses, vrento::vulkan::PassUsage::Storage,
                    vrento::vulkan::PassStages::Vertex);
         for (const auto &material : prepared.data_->materials)
             buffer_use(material.parameters, vrento::vulkan::PassUsage::Uniform,
@@ -1147,40 +1259,133 @@ class Renderer {
                                vrento::vulkan::PassStages::Vertex);
             }
         core_->scopes.collect();
-        vk::VulkanPassBackends backends;
-        backends.set_scopes(Box<dyn<vk::GraphicsScopeBackend>>::make(
-            ModelScopes{core_.clone()}));
-        backends
-            .bind(model_kind, 1,
-                  Box<dyn<vk::VulkanPassBackend>>::make(
-                      ModelBackend{inputs.clone()}))
-            .unwrap();
-        auto result = vk::record_vulkan_pass(core_->session, rstd::move(pass),
-                                             bindings, backends, work);
-        if (result.is_err()) {
-            const auto error = result.unwrap_err();
-            if (error.texture_error())
-                return Err(texture_error(*error.texture_error()));
-            return Err(render_error(
-                "model pass"_str,
-                rstd::format("stage={} native={}", unsigned(error.stage), error.native_result())
-                    .as_str()));
+        if (!compiler_) {
+            compiler_ = Some(vk::Renderer(core_->session));
+            compiler_
+                ->bind(Arc<dyn<vk::PassFactory>>::make(
+                    vk::TypedPassFactory<ModelPassDesc, ModelPassFactory>{
+                        ModelPassFactory{core_.clone()}}))
+                .unwrap();
         }
-        if (*result == vk::FrameProgress::Pending)
-            return Err(
-                render_error("model pass"_str, "pass preparation pending"_str, ErrorKind::Pending));
+        if (!graph_shape_ || *graph_shape_ != shape) {
+            vrento::fg::FrameGraphBuilder builder(1);
+            for (const auto &resource : shape.resources) {
+                vrento::fg::ResourceDescription desc{
+                    .id = resource.id,
+                    .kind = resource.kind,
+                    .bytes = resource.bytes,
+                    .mip_levels = resource.mips,
+                    .layers = resource.layers,
+                    .aspects = resource.aspects};
+                auto declared = resource.imported
+                                    ? builder.import_resource(rstd::move(desc))
+                                    : builder.create_resource(rstd::move(desc));
+                if (declared.is_err())
+                    return Err(graph_error(declared.unwrap_err()));
+            }
+            auto added = builder.add_pass(pass.id);
+            if (added.is_err())
+                return Err(graph_error(added.unwrap_err()));
+            ModelPassDesc desc;
+            desc.io.kind = model_kind;
+            desc.io.graphics = pass.graphics;
+            desc.signature.color_format = vk::ToVkType(target_desc.format);
+            desc.signature.has_depth_attachment = true;
+            desc.signature.depth_format =
+                vk::ToVkType(depth.texture().description().format);
+            for (const auto &use : pass.uses) {
+                if (use.access != vk::GraphAccess::Write)
+                    continue;
+                bool inherits =
+                    use.resource == color_id
+                        ? destination.color_load == vk::AttachmentLoad::Load
+                        : destination.depth_load == vk::AttachmentLoad::Load;
+                auto output = builder.reserve_write(pass.id, {use.resource, 0},
+                                                    inherits, inherits);
+                if (output.is_err())
+                    return Err(graph_error(output.unwrap_err()));
+                if (inherits)
+                    desc.io.storage.push({vrento::pass::ContentRef::bind(
+                                              builder, {use.resource, 1})
+                                              .unwrap(),
+                                          vrento::pass::ContentRef::bind(
+                                              builder, {use.resource, 0})
+                                              .unwrap()});
+            }
+            for (const auto &use : pass.uses) {
+                auto content = vrento::pass::ContentRef::bind(
+                    builder, {use.resource, use.version});
+                if (content.is_err())
+                    return Err(graph_error(content.unwrap_err()));
+                vk::VulkanResourceUse value{content.unwrap(), use.usage,
+                                            use.stages, use.range};
+                if (use.access == vk::GraphAccess::Read)
+                    desc.io.inputs.push(rstd::move(value));
+                else
+                    desc.io.outputs.push(rstd::move(value));
+            }
+            auto published =
+                vk::declare_input(builder, pass.id, rstd::move(desc));
+            if (published.is_err())
+                return Err(graph_error(published.unwrap_err()));
+            auto graph = rstd::move(builder).finish();
+            if (graph.is_err())
+                return Err(graph_error(graph.unwrap_err()));
+            Vec<vk::PassInput> descriptions;
+            descriptions.push(published.unwrap());
+            auto compiled =
+                compiler_->compile(graph.unwrap(), rstd::move(descriptions));
+            if (compiled.is_err())
+                return Err(graph_error(compiled.unwrap_err()));
+            graph_shape_ = Some(rstd::move(shape));
+        }
+        if (compiler_->pending()) {
+            auto continued =
+                compiler_->continue_compile(compiler_->status().id);
+            if (continued.is_err())
+                return Err(graph_error(continued.unwrap_err()));
+            if (*continued == vk::CompileProgress::Pending)
+                return Err(render_error("model pass"_str,
+                                        "prewarmed pipeline unavailable"_str));
+        }
+        auto compiled = compiler_->compiled().unwrap();
+        auto frame_binding =
+            compiled.frame<ModelPass>({1}, 1, rstd::move(inputs));
+        if (frame_binding.is_err())
+            return Err(graph_error(frame_binding.unwrap_err()));
+        Vec<vk::PassFrameBinding> frames;
+        frames.push(frame_binding.unwrap());
+        auto prepared_frame =
+            compiled.instantiate(bindings, frames.as_slice(),
+                                 Box<dyn<vk::GraphicsScopeBackend>>::make(
+                                     ModelScopes{core_.clone()}),
+                                 true, &work);
+        if (prepared_frame.is_err())
+            return Err(graph_error(prepared_frame.unwrap_err()));
+        if (!prepared_frame->ready())
+            return Err(render_error(
+                "model pass"_str, "unexpected frame preparation pending"_str));
+        auto program = prepared_frame->take_ready();
+        auto recorded_frame = program.record(work);
+        if (recorded_frame.is_err())
+            return Err(graph_error(recorded_frame.unwrap_err()));
         auto sampled = work.commands()->UseTexture(
             {target, vrento::texture::Access::Sampled,
              vrento::texture::Stages::Fragment});
         if (sampled.is_err())
             return Err(texture_error(sampled.unwrap_err()));
+        recording.accepted = true;
         ++statistics_.recorded_frames;
         return Ok(empty{});
     }
     void close() {
+        compiler_ = None();
+        graph_shape_ = None();
         depth_ = None();
-        if (core_ && core_->preparation)
+        if (core_ && core_->preparation) {
             core_->preparation->close();
+            core_->warmed.clear();
+        }
     }
 };
 } // namespace vecgltf
