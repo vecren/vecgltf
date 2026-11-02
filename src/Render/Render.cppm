@@ -47,6 +47,7 @@ auto graph_error(vrento::fg::Error error) -> Error {
 }
 struct RenderCore {
     vk::DeviceSession session;
+    LoadTrace trace;
     vk::BufferManager buffers;
     Option<vk::TextureContext> image_device;
     registry::DescriptorLayoutRegistry &descriptor_layouts;
@@ -59,8 +60,9 @@ struct RenderCore {
     vk::GraphicsScopeCache scopes;
     Vec<registry::PipelineResourceResult> warmed;
     Option<vrento::texture::SubmissionReceipt> latest;
-    explicit RenderCore(vk::DeviceSession device)
-        : session(rstd::move(device)), buffers(session.device()),
+    explicit RenderCore(vk::DeviceSession device, LoadTrace observer)
+        : session(rstd::move(device)), trace(rstd::move(observer)),
+          buffers(session.device()),
           image_device(None()),
           descriptor_layouts(session.graphics_resources().descriptors) {}
     ~RenderCore() {
@@ -91,7 +93,7 @@ struct PreparedTexture {
 struct PreparedImageEntry {
     unsigned image{};
     bool srgb{};
-    Arc<vrento::texture::PreparedImage> source;
+    Arc<PreparedTextureImage> source;
 };
 struct MaterialParameters {
     Vec4 base, emissive, factors, flags;
@@ -165,13 +167,14 @@ auto shader(const unsigned (&code)[N], vrento::ShaderType stage)
     -> vk::Uni_ShaderSpv {
     auto result = Box<vk::ShaderSpv>::make();
     result->stage = stage;
-    for (auto word : code)
-        result->spirv.push(unsigned(word));
+    result->spirv = vrento::ShaderCode::from(
+        slice<rstd::uint32_t>::from_raw_parts(code, usize(N)));
     return result;
 }
 
 auto initialize(RenderCore &core, vk::PipelinePreparationMode mode)
     -> Result<empty, Error> {
+    LoadScope scope(core.trace, LoadEvent::RendererInitialize);
     auto preparation = vk::PipelinePreparationQueue::create(core.session, mode);
     if (preparation.is_err())
         return Err(
@@ -558,11 +561,13 @@ class Renderer {
     ~Renderer() { close(); }
     static auto create(vk::DeviceSession session, VkExtent2D extent,
                        vk::PipelinePreparationMode mode =
-                           vk::PipelinePreparationMode::Synchronous)
+                           vk::PipelinePreparationMode::Synchronous,
+                       LoadTrace trace = {})
         -> Result<Renderer, Error> {
+        LoadScope scope(trace, LoadEvent::RendererCreate);
         if (!session.valid())
             return Err(render_error("create"_str, "invalid device"_str));
-        auto core = Arc<RenderCore>::make(rstd::move(session));
+        auto core = Arc<RenderCore>::make(rstd::move(session), rstd::move(trace));
         auto initialized = initialize(*core, mode);
         if (initialized.is_err())
             return Err(initialized.unwrap_err());
@@ -583,6 +588,7 @@ class Renderer {
         return core_->buffers.statistics();
     }
     auto set_environment(HdrImage source) -> Result<empty, Error> {
+        LoadScope scope(core_->trace, LoadEvent::Environment);
         if (!source.width || !source.height ||
             count(source.rgba) !=
                 rstd::size_t(source.width) * source.height * 4)
@@ -594,7 +600,7 @@ class Renderer {
                 return Err(render_error("environment"_str,
                                         "invalid HDR radiance"_str,
                                         ErrorKind::InvalidAsset));
-        auto processed = preprocess_environment(rstd::move(source));
+        auto processed = preprocess_environment(rstd::move(source), core_->trace);
         auto environment = Arc<PreparedEnvironment>::make(core_.clone());
         auto add = [&](Vec<HdrImage> images,
                        bool wrap = true) -> Result<empty, Error> {
@@ -602,7 +608,7 @@ class Renderer {
                 dyn<vrento::texture::TextureDevice>::from_ref(
                     *core_->image_device)
                     .as_mut_ref(),
-                rstd::move(images), wrap);
+                rstd::move(images), wrap, core_->trace);
             if (result.is_err())
                 return Err(texture_error(result.unwrap_err()));
             environment->textures.push(
@@ -633,6 +639,7 @@ class Renderer {
         return Ok(empty{});
     }
     auto prepare(Arc<Asset> asset) -> Result<PreparedAsset, Error> {
+        LoadScope scope(core_->trace, LoadEvent::PrepareAsset);
         auto data = Arc<PreparedData>::make(core_.clone(), rstd::move(asset));
         auto upload =
             [&](const void *bytes, rstd::size_t size,
@@ -664,7 +671,7 @@ class Renderer {
             unsigned image_index = index == invalid_index
                                        ? invalid_index
                                        : at(data->asset->textures, index).image;
-            Option<Arc<vrento::texture::PreparedImage>> image;
+            Option<Arc<PreparedTextureImage>> image;
             auto device = dyn<vrento::texture::TextureDevice>::from_ref(
                 *core_->image_device);
             for (auto &existing : data->images)
@@ -675,14 +682,14 @@ class Renderer {
                 white.width = white.height = 1;
                 white.rgba.resize(usize(4), u8(255));
                 auto prepared =
-                    prepare_texture(device.as_mut_ref(),
+                    prepare_texture(core_->session, device.as_mut_ref(),
                                     image_index == invalid_index
                                         ? white
                                         : at(data->asset->images, image_index),
-                                    srgb);
+                                    srgb, core_->trace);
                 if (prepared.is_err())
                     return Err(texture_error(prepared.unwrap_err()));
-                image = Some(Arc<vrento::texture::PreparedImage>::make(
+                image = Some(Arc<PreparedTextureImage>::make(
                     prepared.unwrap()));
                 data->images.push({image_index, srgb, image->clone()});
             }
@@ -692,11 +699,12 @@ class Renderer {
                     : at(data->asset->textures, index).sampler)});
             if (sampler.is_err())
                 return Err(texture_error(sampler.unwrap_err()));
-            PreparedTexture result{index, srgb, (*image)->view,
+            PreparedTexture result{index, srgb, (*image)->image.view,
                                    sampler.unwrap()};
             data->textures.push(PreparedTexture(result));
             return Ok(rstd::move(result));
         };
+        LoadScope materials(core_->trace, LoadEvent::PrepareMaterials);
         for (const auto &material : data->asset->materials) {
             const TextureBinding *bindings[]{
                 &material.base, &material.physical, &material.normal,
@@ -750,6 +758,8 @@ class Renderer {
             data->materials.push(
                 {rstd::move(buffer).unwrap(), descriptor.unwrap()});
         }
+        materials.finish();
+        LoadScope geometry(core_->trace, LoadEvent::PrepareGeometry);
         for (const auto &mesh : data->asset->meshes) {
             PreparedMesh prepared;
             for (const auto &primitive : mesh.primitives) {
@@ -810,6 +820,7 @@ class Renderer {
             }
             data->meshes.push(rstd::move(prepared));
         }
+        geometry.finish();
         ++statistics_.prepared_assets;
         return Ok(PreparedAsset(rstd::move(data)));
     }
@@ -1049,6 +1060,7 @@ class Renderer {
             return Err(
                 backend_error("frame descriptor"_str, descriptor.unwrap_err()));
         resources->frame_binding = Some(descriptor.unwrap());
+        LoadScope uploads(core_->trace, LoadEvent::Uploads);
         vk::RecordedBufferUploads recorded;
         if (core_->buffers.HasPendingUploads()) {
             if (!core_->buffers.RecordPendingUploads(command, recorded))
@@ -1060,31 +1072,18 @@ class Renderer {
                 return Err(render_error("upload"_str,
                                         "buffer upload lease failed"_str));
         }
-        auto prepare_image = [&](const vrento::texture::PreparedImage &source)
-            -> Result<empty, Error> {
-            if (!source.view.texture().ready().valid()) {
-                for (auto &upload : source.uploads) {
-                    auto queued = work.commands()->Upload(upload.clone());
-                    if (queued.is_err())
-                        return Err(texture_error(queued.unwrap_err()));
-                }
-            }
-            auto used = work.commands()->UseSampledView(
-                source.view, source.sampler, vrento::texture::Stages::Fragment);
-            if (used.is_err())
-                return Err(texture_error(used.unwrap_err()));
-            return Ok(empty{});
-        };
         for (auto &source : prepared.data_->images) {
-            auto result = prepare_image(*source.source);
+            auto result = record_texture(work, source.source->image,
+                                         source.source->mipmaps, core_->trace);
             if (result.is_err())
-                return result;
+                return Err(texture_error(result.unwrap_err()));
         }
         for (auto &source : (*environment_)->textures) {
-            auto result = prepare_image(*source);
+            auto result = record_texture(work, *source, {}, core_->trace);
             if (result.is_err())
-                return result;
+                return Err(texture_error(result.unwrap_err()));
         }
+        uploads.finish();
         const auto &asset = instance.asset();
         struct Draw {
             unsigned node{}, primitive{};
@@ -1211,7 +1210,7 @@ class Renderer {
             pass.uses.push(rstd::move(use));
         };
         for (const auto &source : prepared.data_->images)
-            sampled_use(source.source->view);
+            sampled_use(source.source->image.view);
         for (const auto &source : (*environment_)->textures)
             sampled_use(source->view);
         Vec<rstd::uint64_t> allocations;

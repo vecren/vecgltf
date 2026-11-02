@@ -95,6 +95,7 @@ struct Loader {
     return Ok(result);
   }
   auto materials() -> Result<empty, Error> {
+    LoadScope scope(options.trace, LoadEvent::Materials);
     for (cgltf_size i = 0; i < data.materials_count; ++i) {
       const auto &m = data.materials[i];
       const auto &p = m.pbr_metallic_roughness;
@@ -131,6 +132,7 @@ struct Loader {
     return Ok(empty{});
   }
   auto images() -> Result<empty, Error> {
+    LoadScope scope(options.trace, LoadEvent::Images);
     Vec<unsigned> image_indices;
     image_indices.resize(usize(data.images_count), invalid_index);
     for (cgltf_size i = 0; i < data.images_count; ++i) {
@@ -142,6 +144,7 @@ struct Loader {
       const auto &input = data.images[i];
       int width{}, height{}, channels{};
       Pixels pixels;
+      LoadScope decode(options.trace, LoadEvent::ImageDecode);
       if (input.buffer_view) {
         auto bytes = cgltf_buffer_view_data(input.buffer_view);
         if (!bytes || input.buffer_view->size > 0x7fffffff)
@@ -198,6 +201,7 @@ struct Loader {
       if (!pixels.data)
         return Err(error(ErrorKind::Decode, rstd::format("images[{}]", i),
                          stbi_failure_reason()));
+      decode.finish();
       if (width <= 0 || height <= 0 ||
           rstd::size_t(width) >
               options.max_image_pixels.to_primitive() / rstd::size_t(height))
@@ -207,9 +211,11 @@ struct Loader {
       output.name = text(input.name);
       output.width = unsigned(width);
       output.height = unsigned(height);
+      LoadScope copy(options.trace, LoadEvent::ImageCopy);
       output.rgba = Vec<u8>::from(
           slice<u8>::from_raw_parts(static_cast<const byte *>(pixels.data),
                                     usize(rstd::size_t(width) * height * 4)));
+      copy.finish();
       at(image_indices, i) = unsigned(count(asset->images));
       asset->images.push(rstd::move(output));
     }
@@ -514,6 +520,7 @@ struct Loader {
     return Ok(rstd::move(result));
   }
   auto geometry() -> Result<empty, Error> {
+    LoadScope scope(options.trace, LoadEvent::Geometry);
     for (cgltf_size i = 0; i < data.meshes_count; ++i) {
       Mesh mesh;
       mesh.name = text(data.meshes[i].name);
@@ -542,6 +549,7 @@ struct Loader {
     return Ok(empty{});
   }
   auto scene() -> Result<empty, Error> {
+    LoadScope scope(options.trace, LoadEvent::Scene);
     for (cgltf_size i = 0; i < data.nodes_count; ++i) {
       const auto &n = data.nodes[i];
       Node node;
@@ -652,6 +660,7 @@ struct Loader {
     return Ok(empty{});
   }
   auto animations() -> Result<empty, Error> {
+    LoadScope scope(options.trace, LoadEvent::Animations);
     for (cgltf_size i = 0; i < data.animations_count; ++i) {
       const auto &input = data.animations[i];
       Animation animation;
@@ -749,10 +758,15 @@ struct Loader {
 
 auto LoadAsset(ref<str> path, LoadOptions options)
     -> Result<Arc<Asset>, Error> {
+  LoadScope scope(options.trace, LoadEvent::Asset);
   auto filename = terminated(path);
   Parsed parsed;
   cgltf_options opts{};
-  auto result = cgltf_parse_file(&opts, filename.begin(), &parsed.data);
+  cgltf_result result;
+  {
+    LoadScope document(options.trace, LoadEvent::Document);
+    result = cgltf_parse_file(&opts, filename.begin(), &parsed.data);
+  }
   auto failure = [&](ErrorKind kind, const char *location,
                      const char *message) {
     return Error{kind, String::make(path), text(location), text(message)};
@@ -774,11 +788,18 @@ auto LoadAsset(ref<str> path, LoadOptions options)
       loader.asset->diagnostics.push(
           {text(parsed.data->extensions_used[i]),
            "Using core fallback for unsupported optional extension"_Str});
-  result = cgltf_load_buffers(&opts, parsed.data, filename.begin());
+  {
+    LoadScope buffers(options.trace, LoadEvent::Buffers);
+    result = cgltf_load_buffers(&opts, parsed.data, filename.begin());
+  }
   if (result != cgltf_result_success)
     return Err(failure(ErrorKind::Io, "buffers",
                        "cannot load external or embedded buffer"));
-  if (cgltf_validate(parsed.data) != cgltf_result_success)
+  {
+    LoadScope validation(options.trace, LoadEvent::Validation);
+    result = cgltf_validate(parsed.data);
+  }
+  if (result != cgltf_result_success)
     return Err(
         failure(ErrorKind::InvalidAsset, "document", "glTF validation failed"));
   auto materials = loader.materials();

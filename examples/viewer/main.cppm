@@ -13,7 +13,8 @@ struct Options {
   String path, capture, environment;
   unsigned width{960}, height{720}, frames{}, scene{gltf::invalid_index},
       animation{gltf::invalid_index}, camera{gltf::invalid_index};
-  float time{};
+  float time{}, zoom{}, roll{};
+  gltf::Vec2 rotate{}, pan{};
   gltf::RenderOptions render;
   bool validation{}, headless{}, fixed_time{};
 };
@@ -29,6 +30,13 @@ bool parse(int argc, char **argv, Options &options) {
     auto number = [&](unsigned &target) {
       auto value = rstd::from_str<u32>(next());
       if (value.is_err())
+        return false;
+      target = value.unwrap().to_primitive();
+      return true;
+    };
+    auto real = [&](float &target) {
+      auto value = rstd::from_str<f32>(next());
+      if (value.is_err() || !value.unwrap().is_finite())
         return false;
       target = value.unwrap().to_primitive();
       return true;
@@ -79,6 +87,18 @@ bool parse(int argc, char **argv, Options &options) {
         return false;
       options.time = value.unwrap().to_primitive();
       options.fixed_time = true;
+    } else if (arg == "--zoom"_str) {
+      if (!real(options.zoom))
+        return false;
+    } else if (arg == "--rotate"_str) {
+      if (!real(options.rotate.x) || !real(options.rotate.y))
+        return false;
+    } else if (arg == "--pan"_str) {
+      if (!real(options.pan.x) || !real(options.pan.y))
+        return false;
+    } else if (arg == "--roll"_str) {
+      if (!real(options.roll))
+        return false;
     } else if (arg.starts_with("-"_str) || !options.path.is_empty())
       return false;
     else
@@ -123,8 +143,10 @@ int main(int argc, char **argv) {
         "usage: vecgltf-viewer model.gltf|model.glb [--headless] [--size W H] "
         "[--frames N] [--capture image.ppm] [--scene N] [--camera node] "
         "[--animation N] "
-        "[--time seconds] [--environment image.hdr] [--background] [--exposure "
-        "scale] [--debug 0..5] [--validation]");
+        "[--time seconds] [--zoom steps] [--rotate yaw pitch] [--pan x y] "
+        "[--roll radians] "
+        "[--environment image.hdr] [--background] [--exposure scale] "
+        "[--debug 0..5] [--validation]");
     return 2;
   }
   auto loaded = gltf::LoadAsset(options.path.as_str());
@@ -152,6 +174,10 @@ int main(int argc, char **argv) {
   instance.set_playing(!options.fixed_time);
   gltf::OrbitCamera camera;
   camera.fit(instance.bounds());
+  camera.zoom(options.zoom);
+  camera.rotate(options.rotate.x, options.rotate.y);
+  camera.pan(options.pan.x, options.pan.y);
+  camera.roll(options.roll);
   vui::sdl::Window window;
   vui::gpu::Renderer ui_renderer;
   auto gpu_error = [&](vui::gpu::Error error) {

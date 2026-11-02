@@ -11,6 +11,51 @@ using namespace vecgltf;
 using namespace rstd::literals;
 
 namespace vecgltf_test::asset {
+struct TraceEntry {
+  LoadEvent event;
+  bool begin;
+};
+struct TraceState {
+  Vec<TraceEntry> events;
+  Vec<LoadEvent> stack;
+  unsigned begins{}, ends{}, dropped{};
+};
+struct TraceObserver {
+  Arc<TraceState> state;
+  explicit TraceObserver(Arc<TraceState> value) : state(rstd::move(value)) {}
+  TraceObserver(TraceObserver &&) = default;
+  ~TraceObserver() {
+    if (state)
+      ++state->dropped;
+  }
+  void Begin(LoadEvent event) const {
+    if (event == LoadEvent::Asset)
+      rstd_assert(state->stack.is_empty());
+    if (event == LoadEvent::ImageDecode || event == LoadEvent::ImageCopy)
+      rstd_assert(!state->stack.is_empty() &&
+                  *state->stack.last().unwrap() == LoadEvent::Images);
+    state->events.push({event, true});
+    state->stack.push(LoadEvent(event));
+    ++state->begins;
+  }
+  void End() const {
+    rstd_assert(!state->stack.is_empty());
+    state->events.push({state->stack.pop().unwrap(), false});
+    ++state->ends;
+  }
+};
+} // namespace vecgltf_test::asset
+
+namespace rstd {
+template <>
+struct Impl<vecgltf::LoadObserver, vecgltf_test::asset::TraceObserver>
+    : ImplBase<vecgltf_test::asset::TraceObserver> {
+  void Begin(vecgltf::LoadEvent event) const { self().Begin(event); }
+  void End() const { self().End(); }
+};
+} // namespace rstd
+
+namespace vecgltf_test::asset {
 auto load(ref<str> path) -> Arc<Asset> {
   auto result = LoadAsset(path);
   if (result.is_err()) {
@@ -20,6 +65,57 @@ auto load(ref<str> path) -> Arc<Asset> {
     rstd::panic("asset load failed");
   }
   return result.unwrap();
+}
+TEST(Asset, LoadTrace) {
+  auto state = Arc<TraceState>::make();
+  LoadTrace trace(
+      Arc<dyn<LoadObserver>>::make(TraceObserver(state.clone())));
+  auto loaded = LoadAsset("tests/data/triangle.gltf"_str, {.trace = trace});
+  rstd_assert(loaded.is_ok() && state->stack.is_empty() &&
+              state->begins == state->ends);
+  rstd_assert(state->events[usize()].event == LoadEvent::Asset &&
+              state->events[usize()].begin);
+  rstd_assert(state->events.last().unwrap()->event == LoadEvent::Asset &&
+              !state->events.last().unwrap()->begin);
+  Option<usize> decode, copy;
+  for (usize i{}; i < state->events.len(); ++i) {
+    const auto &entry = state->events[i];
+    if (entry.begin && entry.event == LoadEvent::ImageDecode && !decode)
+      decode = Some(i);
+    if (entry.begin && entry.event == LoadEvent::ImageCopy && !copy)
+      copy = Some(i);
+  }
+  rstd_assert(decode && copy && *decode < *copy);
+  auto failed_begin = state->events.len();
+  auto failed = LoadAsset("tests/data/missing.gltf"_str, {.trace = trace});
+  rstd_assert(failed.is_err() && state->stack.is_empty() &&
+              state->begins == state->ends);
+  rstd_assert(state->events[failed_begin].event == LoadEvent::Asset &&
+              state->events[failed_begin].begin &&
+              state->events.last().unwrap()->event == LoadEvent::Asset &&
+              !state->events.last().unwrap()->begin);
+  auto ends = state->ends;
+  {
+    auto shared = trace;
+    LoadScope outer(shared, LoadEvent::Asset);
+    {
+      LoadScope original(trace, LoadEvent::Document);
+      auto moved = rstd::move(original);
+      trace = LoadTrace{};
+      shared = LoadTrace{};
+      rstd_assert(state->dropped == 0);
+      original.finish();
+      moved.finish();
+      moved.finish();
+      rstd_assert(state->ends == ends + 1 &&
+                  state->stack.len() == usize(1));
+    }
+    outer.finish();
+    outer.finish();
+    rstd_assert(state->ends == ends + 2 && state->stack.is_empty() &&
+                state->dropped == 0);
+  }
+  rstd_assert(state->dropped == 1 && state->begins == state->ends);
 }
 TEST(Asset, Loading) {
   auto json = load("tests/data/triangle.gltf"_str);

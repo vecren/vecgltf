@@ -1,9 +1,11 @@
 export module vecgltf.load;
 export import vecgltf.asset;
+export import vecgltf.trace;
 
 export namespace vecgltf {
 struct LoadOptions {
   usize max_vertices{10000000}, max_image_pixels{67108864};
+  LoadTrace trace;
 };
 auto LoadAsset(ref<str> path, LoadOptions options = {})
     -> Result<Arc<Asset>, Error>;

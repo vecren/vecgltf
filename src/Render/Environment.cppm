@@ -78,7 +78,9 @@ auto default_environment() -> HdrImage {
     }
   return image;
 }
-auto preprocess_environment(HdrImage source) -> EnvironmentImages {
+auto preprocess_environment(HdrImage source, const LoadTrace &trace = {})
+    -> EnvironmentImages {
+  LoadScope scope(trace, LoadEvent::EnvironmentProcess);
   using namespace environment_detail;
   EnvironmentImages result;
   result.background = rstd::move(source);
@@ -154,17 +156,18 @@ auto preprocess_environment(HdrImage source) -> EnvironmentImages {
 }
 auto upload_environment_image(
     mut_ref<dyn<vrento::texture::TextureDevice>> device, Vec<HdrImage> mips,
-    bool wrap = true)
+    bool wrap = true, const LoadTrace &trace = {})
     -> Result<vrento::texture::PreparedImage, vrento::texture::Error> {
+  LoadScope scope(trace, LoadEvent::EnvironmentImage);
   if (mips.is_empty())
     return Err(vrento::texture::Error{vrento::texture::ErrorKind::Invalid});
-  vrento::Image image;
-  image.header.format = vrento::TextureFormat::RGBA32F;
-  image.header.sample.minFilter = image.header.sample.magFilter =
+  auto image = Arc<vrento::Image>::make();
+  image->header.format = vrento::TextureFormat::RGBA32F;
+  image->header.sample.minFilter = image->header.sample.magFilter =
       vrento::TextureFilter::LINEAR;
-  image.header.sample.wrapS =
+  image->header.sample.wrapS =
       wrap ? vrento::TextureWrap::REPEAT : vrento::TextureWrap::CLAMP_TO_EDGE;
-  image.header.sample.wrapT = vrento::TextureWrap::CLAMP_TO_EDGE;
+  image->header.sample.wrapT = vrento::TextureWrap::CLAMP_TO_EDGE;
   vrento::Image::Slot slot;
   slot.width = int(at(mips, 0).width);
   slot.height = int(at(mips, 0).height);
@@ -178,11 +181,12 @@ auto upload_environment_image(
         pointer, [owner = rstd::move(mip.rgba)](rstd::uint8_t *) {});
     slot.mipmaps.push(rstd::move(data));
   }
-  image.slots.push(rstd::move(slot));
+  image->slots.push(rstd::move(slot));
+  LoadScope prepare(trace, LoadEvent::ImagePrepare);
   vrento::texture::ImagePrepareContext context(device);
   auto prepared =
       rstd::as<vrento::texture::TextureContentPreparer>(context).PrepareImage(
-          image);
+          rstd::move(image));
   if (prepared.is_err())
     return Err(prepared.unwrap_err());
   auto result = prepared.unwrap();

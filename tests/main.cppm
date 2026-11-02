@@ -3,6 +3,7 @@ export import :output;
 import :asset;
 import :scene;
 import :render;
+import :mipmaps;
 import :controls;
 import :window;
 import rstd.test;

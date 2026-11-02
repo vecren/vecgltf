@@ -284,7 +284,14 @@ public:
 
 class OrbitCamera {
   Vec3 target_{};
-  float radius_{1}, distance_{3}, yaw_{0.5f}, pitch_{0.25f};
+  float radius_{1}, distance_{3}, yaw_{0.5f}, pitch_{0.25f}, roll_{};
+
+  Vec3 up() const {
+    auto right = Vec3{cosine(yaw_), 0, -sine(yaw_)};
+    auto vertical = Vec3{-sine(yaw_) * sine(pitch_), cosine(pitch_),
+                         -cosine(yaw_) * sine(pitch_)};
+    return vertical * cosine(roll_) + right * sine(roll_);
+  }
 
 public:
   void fit(const Bounds &bounds) {
@@ -293,6 +300,7 @@ public:
     distance_ = radius_ * 3;
     yaw_ = 0.5f;
     pitch_ = 0.25f;
+    roll_ = 0;
   }
   void rotate(float x, float y) {
     yaw_ += x;
@@ -303,17 +311,19 @@ public:
         clamp(distance_ * rstd::f32(-amount * 0.1f).exp().to_primitive(),
               radius_ * 0.01f, radius_ * 1000);
   }
+  void roll(float amount) { roll_ += amount; }
   void pan(float x, float y) {
-    auto right = Vec3{cosine(yaw_), 0, -sine(yaw_)};
-    auto up = Vec3{-sine(yaw_) * sine(pitch_), cosine(pitch_),
-                   -cosine(yaw_) * sine(pitch_)};
-    target_ = target_ + (right * (-x) + up * y) * distance_;
+    auto forward = Vec3{-sine(yaw_) * cosine(pitch_), -sine(pitch_),
+                        -cosine(yaw_) * cosine(pitch_)};
+    auto vertical = up();
+    auto right = normalized(cross(forward, vertical));
+    target_ = target_ + (right * (-x) + vertical * y) * distance_;
   }
   View view(float aspect) const {
     Vec3 eye = target_ + Vec3{sine(yaw_) * cosine(pitch_), sine(pitch_),
                               cosine(yaw_) * cosine(pitch_)} *
                              (distance_ / minimum(maximum(aspect, 0.01f), 1));
-    return {look_at(eye, target_),
+    return {look_at(eye, target_, up()),
             perspective(0.785398f, aspect, maximum(radius_ * 0.001f, 0.00001f),
                         distance_ / minimum(maximum(aspect, 0.01f), 1) +
                             radius_ * 100),
