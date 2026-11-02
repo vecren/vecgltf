@@ -1,6 +1,8 @@
 export module vecgltf.tests;
 export import :output;
 import :asset;
+import :attributes;
+import :emissive;
 import :resources;
 import :scene;
 import :render;

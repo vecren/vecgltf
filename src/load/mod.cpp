@@ -275,6 +275,15 @@ struct Loader {
             result.metallic     = p.metallic_factor;
             result.roughness    = p.roughness_factor;
             result.emissive = { m.emissive_factor[0], m.emissive_factor[1], m.emissive_factor[2] };
+            if (m.has_emissive_strength) {
+                float strength = m.emissive_strength.emissive_strength;
+                if (! rstd::f32(strength).is_finite() || strength < 0)
+                    return Err(error(
+                        ErrorKind::InvalidAsset,
+                        rstd::format("materials[{}].extensions.KHR_materials_emissive_strength", i),
+                        "emissive strength must be finite and non-negative"));
+                result.emissive = result.emissive * strength;
+            }
             result.alpha_cutoff = m.alpha_cutoff;
             result.alpha        = m.alpha_mode == cgltf_alpha_mode_blend  ? AlphaMode::Blend
                                   : m.alpha_mode == cgltf_alpha_mode_mask ? AlphaMode::Mask
@@ -474,6 +483,12 @@ struct Loader {
             if (attr.data->count != position->count)
                 return Err(
                     error(ErrorKind::InvalidAsset, location.clone(), "attribute counts differ"));
+            if (attr.type == cgltf_attribute_type_texcoord) {
+                if (components != 2)
+                    return Err(
+                        error(ErrorKind::InvalidAsset, location.clone(), "texcoord must be VEC2"));
+                if (attr.index > 1) continue;
+            }
             if (attr.index > 1 || (attr.index != 0 && attr.type != cgltf_attribute_type_texcoord))
                 return Err(
                     error(ErrorKind::Unsupported, location.clone(), "unsupported attribute set"));
@@ -506,9 +521,6 @@ struct Loader {
                     has_tangent    = true;
                     break;
                 case cgltf_attribute_type_texcoord:
-                    if (components != 2)
-                        return Err(error(
-                            ErrorKind::InvalidAsset, location.clone(), "texcoord must be VEC2"));
                     (attr.index == 0 ? vertex.uv0 : vertex.uv1) = { f[0], f[1] };
                     break;
                 case cgltf_attribute_type_color:
@@ -938,7 +950,9 @@ auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> 
                            resources.failure.clone() });
     Loader loader { resources.source.as_str(), options, *parsed.data, resources };
     auto   supported = [](const char* ext) {
-        return strcmp(ext, "KHR_materials_unlit") == 0 || strcmp(ext, "KHR_texture_transform") == 0;
+        return strcmp(ext, "KHR_materials_unlit") == 0 ||
+               strcmp(ext, "KHR_texture_transform") == 0 ||
+               strcmp(ext, "KHR_materials_emissive_strength") == 0;
     };
     for (cgltf_size i = 0; i < parsed.data->extensions_required_count; ++i)
         if (! supported(parsed.data->extensions_required[i]))

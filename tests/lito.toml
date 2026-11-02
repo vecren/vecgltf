@@ -21,6 +21,8 @@ sources = [
   "tests/main.cppm",
   "tests/output.cppm",
   "tests/asset.cppm",
+  "tests/attributes.cppm",
+  "tests/emissive.cppm",
   "tests/resources.cppm",
   "tests/scene.cppm",
   "tests/render.cppm",

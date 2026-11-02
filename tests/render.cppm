@@ -713,6 +713,12 @@ TEST(Render, Integration) {
     checked_material.emissive         = { 0.5f, 0.5f, 0.5f };
     auto emissive = draw(material_checks.clone(), 64, false, DebugView::Emissive);
     near(center(emissive, 0), 92);
+    checked_material.emissive = { 2.5f, 5, 10 };
+    auto strong_emissive      = draw(material_checks.clone(), 64, false, DebugView::Emissive);
+    near(center(strong_emissive, 0), 194);
+    near(center(strong_emissive, 1), 255);
+    near(center(strong_emissive, 2), 255);
+    checked_material.emissive       = { 0.5f, 0.5f, 0.5f };
     checked_material.normal.texture = solid_texture(128, 255, 128);
     auto normal                     = draw(material_checks.clone(), 64, false, DebugView::Normal);
     near(center(normal, 0), 188);
