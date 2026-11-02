@@ -1,0 +1,24 @@
+[package]
+name = "vecgltf-viewer"
+authors = ["hypengw <hypengwip@gmail.com>"]
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[profile.base]
+exceptions = false
+rtti = false
+
+[dependencies]
+vecgltf = { path = "../.." }
+rstd-json = { version = "0.1.5" }
+rstd-nostd = { version = "0.1.5", usage = "link" }
+vui-render = { version = "0.1.0" }
+vui-sdl = { version = "0.1.0" }
+vui-controls = { version = "0.1.0" }
+
+[[bin]]
+name = "viewer"
+module = "vecgltf.viewer"
+path = "main.cppm"
+source-root = "."
+link-stdlib = false

@@ -1,0 +1,34 @@
+[package]
+name = "vecgltf-tests"
+authors = ["hypengw <hypengwip@gmail.com>"]
+source-root = ".."
+autoexamples = false
+
+[dependencies]
+vecgltf = { path = ".." }
+rstd-test = { version = "0.1.5" }
+rstd-log = { version = "0.1.5" }
+rstd-json = { version = "0.1.5" }
+rstd-nostd = { version = "0.1.5", usage = "link" }
+vui-render = { version = "0.1.0" }
+vui-sdl = { version = "0.1.0" }
+vui-controls = { version = "0.1.0" }
+
+[[test]]
+name = "vecgltf"
+module = "vecgltf.tests"
+sources = [
+  "tests/main.cppm",
+  "tests/output.cppm",
+  "tests/asset.cppm",
+  "tests/scene.cppm",
+  "tests/render.cppm",
+  "tests/mipmaps.cppm",
+  "tests/controls.cppm",
+  "tests/camera.cppm",
+  "tests/window.cppm",
+  "examples/viewer/panel.cppm",
+  "examples/viewer/model.cppm",
+  "examples/viewer/camera.cppm",
+]
+link-stdlib = false

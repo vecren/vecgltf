@@ -9,4 +9,6 @@ import :camera;
 import :window;
 import rstd.test;
 
-int main() { return rstd::test::run_registered().to_primitive(); }
+int main() {
+    return rstd::test::run_registered().to_primitive();
+}
