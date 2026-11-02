@@ -33,10 +33,177 @@ struct Allocation {
     void* data {};
     ~Allocation() { free(data); }
 };
+struct ResourceResolver {
+    String                      source;
+    Option<rstd::path::PathBuf> root;
+    String                      failure;
+
+    bool fail(ref<str> message) {
+        failure = String::make(message);
+        return false;
+    }
+    bool initialize(ref<str> path, Option<ref<rstd::path::Path>> directory) {
+        source = String::make(path);
+        if (! directory) return true;
+        for (auto value : path.as_bytes())
+            if (value == u8()) return fail("resource path contains NUL"_str);
+        auto canonical = rstd::fs::canonicalize(*directory);
+        if (canonical.is_err()) return fail("cannot resolve resource root"_str);
+        root          = Some(canonical.unwrap());
+        auto metadata = rstd::fs::metadata(root->as_path());
+        if (metadata.is_err() || ! metadata->is_dir())
+            return fail("resource root is not a directory"_str);
+        auto input    = rstd::path::PathBuf::from(path);
+        auto resolved = canonical_file(input.as_path());
+        if (! resolved) return false;
+        source = resolved->as_path().to_string_lossy();
+        return true;
+    }
+    auto canonical_file(ref<rstd::path::Path> path) -> Option<rstd::path::PathBuf> {
+        if (! root) return Some(rstd::path::PathBuf::from(path));
+        auto canonical = rstd::fs::canonicalize(path);
+        if (canonical.is_err()) {
+            fail("cannot resolve resource file"_str);
+            return None();
+        }
+        auto resolved = canonical.unwrap();
+        if (! resolved.as_path().starts_with(root->as_path())) {
+            fail("resource file escapes resource root"_str);
+            return None();
+        }
+        return Some(rstd::move(resolved));
+    }
+    auto relative_uri(const char* uri) -> Option<rstd::path::PathBuf> {
+        auto value = terminated(text(uri).as_str());
+        if (root) {
+            for (rstd::size_t i = 0; value[usize(i)] != '\0'; ++i) {
+                if (value[usize(i)] != '%') continue;
+                auto hex = [](char ch) {
+                    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                           (ch >= 'A' && ch <= 'F');
+                };
+                if (! hex(value[usize(i + 1)]) || value[usize(i + 1)] == '\0' ||
+                    ! hex(value[usize(i + 2)])) {
+                    fail("invalid percent-encoded resource URI"_str);
+                    return None();
+                }
+                i += 2;
+            }
+        }
+        auto decoded_size = cgltf_decode_uri(value.begin());
+        if (root && (decoded_size != ::strlen(value.begin()) || ! decoded_size)) {
+            fail("empty resource URI or embedded NUL"_str);
+            return None();
+        }
+        if (strstr(value.begin(), "://")) {
+            fail("network resource URIs are unsupported"_str);
+            return None();
+        }
+        if (root && rstd::ffi::CStr::from_ptr(value.begin()).to_str().is_err()) {
+            fail("resource URI is not UTF-8"_str);
+            return None();
+        }
+        auto decoded = text(value.begin());
+        auto path    = rstd::path::PathBuf::from(decoded.as_str());
+        if (root) {
+            const char* first_separator = strchr(value.begin(), '/');
+            const char* colon           = strchr(value.begin(), ':');
+            if (path.as_path().is_absolute() || strchr(value.begin(), '\\') ||
+                (colon && (! first_separator || colon < first_separator))) {
+                fail("resource URI must be a relative file path"_str);
+                return None();
+            }
+        }
+        return Some(rstd::move(path));
+    }
+    bool prepare_uris(cgltf_data& data) {
+        if (! root) return true;
+        auto prepare = [&](char* uri) {
+            if (! uri) return true;
+            auto size = cgltf_decode_string(uri);
+            if (size != ::strlen(uri)) return fail("resource URI contains NUL"_str);
+            if (strncmp(uri, "data:", 5) == 0) return true;
+            return relative_uri(uri).is_some();
+        };
+        for (cgltf_size i = 0; i < data.buffers_count; ++i)
+            if (! prepare(data.buffers[i].uri)) return false;
+        for (cgltf_size i = 0; i < data.images_count; ++i)
+            if (! prepare(data.images[i].uri)) return false;
+        return true;
+    }
+    auto image_path(const char* uri) -> Option<rstd::path::PathBuf> {
+        auto relative = relative_uri(uri);
+        if (! relative) return None();
+        auto path   = rstd::path::PathBuf::from(source.as_str());
+        auto parent = path.as_path().parent();
+        auto folder =
+            parent ? rstd::path::PathBuf::from(*parent) : rstd::path::PathBuf::from("."_str);
+        return Some(folder.join(relative->as_path()));
+    }
+    cgltf_result read(const cgltf_memory_options& memory,
+                      ref<rstd::path::Path>       path,
+                      cgltf_size*                 size,
+                      void**                      data,
+                      cgltf_size                  limit = ~cgltf_size(0)) {
+        auto resolved = canonical_file(path);
+        if (! resolved) return cgltf_result_io_error;
+        auto opened = rstd::fs::File::open(resolved->as_path());
+        if (opened.is_err()) {
+            fail("cannot open resource file"_str);
+            return cgltf_result_file_not_found;
+        }
+        auto file     = opened.unwrap();
+        auto metadata = file.metadata();
+        if (metadata.is_err() || ! metadata->is_file()) {
+            fail("resource is not a regular file"_str);
+            return cgltf_result_io_error;
+        }
+        auto length = metadata->len().to_primitive();
+        auto bytes  = size && *size ? *size : cgltf_size(length);
+        if (length < bytes || bytes != (size && *size ? *size : length) || bytes > limit) {
+            fail("resource file is too short or too large"_str);
+            return cgltf_result_io_error;
+        }
+        void* allocation = memory.alloc_func
+                               ? memory.alloc_func(memory.user_data, bytes ? bytes : 1)
+                               : malloc(bytes ? bytes : 1);
+        if (! allocation) return cgltf_result_out_of_memory;
+        auto buffer = mut_ref<u8[]>::from_raw_parts(static_cast<byte*>(allocation), usize(bytes));
+        auto loaded = file.read_exact_at(buffer, u64());
+        if (loaded.is_err()) {
+            if (memory.free_func)
+                memory.free_func(memory.user_data, allocation);
+            else
+                free(allocation);
+            fail("cannot read resource file"_str);
+            return cgltf_result_io_error;
+        }
+        if (size) *size = bytes;
+        *data = allocation;
+        return cgltf_result_success;
+    }
+    static cgltf_result read_callback(const cgltf_memory_options* memory,
+                                      const cgltf_file_options*   options,
+                                      const char*                 path,
+                                      cgltf_size*                 size,
+                                      void**                      data) {
+        auto& self  = *static_cast<ResourceResolver*>(options->user_data);
+        auto  value = rstd::path::PathBuf::from(text(path).as_str());
+        return self.read(*memory, value.as_path(), size, data);
+    }
+    static void
+    release_callback(const cgltf_memory_options* memory, const cgltf_file_options*, void* data) {
+        if (memory->free_func)
+            memory->free_func(memory->user_data, data);
+        else
+            free(data);
+    }
+};
 struct Loader {
     ref<str>          source;
     LoadOptions       options;
     const cgltf_data& data;
+    ResourceResolver& resources;
     Arc<Asset>        asset { Arc<Asset>::make() };
     usize             vertices {};
 
@@ -181,20 +348,38 @@ struct Loader {
                                                     &channels,
                                                     4);
             } else if (input.uri) {
-                auto uri = terminated(text(input.uri).as_str());
-                cgltf_decode_uri(uri.begin());
-                if (strstr(uri.begin(), "://"))
-                    return Err(error(ErrorKind::Unsupported,
-                                     rstd::format("images[{}]", i),
-                                     "network image URIs are unsupported"));
-                auto path       = rstd::path::PathBuf::from(String::make(source));
-                auto parent     = path.as_path().parent();
-                auto folder     = parent.is_some() ? rstd::path::PathBuf::from(*parent)
-                                                   : rstd::path::PathBuf::from("."_str);
-                auto relative   = rstd::path::PathBuf::from(text(uri.begin()));
-                auto image_path = folder.join(relative.as_path()).as_path().to_string_lossy();
-                auto cpath      = terminated(image_path.as_str());
-                pixels.data     = stbi_load(cpath.begin(), &width, &height, &channels, 4);
+                auto path = resources.image_path(input.uri);
+                if (! path)
+                    return Err(Error { ErrorKind::InvalidAsset,
+                                       String::make(source),
+                                       rstd::format("images[{}]", i),
+                                       resources.failure.clone() });
+                if (resources.root) {
+                    Allocation           bytes;
+                    cgltf_size           size {};
+                    cgltf_memory_options memory {};
+                    if (resources.read(memory, path->as_path(), &size, &bytes.data, 0x7fffffff) !=
+                        cgltf_result_success)
+                        return Err(Error { ErrorKind::Io,
+                                           String::make(source),
+                                           rstd::format("images[{}]", i),
+                                           resources.failure.clone() });
+                    if (size > 0x7fffffff)
+                        return Err(error(ErrorKind::Limit,
+                                         rstd::format("images[{}]", i),
+                                         "image file is too large"));
+                    pixels.data =
+                        stbi_load_from_memory(static_cast<const unsigned char*>(bytes.data),
+                                              int(size),
+                                              &width,
+                                              &height,
+                                              &channels,
+                                              4);
+                } else {
+                    auto name     = path->as_path().to_string_lossy();
+                    auto filename = terminated(name.as_str());
+                    pixels.data   = stbi_load(filename.begin(), &width, &height, &channels, 4);
+                }
             } else {
                 return Err(error(ErrorKind::Unsupported,
                                  rstd::format("images[{}]", i),
@@ -720,11 +905,20 @@ struct Loader {
 } // namespace
 
 auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> {
-    LoadScope     scope(options.trace, LoadEvent::Asset);
-    auto          filename = terminated(path);
+    LoadScope        scope(options.trace, LoadEvent::Asset);
+    ResourceResolver resources;
+    if (! resources.initialize(path, options.resource_root))
+        return Err(Error {
+            ErrorKind::Io, String::make(path), "resource root"_Str, resources.failure.clone() });
+    auto          filename = terminated(resources.source.as_str());
     Parsed        parsed;
     cgltf_options opts {};
-    cgltf_result  result;
+    if (resources.root) {
+        opts.file.read      = &ResourceResolver::read_callback;
+        opts.file.release   = &ResourceResolver::release_callback;
+        opts.file.user_data = &resources;
+    }
+    cgltf_result result;
     {
         LoadScope document(options.trace, LoadEvent::Document);
         result = cgltf_parse_file(&opts, filename.begin(), &parsed.data);
@@ -732,9 +926,17 @@ auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> 
     auto failure = [&](ErrorKind kind, const char* location, const char* message) {
         return Error { kind, String::make(path), text(location), text(message) };
     };
+    if (result != cgltf_result_success && ! resources.failure.is_empty())
+        return Err(
+            Error { ErrorKind::Io, String::make(path), "document"_Str, resources.failure.clone() });
     if (result != cgltf_result_success)
         return Err(failure(ErrorKind::Parse, "document", "cannot parse glTF/GLB file"));
-    Loader loader { path, options, *parsed.data };
+    if (! resources.prepare_uris(*parsed.data))
+        return Err(Error { ErrorKind::InvalidAsset,
+                           String::make(path),
+                           "resource URI"_Str,
+                           resources.failure.clone() });
+    Loader loader { resources.source.as_str(), options, *parsed.data, resources };
     auto   supported = [](const char* ext) {
         return strcmp(ext, "KHR_materials_unlit") == 0 || strcmp(ext, "KHR_texture_transform") == 0;
     };
@@ -751,6 +953,9 @@ auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> 
         LoadScope buffers(options.trace, LoadEvent::Buffers);
         result = cgltf_load_buffers(&opts, parsed.data, filename.begin());
     }
+    if (result != cgltf_result_success && ! resources.failure.is_empty())
+        return Err(
+            Error { ErrorKind::Io, String::make(path), "buffers"_Str, resources.failure.clone() });
     if (result != cgltf_result_success)
         return Err(failure(ErrorKind::Io, "buffers", "cannot load external or embedded buffer"));
     {

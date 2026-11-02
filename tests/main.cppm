@@ -1,6 +1,7 @@
 export module vecgltf.tests;
 export import :output;
 import :asset;
+import :resources;
 import :scene;
 import :render;
 import :mipmaps;

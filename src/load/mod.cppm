@@ -8,6 +8,8 @@ export namespace vecgltf
 struct LoadOptions {
     usize     max_vertices { 10000000 }, max_image_pixels { 67108864 };
     LoadTrace trace;
+    // Borrowed for this synchronous load; external files must stay inside the root.
+    Option<ref<rstd::path::Path>> resource_root;
 };
 auto LoadAsset(ref<str> path, LoadOptions options = {}) -> Result<Arc<Asset>, Error>;
 struct HdrImage {
