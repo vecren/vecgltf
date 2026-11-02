@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 name = "vecgltf"
 module = "vecgltf"
 archive = "vecgltf"
-sources = ["src/lib.cppm", "src/Asset/Math.cppm", "src/Asset/Asset.cppm", "src/Load/Trace.cppm", "src/Load/Load.cppm", "src/Load/Load.cpp", "src/Load/External.cpp", "src/Scene/Scene.cppm", "src/Render/Render.cppm", "src/Render/Spirv.cppm", "src/Render/Textures.cppm", "src/Render/Environment.cppm"]
+sources = ["src/lib.cppm", "src/Asset/Math.cppm", "src/Asset/Asset.cppm", "src/Load/Trace.cppm", "src/Load/Load.cppm", "src/Load/Load.cpp", "src/Load/External.cpp", "src/Scene/Camera.cppm", "src/Scene/Scene.cppm", "src/Render/Render.cppm", "src/Render/Spirv.cppm", "src/Render/Textures.cppm", "src/Render/Environment.cppm"]
 
 [profile.base]
 exceptions = false
@@ -33,15 +33,18 @@ sources = [
   "tests/render.cppm",
   "tests/mipmaps.cppm",
   "tests/controls.cppm",
+  "tests/camera.cppm",
   "tests/window.cppm",
   "examples/viewer/panel.cppm",
   "examples/viewer/model.cppm",
+  "examples/viewer/camera.cppm",
 ]
 
 [dev-dependencies]
 rstd-bench = { version = "0.1.5" }
 rstd-test = { version = "0.1.5" }
 rstd-log = { version = "0.1.5" }
+rstd-json = { version = "0.1.5" }
 vui-render = { version = "0.1.0" }
 vui-sdl = { version = "0.1.0" }
 vui-controls = { version = "0.1.0" }

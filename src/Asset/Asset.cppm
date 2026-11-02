@@ -115,10 +115,12 @@ struct Skin {
     Vec<unsigned> joints;
     Vec<Mat4> inverse_bind;
 };
-struct Camera {
-    String name;
+struct CameraProjection {
     bool orthographic{};
     float yfov{0.785398f}, aspect{}, near{0.01f}, far{}, xmag{1}, ymag{1};
+};
+struct Camera : CameraProjection {
+    String name;
 };
 enum class Interpolation { Step, Linear, CubicSpline };
 enum class AnimationPath { Translation, Rotation, Scale, Weights };

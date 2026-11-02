@@ -5,6 +5,7 @@ import :scene;
 import :render;
 import :mipmaps;
 import :controls;
+import :camera;
 import :window;
 import rstd.test;
 

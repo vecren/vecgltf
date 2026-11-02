@@ -4,19 +4,21 @@ import vecgltf.render;
 import vui.sdl;
 import vecgltf.viewer.panel;
 import vecgltf.viewer.model;
+import vecgltf.viewer.camera;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 namespace gltf = vecgltf;
 
 struct Options {
-  String path, capture, environment;
+  String path, capture, environment, camera_path;
   unsigned width{960}, height{720}, frames{}, scene{gltf::invalid_index},
       animation{gltf::invalid_index}, camera{gltf::invalid_index};
-  float time{}, zoom{}, roll{};
+  float time{}, camera_time{}, zoom{}, roll{};
   gltf::Vec2 rotate{}, pan{};
   gltf::RenderOptions render;
-  bool validation{}, headless{}, fixed_time{};
+  bool validation{}, headless{}, fixed_time{}, fixed_camera_time{},
+      camera_play{};
 };
 auto argument(const char *value) -> ref<str> {
   return rstd::ffi::CStr::from_ptr(value).to_str().unwrap_or(""_str);
@@ -64,6 +66,16 @@ bool parse(int argc, char **argv, Options &options) {
     } else if (arg == "--camera"_str) {
       if (!number(options.camera))
         return false;
+    } else if (arg == "--camera-path"_str) {
+      options.camera_path = String::make(next());
+      if (options.camera_path.is_empty())
+        return false;
+    } else if (arg == "--camera-time"_str) {
+      if (!real(options.camera_time) || options.camera_time < 0)
+        return false;
+      options.fixed_camera_time = true;
+    } else if (arg == "--camera-play"_str) {
+      options.camera_play = true;
     } else if (arg == "--animation"_str) {
       if (!number(options.animation))
         return false;
@@ -107,7 +119,8 @@ bool parse(int argc, char **argv, Options &options) {
   if (options.headless && !options.frames)
     options.frames = 1;
   return !options.path.is_empty() && options.width && options.height &&
-         options.width <= 8192 && options.height <= 8192;
+         options.width <= 8192 && options.height <= 8192 &&
+         !(options.camera_play && options.fixed_camera_time);
 }
 void report(gltf::Error error) {
   rstd::io::eprintln("{} [{}] {}: {}", error.source, unsigned(error.kind),
@@ -142,6 +155,7 @@ int main(int argc, char **argv) {
     rstd::io::eprintln(
         "usage: vecgltf-viewer model.gltf|model.glb [--headless] [--size W H] "
         "[--frames N] [--capture image.ppm] [--scene N] [--camera node] "
+        "[--camera-path track.json] [--camera-time seconds | --camera-play] "
         "[--animation N] "
         "[--time seconds] [--zoom steps] [--rotate yaw pitch] [--pan x y] "
         "[--roll radians] "
@@ -165,19 +179,42 @@ int main(int argc, char **argv) {
     rstd::io::eprintln("scene or animation index is out of range");
     return 2;
   }
+  instance.set_time(options.time);
+  instance.set_playing(!options.fixed_time);
+  viewer::CameraController cameras;
+  cameras.fit(instance);
+  cameras.orbit().zoom(options.zoom);
+  cameras.orbit().rotate(options.rotate.x, options.rotate.y);
+  cameras.orbit().pan(options.pan.x, options.pan.y);
+  cameras.orbit().roll(options.roll);
+  if (options.camera_path.is_empty())
+    options.camera_path = rstd::format("{}.camera.json", options.path);
+  auto camera_file = rstd::path::PathBuf::from(options.camera_path.as_str());
+  auto exists = rstd::fs::exists(camera_file.as_path());
+  if (exists.is_err()) {
+    rstd::io::eprintln("{}: {}", options.camera_path, exists.unwrap_err());
+    return 1;
+  }
+  if (exists.unwrap()) {
+    auto track = viewer::LoadCameraTrack(options.camera_path.as_str());
+    if (track.is_err()) {
+      auto error = track.unwrap_err();
+      rstd::io::eprintln("{}: {}: {}", error.source, error.location,
+                         error.message);
+      return 1;
+    }
+    cameras.replace_track(track.unwrap());
+  }
   if (options.camera != gltf::invalid_index &&
-      instance.camera_view(asset->node_id(options.camera), 1).is_none()) {
+      !cameras.select_asset(instance, options.camera, 1)) {
     rstd::io::eprintln("camera node is invalid");
     return 2;
   }
-  instance.set_time(options.time);
-  instance.set_playing(!options.fixed_time);
-  gltf::OrbitCamera camera;
-  camera.fit(instance.bounds());
-  camera.zoom(options.zoom);
-  camera.rotate(options.rotate.x, options.rotate.y);
-  camera.pan(options.pan.x, options.pan.y);
-  camera.roll(options.roll);
+  if ((options.fixed_camera_time && !cameras.seek_track(options.camera_time)) ||
+      (options.camera_play && !cameras.toggle_track())) {
+    rstd::io::eprintln("camera path has insufficient keyframes");
+    return 2;
+  }
   vui::sdl::Window window;
   vui::gpu::Renderer ui_renderer;
   auto gpu_error = [&](vui::gpu::Error error) {
@@ -263,16 +300,18 @@ int main(int argc, char **argv) {
                       ? ""_Str
                       : asset->diagnostics[usize(0)].message.clone();
   bool looping = true;
+  float camera_aspect = float(extent.width) / float(extent.height);
   if (panel)
-    (*panel)->update(instance, options.camera, looping, options.render,
-                     status.as_str());
+    (*panel)->update(instance, cameras.asset_camera(), looping, options.render,
+                     status.as_str(), cameras.status());
   document.mount(root).unwrap();
   vui::Point last{};
   vui::PointerButton drag{};
   session.input()
       .on(viewport, vui::EventType::PointerDown,
           [&](auto &context, const auto &event) {
-            options.camera = gltf::invalid_index;
+            if (!cameras.take_control(instance, camera_aspect))
+              return;
             drag = event.input.button;
             last = event.input.position;
             context.capture_pointer().unwrap();
@@ -288,9 +327,10 @@ int main(int argc, char **argv) {
             float x = float(p.x - last.x), y = float(p.y - last.y);
             last = p;
             if (drag == vui::PointerButton::Primary)
-              camera.rotate(-x * 0.008f, -y * 0.008f);
+              cameras.rotate(instance, camera_aspect, -x * 0.008f, -y * 0.008f);
             else
-              camera.pan(x / float(extent.height), y / float(extent.height));
+              cameras.pan(instance, camera_aspect, x / float(extent.height),
+                          y / float(extent.height));
           })
       .unwrap();
   session.input()
@@ -303,11 +343,11 @@ int main(int argc, char **argv) {
   session.input()
       .on(viewport, vui::EventType::Wheel,
           [&](auto &context, const auto &event) {
-            options.camera = gltf::invalid_index;
-            camera.zoom(float(event.input.scroll_delta.y) *
-                        (event.input.scroll_unit == vui::ScrollUnit::Pixels
-                             ? 0.025f
-                             : 1));
+            cameras.zoom(instance, camera_aspect,
+                         float(event.input.scroll_delta.y) *
+                             (event.input.scroll_unit == vui::ScrollUnit::Pixels
+                                  ? 0.025f
+                                  : 1));
             context.prevent_default();
           })
       .unwrap();
@@ -315,12 +355,16 @@ int main(int argc, char **argv) {
       .on(viewport, vui::EventType::KeyDown,
           [&](auto &, const auto &event) {
             if (event.input.key == vui::Key::Home) {
-              camera.fit(instance.bounds());
-              options.camera = gltf::invalid_index;
+              cameras.fit(instance);
             }
             if (event.input.key == vui::Key::Space) {
-              instance.set_playing(!instance.playing());
-              options.fixed_time = false;
+              if (cameras.mode() == viewer::CameraMode::Track) {
+                cameras.toggle_track();
+                options.fixed_camera_time = false;
+              } else {
+                instance.set_playing(!instance.playing());
+                options.fixed_time = false;
+              }
             }
           })
       .unwrap();
@@ -335,12 +379,12 @@ int main(int argc, char **argv) {
       timing.now_ns = ++serial * 16'666'667;
     } else {
       events = window.wait(
-          !completed
-              ? 0
-              : (options.frames || (instance.playing() &&
-                                    instance.animation() != gltf::invalid_index)
-                     ? 16
-                     : 1000));
+          !completed ? 0
+                     : (options.frames || cameras.animating() ||
+                                (instance.playing() &&
+                                 instance.animation() != gltf::invalid_index)
+                            ? 16
+                            : 1000));
       timing = window.timing();
       close = events.close_requested;
       for (const auto &event : events.input)
@@ -388,11 +432,13 @@ int main(int argc, char **argv) {
                             extent.height};
     if (!model_extent.width)
       model_extent.width = 1;
+    camera_aspect = float(model_extent.width) / float(model_extent.height);
     auto model_resized = renderer.resize(model_extent);
     if (model_resized.is_err()) {
       report(model_resized.unwrap_err());
       return 1;
     }
+    bool camera_was_playing = cameras.animating();
     auto advance =
         session.advance(events.input.as_slice(), timing, events.surface);
     if (advance.is_err()) {
@@ -409,18 +455,19 @@ int main(int argc, char **argv) {
         case viewer::Action::Scene:
           instance.set_scene((instance.scene() + 1) %
                              gltf::count(asset->scenes));
-          options.camera = gltf::invalid_index;
-          camera.fit(instance.bounds());
+          cameras.fit(instance);
           break;
         case viewer::Action::Camera: {
-          unsigned next =
-              options.camera == gltf::invalid_index ? 0 : options.camera + 1;
+          auto current = cameras.asset_camera();
+          unsigned next = current == gltf::invalid_index ? 0 : current + 1;
           while (next < gltf::count(asset->nodes) &&
                  (gltf::at(asset->nodes, next).camera == gltf::invalid_index ||
                   !instance.visible(next)))
             ++next;
-          options.camera =
-              next < gltf::count(asset->nodes) ? next : gltf::invalid_index;
+          if (next == gltf::count(asset->nodes))
+            cameras.take_control(instance, camera_aspect);
+          else if (!cameras.select_asset(instance, next, camera_aspect))
+            status = "相机变换无效"_Str;
           break;
         }
         case viewer::Action::Animation: {
@@ -451,9 +498,57 @@ int main(int argc, char **argv) {
           }
           break;
         case viewer::Action::Fit:
-          camera.fit(instance.bounds());
-          options.camera = gltf::invalid_index;
+          cameras.fit(instance);
           break;
+        case viewer::Action::CameraRecord:
+          if (cameras.record(instance, camera_aspect))
+            status =
+                rstd::format("已记录 {} 个视角", cameras.status().keyframes);
+          else
+            status = "当前视角无法记录"_Str;
+          break;
+        case viewer::Action::CameraRemove:
+          cameras.remove_last(instance, camera_aspect);
+          break;
+        case viewer::Action::CameraPlay:
+          if (!cameras.toggle_track())
+            status = "请先记录至少两个视角"_Str;
+          else {
+            options.fixed_camera_time = false;
+            status = ""_Str;
+          }
+          break;
+        case viewer::Action::CameraLoop:
+          cameras.track().set_looping(!cameras.track().looping());
+          break;
+        case viewer::Action::CameraSeek:
+          cameras.seek_track(command.value * cameras.track().duration());
+          break;
+        case viewer::Action::CameraIntervalDown:
+          cameras.track().set_interval(
+              gltf::maximum(0.25f, cameras.track().interval() - 0.25f));
+          break;
+        case viewer::Action::CameraIntervalUp:
+          cameras.track().set_interval(
+              gltf::minimum(60, cameras.track().interval() + 0.25f));
+          break;
+        case viewer::Action::CameraClear:
+          cameras.clear_track(instance, camera_aspect);
+          break;
+        case viewer::Action::CameraSave: {
+          auto saved = viewer::SaveCameraTrack(options.camera_path.as_str(),
+                                               cameras.track());
+          if (saved.is_err()) {
+            auto error = saved.unwrap_err();
+            status =
+                rstd::format("保存失败：{}\n{}", error.location, error.message);
+          } else {
+            cameras.track().mark_saved();
+            status = "轨迹已保存"_Str;
+            rstd::io::println("camera path saved: {}", options.camera_path);
+          }
+          break;
+        }
         case viewer::Action::Background:
           options.render.background = !options.render.background;
           break;
@@ -479,37 +574,43 @@ int main(int argc, char **argv) {
             break;
           }
           instance.set_looping(looping);
-          options.camera = gltf::invalid_index;
           options.fixed_time = false;
-          camera.fit(instance.bounds());
+          cameras.fit(instance);
           status = "模型已重新加载"_Str;
           break;
         }
         }
       }
     }
-    if (previous && !options.fixed_time)
-      instance.update(float(timing.now_ns - previous) * 1e-9f);
+    float camera_before = cameras.track().time();
+    if (previous) {
+      float delta = float(timing.now_ns - previous) * 1e-9f;
+      if (!options.fixed_time)
+        instance.update(delta);
+      if (camera_was_playing && !options.fixed_camera_time)
+        cameras.update(delta);
+    }
+    changed = changed || camera_before != cameras.track().time();
     previous = timing.now_ns;
     bool animating = instance.playing() &&
                      instance.animation() != gltf::invalid_index &&
                      !options.fixed_time;
+    animating = animating || cameras.animating();
     if (!options.headless && !options.frames && completed && !redraw_pending &&
         !changed && !events.redraw && !advance.unwrap().frame_needed &&
         !animating)
       continue;
-    if (panel)
-      (*panel)->update(instance, options.camera, looping, options.render,
-                       status.as_str());
-    auto view =
-        camera.view(float(model_extent.width) / float(model_extent.height));
-    if (options.camera != gltf::invalid_index) {
-      auto selected = instance.camera_view(asset->node_id(options.camera),
-                                           float(model_extent.width) /
-                                               float(model_extent.height));
-      if (selected)
-        view = *selected;
+    auto camera_frame = cameras.frame(instance, camera_aspect);
+    if (camera_frame.is_none()) {
+      status = "相机变换无效，已返回手动视角"_Str;
+      if (!cameras.take_control(instance, camera_aspect))
+        cameras.fit(instance);
+      camera_frame = cameras.frame(instance, camera_aspect);
     }
+    auto view = camera_frame.unwrap().view(camera_aspect).unwrap();
+    if (panel)
+      (*panel)->update(instance, cameras.asset_camera(), looping,
+                       options.render, status.as_str(), cameras.status());
     if (!output_pool || output_extent.width != model_extent.width ||
         output_extent.height != model_extent.height) {
       vrento::texture::TextureDesc description;

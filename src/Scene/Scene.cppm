@@ -1,11 +1,7 @@
 export module vecgltf.scene;
-export import vecgltf.asset;
+export import vecgltf.camera;
 
 export namespace vecgltf {
-struct View {
-  Mat4 view{Mat4::Identity()}, projection{Mat4::Identity()};
-  Vec3 eye{};
-};
 struct NodePose {
   Vec3 translation, scale;
   Vec4 rotation;
@@ -191,29 +187,18 @@ public:
   void set_looping(bool value) { looping_ = value; }
   u64 revision() const { return revision_; }
   const Bounds &bounds() const { return bounds_; }
-  auto camera_view(AssetId id, float aspect) const -> Option<View> {
+  auto camera_frame(AssetId id, float focus_distance = 1) const
+      -> Option<CameraFrame> {
     auto node = asset_->node(id);
-    if (node.is_none() || (**node).camera == invalid_index || aspect <= 0)
+    if (node.is_none() || (**node).camera == invalid_index ||
+        (**node).camera >= count(asset_->cameras))
       return None();
     const auto &camera = at(asset_->cameras, (**node).camera);
-    const auto &world = pose(id.index).world;
-    auto inverse = world.inverse();
-    if (inverse.is_none())
-      return None();
-    View result;
-    result.view = *inverse;
-    result.eye = world.point({0, 0, 0});
-    if (camera.orthographic) {
-      result.projection = Mat4::Identity();
-      result.projection.m[0] = 1 / camera.xmag;
-      result.projection.m[5] = -1 / camera.ymag;
-      result.projection.m[10] = 1 / (camera.near - camera.far);
-      result.projection.m[14] = camera.near / (camera.near - camera.far);
-    } else
-      result.projection =
-          perspective(camera.yfov, camera.aspect > 0 ? camera.aspect : aspect,
-                      camera.near, camera.far);
-    return Some(result);
+    return vecgltf::camera_frame(pose(id.index).world, camera, focus_distance);
+  }
+  auto camera_view(AssetId id, float aspect) const -> Option<View> {
+    auto frame = camera_frame(id);
+    return frame.is_some() ? frame->view(aspect) : None();
   }
   bool set_scene(unsigned index) {
     if (index >= count(asset_->scenes))
@@ -282,52 +267,23 @@ public:
   }
 };
 
-class OrbitCamera {
-  Vec3 target_{};
-  float radius_{1}, distance_{3}, yaw_{0.5f}, pitch_{0.25f}, roll_{};
-
-  Vec3 up() const {
-    auto right = Vec3{cosine(yaw_), 0, -sine(yaw_)};
-    auto vertical = Vec3{-sine(yaw_) * sine(pitch_), cosine(pitch_),
-                         -cosine(yaw_) * sine(pitch_)};
-    return vertical * cosine(roll_) + right * sine(roll_);
-  }
-
-public:
-  void fit(const Bounds &bounds) {
-    target_ = bounds.center();
-    radius_ = maximum(bounds.radius(), 0.01f);
-    distance_ = radius_ * 3;
-    yaw_ = 0.5f;
-    pitch_ = 0.25f;
-    roll_ = 0;
-  }
-  void rotate(float x, float y) {
-    yaw_ += x;
-    pitch_ = clamp(pitch_ + y, -1.5f, 1.5f);
-  }
-  void zoom(float amount) {
-    distance_ =
-        clamp(distance_ * rstd::f32(-amount * 0.1f).exp().to_primitive(),
-              radius_ * 0.01f, radius_ * 1000);
-  }
-  void roll(float amount) { roll_ += amount; }
-  void pan(float x, float y) {
-    auto forward = Vec3{-sine(yaw_) * cosine(pitch_), -sine(pitch_),
-                        -cosine(yaw_) * cosine(pitch_)};
-    auto vertical = up();
-    auto right = normalized(cross(forward, vertical));
-    target_ = target_ + (right * (-x) + vertical * y) * distance_;
-  }
-  View view(float aspect) const {
-    Vec3 eye = target_ + Vec3{sine(yaw_) * cosine(pitch_), sine(pitch_),
-                              cosine(yaw_) * cosine(pitch_)} *
-                             (distance_ / minimum(maximum(aspect, 0.01f), 1));
-    return {look_at(eye, target_, up()),
-            perspective(0.785398f, aspect, maximum(radius_ * 0.001f, 0.00001f),
-                        distance_ / minimum(maximum(aspect, 0.01f), 1) +
-                            radius_ * 100),
-            eye};
-  }
+struct SceneCameraSource {
+  const SceneInstance *instance{};
+  AssetId node;
+  float focus_distance{1};
 };
 } // namespace vecgltf
+
+export namespace rstd {
+template <>
+struct Impl<vecgltf::CameraSource, vecgltf::SceneCameraSource>
+    : ImplBase<vecgltf::SceneCameraSource> {
+  auto Snapshot(float aspect) const -> Option<vecgltf::CameraFrame> {
+    const auto &source = this->self();
+    if (!source.instance || !vecgltf::camera_detail::finite(aspect) ||
+        aspect <= 0)
+      return None();
+    return source.instance->camera_frame(source.node, source.focus_distance);
+  }
+};
+} // namespace rstd
