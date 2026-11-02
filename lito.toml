@@ -15,7 +15,7 @@ rtti = false
 
 [dependencies]
 rstd-std = { version = "0.1.5", pub = true }
-vrento = { version = "0.1.0", pub = true }
+vrento = { git = "https://github.com/vecren/vrento.git", pub = true }
 lito-spirv = { version = "0.1.0" }
 
 [build-tools.glslang]
