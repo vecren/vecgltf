@@ -7,11 +7,14 @@ for _, shader in ipairs({
   { name = "background_fragment", source = "background.frag", stage = "fragment" },
   { name = "model_vertex", source = "model.vert", stage = "vertex" },
   { name = "model_fragment", source = "model.frag", stage = "fragment" },
+  { name = "model_opaque_fragment", source = "model.frag", stage = "fragment",
+    output = "model-opaque.frag", definitions = { "BLEND_OPAQUE=1" } },
 }) do
   local result = spirv.compile({
     backend = "glslang", tool = lito.tool("glslang"), language = "glsl",
     source = "shaders/" .. shader.source, stage = shader.stage, target_env = "vulkan1.1",
-    output = "shaders/" .. shader.source .. ".spv",
+    output = "shaders/" .. (shader.output or shader.source) .. ".spv",
+    definitions = shader.definitions,
   })
   inputs[#inputs + 1] = result.spirv
   content[#content + 1] = "inline constexpr auto " .. shader.name .. " = decode({"

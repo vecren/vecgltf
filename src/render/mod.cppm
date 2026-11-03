@@ -47,6 +47,40 @@ auto graph_error(vrento::fg::Error error) -> Error {
                                                  error.resource,
                                                  vk::GraphExecutionCause::Graph(error) });
 }
+auto camera_relative_model(const Mat4& model, Vec3 origin) -> Mat4 {
+    auto         result = model;
+    const double offset[] { origin.x, origin.y, origin.z };
+    for (unsigned column = 0; column < 4; ++column)
+        for (unsigned row = 0; row < 3; ++row)
+            result.m[column * 4 + row] = float(double(model.m[column * 4 + row]) -
+                                               offset[row] * double(model.m[column * 4 + 3]));
+    return result;
+}
+auto camera_relative_view(const Mat4& view, Vec3 origin) -> Mat4 {
+    auto         result = view;
+    const double offset[] { origin.x, origin.y, origin.z };
+    for (unsigned row = 0; row < 4; ++row) {
+        double translation = view.m[12 + row];
+        for (unsigned column = 0; column < 3; ++column)
+            translation += double(view.m[column * 4 + row]) * offset[column];
+        result.m[12 + row] = float(translation);
+    }
+    return result;
+}
+float view_depth(const Mat4& view, Vec3 point) {
+    double z = double(view.m[2]) * point.x + double(view.m[6]) * point.y +
+               double(view.m[10]) * point.z + view.m[14];
+    double w = double(view.m[3]) * point.x + double(view.m[7]) * point.y +
+               double(view.m[11]) * point.z + view.m[15];
+    return float(z / w);
+}
+enum class ModelPipeline : unsigned
+{
+    Opaque,
+    BlendOpaque,
+    Blend,
+    Background
+};
 struct RenderCore {
     vk::DeviceSession                          session;
     LoadTrace                                  trace;
@@ -80,6 +114,13 @@ struct PreparedPrimitive {
     Option<vk::BufferAllocation>                morphs;
     Option<registry::PreparedDescriptorBinding> morph_binding;
 };
+struct ModelVertex {
+    Vec3     position, normal;
+    Vec4     color, tangent;
+    Vec2     texcoords[5];
+    unsigned joints[4] {};
+    Vec4     weights {};
+};
 struct PreparedMesh {
     Vec<PreparedPrimitive> primitives;
 };
@@ -99,12 +140,12 @@ struct PreparedImageEntry {
     Arc<PreparedTextureImage> source;
 };
 struct MaterialParameters {
-    Vec4 base, emissive, factors, flags;
+    Vec4 base, emissive, factors, flags, specular;
     Vec4 offset_scale[5], rotation_uv[5];
 };
 struct FrameParameters {
     Vec4 eye, options;
-    Mat4 inverse_view_projection;
+    Mat4 inverse_view_projection, projection;
 };
 struct PreparedEnvironment {
     Arc<RenderCore>                          core;
@@ -122,7 +163,7 @@ struct PreparedData {
         : core(rstd::move(owner)), asset(rstd::move(source)) {}
 };
 struct DrawConstants {
-    Mat4     mvp;
+    Mat4     view;
     Vec4     model[3];
     unsigned skin_offset {}, weight_offset {}, morph_count {}, vertex_count {};
 };
@@ -182,8 +223,11 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
     if (image_device.is_err()) return Err(texture_error(image_device.unwrap_err()));
     core.image_device = Some(image_device.unwrap());
     vk::DescriptorSetInfo frame_info, material_info;
-    frame_info.bindings.push(
-        { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
+    frame_info.bindings.push({ 0,
+                               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                               1,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               nullptr });
     for (unsigned i = 0; i < 5; ++i)
         material_info.bindings.push({ i,
                                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -258,16 +302,31 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         if (prepared.pipeline) core.warmed.push(prepared.pipeline.take().unwrap());
         return Ok(empty {});
     };
-    VkVertexInputBindingDescription   binding { 0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputBindingDescription binding { 0, sizeof(ModelVertex), VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription attributes[] {
-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, __builtin_offsetof(Vertex, position) },
-        { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, __builtin_offsetof(Vertex, normal) },
-        { 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(Vertex, color) },
-        { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(Vertex, tangent) },
-        { 4, 0, VK_FORMAT_R32G32_SFLOAT, __builtin_offsetof(Vertex, uv0) },
-        { 5, 0, VK_FORMAT_R32G32_SFLOAT, __builtin_offsetof(Vertex, uv1) },
-        { 6, 0, VK_FORMAT_R32G32B32A32_UINT, __builtin_offsetof(Vertex, joints) },
-        { 7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(Vertex, weights) }
+        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, __builtin_offsetof(ModelVertex, position) },
+        { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, __builtin_offsetof(ModelVertex, normal) },
+        { 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(ModelVertex, color) },
+        { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(ModelVertex, tangent) },
+        { 4, 0, VK_FORMAT_R32G32_SFLOAT, __builtin_offsetof(ModelVertex, texcoords) },
+        { 5,
+          0,
+          VK_FORMAT_R32G32_SFLOAT,
+          __builtin_offsetof(ModelVertex, texcoords) + sizeof(Vec2) },
+        { 6,
+          0,
+          VK_FORMAT_R32G32_SFLOAT,
+          __builtin_offsetof(ModelVertex, texcoords) + sizeof(Vec2) * 2 },
+        { 7,
+          0,
+          VK_FORMAT_R32G32_SFLOAT,
+          __builtin_offsetof(ModelVertex, texcoords) + sizeof(Vec2) * 3 },
+        { 8,
+          0,
+          VK_FORMAT_R32G32_SFLOAT,
+          __builtin_offsetof(ModelVertex, texcoords) + sizeof(Vec2) * 4 },
+        { 9, 0, VK_FORMAT_R32G32B32A32_UINT, __builtin_offsetof(ModelVertex, joints) },
+        { 10, 0, VK_FORMAT_R32G32B32A32_SFLOAT, __builtin_offsetof(ModelVertex, weights) }
     };
     pipeline.vertex_bindings.push(VkVertexInputBindingDescription(binding));
     for (const auto& attribute : attributes)
@@ -277,6 +336,11 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         shader(shaders::model_fragment.words, vrento::ShaderType::FRAGMENT));
     auto opaque = add(pipeline.clone());
     if (opaque.is_err()) return opaque;
+    auto coverage = pipeline.clone();
+    coverage.shader_stages[usize(1)] =
+        shader(shaders::model_opaque_fragment.words, vrento::ShaderType::FRAGMENT);
+    auto blend_opaque = add(rstd::move(coverage));
+    if (blend_opaque.is_err()) return blend_opaque;
     VkPipelineColorBlendAttachmentState blend {};
     blend.blendEnable               = VK_TRUE;
     blend.srcColorBlendFactor       = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -358,17 +422,17 @@ struct ModelPrepared {
         if (inputs->background) {
             d.vkCmdBindPipeline(cmd,
                                 VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                *(*pipelines)[usize(2)].pipeline->pipeline.handle);
+                                *(*pipelines)[usize(unsigned(ModelPipeline::Background))]
+                                     .pipeline->pipeline.handle);
             d.vkCmdDraw(cmd, 3, 1, 0, 0);
         }
         inputs->resources->pose_binding->Record(command, layout, binding_state);
-        for (const auto& draw : inputs->draws) {
+        auto record = [&](const ModelDraw& draw, ModelPipeline pipeline) {
             const auto& gpu =
                 at(at(inputs->resources->prepared->meshes, draw.mesh).primitives, draw.primitive);
-            d.vkCmdBindPipeline(
-                cmd,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                *(*pipelines)[usize(draw.transparent ? 1 : 0)].pipeline->pipeline.handle);
+            d.vkCmdBindPipeline(cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                *(*pipelines)[usize(unsigned(pipeline))].pipeline->pipeline.handle);
             at(inputs->resources->prepared->materials, draw.material)
                 .descriptor.Record(command, layout, binding_state);
             gpu.morph_binding->Record(command, layout, binding_state);
@@ -387,7 +451,14 @@ struct ModelPrepared {
                 d.vkCmdDrawIndexed(cmd, gpu.index_count, 1, 0, 0, 0);
             } else
                 d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
-        }
+        };
+        for (const auto& draw : inputs->draws)
+            if (! draw.transparent) record(draw, ModelPipeline::Opaque);
+        // Opaque texels in BLEND meshes need depth before any fractional-alpha color.
+        for (const auto& draw : inputs->draws)
+            if (draw.transparent) record(draw, ModelPipeline::BlendOpaque);
+        for (const auto& draw : inputs->draws)
+            if (draw.transparent) record(draw, ModelPipeline::Blend);
         return Ok(empty {});
     }
 };
@@ -652,6 +723,7 @@ public:
         };
         LoadScope materials(core_->trace, LoadEvent::PrepareMaterials);
         for (const auto& material : data->asset->materials) {
+            bool specular_glossiness = material.workflow == MaterialWorkflow::SpecularGlossiness;
             const TextureBinding* bindings[] { &material.base,
                                                &material.physical,
                                                &material.normal,
@@ -662,14 +734,18 @@ public:
             parameters.emissive = {
                 material.emissive.x, material.emissive.y, material.emissive.z, 0
             };
-            parameters.factors = { material.metallic,
-                                   material.roughness,
-                                   material.normal.strength,
-                                   material.occlusion.strength };
-            parameters.flags   = { float(unsigned(material.alpha)),
-                                   material.alpha_cutoff,
-                                   material.double_sided ? 1.0f : 0.0f,
-                                   material.unlit ? 1.0f : 0.0f };
+            parameters.factors  = { material.metallic,
+                                    material.roughness,
+                                    material.normal.strength,
+                                    material.occlusion.strength };
+            parameters.specular = {
+                material.specular.x, material.specular.y, material.specular.z, material.glossiness
+            };
+            parameters.flags = { float(unsigned(material.alpha)),
+                                 material.alpha_cutoff,
+                                 material.double_sided ? 1.0f : 0.0f,
+                                 float((material.unlit ? 1u : 0u) |
+                                       (specular_glossiness ? 2u : 0u)) };
             registry::DescriptorImageBinding images[5];
             for (unsigned i = 0; i < 5; ++i) {
                 const auto& binding        = *bindings[i];
@@ -678,9 +754,10 @@ public:
                 };
                 parameters.rotation_uv[i] = { cosine(binding.rotation),
                                               sine(binding.rotation),
-                                              float(binding.uv),
+                                              0,
                                               binding.texture == invalid_index ? 0.0f : 1.0f };
-                auto image                = texture(binding.texture, i == 0 || i == 4);
+                auto image =
+                    texture(binding.texture, i == 0 || i == 4 || (i == 1 && specular_glossiness));
                 if (image.is_err()) return Err(image.unwrap_err());
                 auto sampled = vk::sampled_image(image->view, image->sampler).unwrap();
                 images[i]    = { i, sampled.image, sampled.layout };
@@ -707,8 +784,37 @@ public:
         for (const auto& mesh : data->asset->meshes) {
             PreparedMesh prepared;
             for (const auto& primitive : mesh.primitives) {
-                auto vertices = upload(primitive.vertices.data(),
-                                       count(primitive.vertices) * sizeof(Vertex),
+                const auto&           material = at(data->asset->materials, primitive.material);
+                const TextureBinding* bindings[] { &material.base,
+                                                   &material.physical,
+                                                   &material.normal,
+                                                   &material.occlusion,
+                                                   &material.emission };
+                Vec<ModelVertex>      lowered;
+                lowered.resize(primitive.vertices.len(), ModelVertex {});
+                for (unsigned v = 0; v < count(primitive.vertices); ++v) {
+                    const auto& source = at(primitive.vertices, v);
+                    auto&       output = at(lowered, v);
+                    output.position    = source.position;
+                    output.normal      = source.normal;
+                    output.color       = source.color;
+                    output.tangent     = source.tangent;
+                    output.weights     = source.weights;
+                    for (unsigned i = 0; i < 4; ++i) output.joints[i] = source.joints[i];
+                    for (unsigned slot = 0; slot < 5; ++slot) {
+                        const auto& binding = *bindings[slot];
+                        if (binding.texture == invalid_index) continue;
+                        auto coord = primitive.texcoord(binding.uv, v);
+                        if (coord.is_none())
+                            return Err(
+                                render_error("prepare texcoords"_str,
+                                             "material references a missing texcoord set"_str,
+                                             ErrorKind::InvalidAsset));
+                        output.texcoords[slot] = coord.unwrap();
+                    }
+                }
+                auto vertices = upload(lowered.data(),
+                                       count(lowered) * sizeof(ModelVertex),
                                        vk::BufferUploadClass::Vertex);
                 if (vertices.is_none())
                     return Err(render_error("prepare vertices"_str,
@@ -873,6 +979,8 @@ public:
             Arc<ModelFrameResources>::make(prepared.data_.clone(), depth, work.receipt());
         resources->environment = Some(environment_->clone());
         ModelFrameData inputs { resources.clone(), {}, options.background };
+        const auto     origin        = view.eye;
+        const auto     relative_view = camera_relative_view(view.view, origin);
         struct PoseOffsets {
             unsigned skin { invalid_index }, weights {};
         };
@@ -883,12 +991,14 @@ public:
             PoseOffsets offsets;
             if (! pose.skin_palette.is_empty()) {
                 offsets.skin = unsigned(count(pose_data));
-                for (const auto& matrix : pose.skin_palette)
+                for (const auto& world : pose.skin_palette) {
+                    auto matrix = camera_relative_model(world, origin);
                     for (unsigned c = 0; c < 4; ++c)
                         pose_data.push({ matrix.m[c * 4],
                                          matrix.m[c * 4 + 1],
                                          matrix.m[c * 4 + 2],
                                          matrix.m[c * 4 + 3] });
+                }
             }
             offsets.weights = unsigned(count(pose_data));
             for (unsigned i = 0; i < count(pose.weights); i += 4) {
@@ -923,12 +1033,13 @@ public:
         const auto&        d    = core_->session.device().handle().Dispatch();
         vvk::CommandBuffer command(command_buffer, d);
         FrameParameters    frame_parameters {
-            { view.eye.x, view.eye.y, view.eye.z, 1 },
+            { 0, 0, 0, 1 },
             { options.exposure,
               float(unsigned(options.debug)),
               options.background ? 1.0f : 0.0f,
               7 },
-            (view.projection * view.view).inverse().unwrap_or(Mat4::Identity())
+            (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity()),
+            view.projection
         };
         resources->frame_buffer = core_->buffers.Allocate(
             { sizeof(FrameParameters),
@@ -999,7 +1110,7 @@ public:
                 auto        position  = at(instance.pose(n).primitive_bounds, p).center();
                 draws.push({ n,
                              p,
-                             view.view.point(position).z,
+                             view_depth(view.view, position),
                              at(asset.materials, primitive.material).alpha == AlphaMode::Blend });
             }
         }
@@ -1016,11 +1127,13 @@ public:
             if (instance.pose(n).skin_palette.is_empty() && absolute(world.determinant3()) < 1e-12f)
                 continue;
             DrawConstants constants {};
-            constants.mvp = view.projection * view.view;
+            constants.view      = relative_view;
+            auto relative_world = camera_relative_model(world, origin);
             for (unsigned row = 0; row < 3; ++row)
-                constants.model[row] = {
-                    world.m[row], world.m[4 + row], world.m[8 + row], world.m[12 + row]
-                };
+                constants.model[row] = { relative_world.m[row],
+                                         relative_world.m[4 + row],
+                                         relative_world.m[8 + row],
+                                         relative_world.m[12 + row] };
             const auto& primitive   = at(mesh.primitives, p);
             const auto& gpu         = at(gpu_mesh.primitives, p);
             constants.skin_offset   = at(pose_offsets, n).skin;
@@ -1136,7 +1249,7 @@ public:
         };
         buffer_use(*resources->frame_buffer,
                    vrento::vulkan::PassUsage::Uniform,
-                   vrento::vulkan::PassStages::Fragment);
+                   vrento::vulkan::PassStages::Vertex | vrento::vulkan::PassStages::Fragment);
         buffer_use(*core_->zero_buffer,
                    vrento::vulkan::PassUsage::Storage,
                    vrento::vulkan::PassStages::Vertex);

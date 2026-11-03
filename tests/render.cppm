@@ -111,7 +111,7 @@ TEST(Render, PreparationTimings) {
         auto session  = vk::DeviceSession::create().unwrap();
         auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
         auto stats    = session.graphics_resources().pipelines.stats();
-        rstd_assert(stats.creations == u64(3) && stats.peak_entries == usize(3));
+        rstd_assert(stats.creations == u64(4) && stats.peak_entries == usize(4));
         cold += stats.creation_nanoseconds.to_primitive() / 1e6;
         auto encoded =
             session.graphics_resources().pipelines.driver_cache().encode(session.device()).unwrap();
@@ -119,7 +119,7 @@ TEST(Render, PreparationTimings) {
             vk::DeviceSession::create({ .pipeline_cache_data = encoded.as_slice() }).unwrap();
         auto warmed       = Renderer::create(loaded, { 64, 64 }).unwrap();
         auto warmed_stats = loaded.graphics_resources().pipelines.stats();
-        rstd_assert(warmed_stats.creations == u64(3));
+        rstd_assert(warmed_stats.creations == u64(4));
         warm += warmed_stats.creation_nanoseconds.to_primitive() / 1e6;
         auto                         queue = vk::TextureContext::create(loaded).unwrap();
         vrento::texture::TextureDesc desc;
@@ -144,11 +144,11 @@ TEST(Render, PreparationTimings) {
             rstd::thread::sleep(rstd::time::Duration::from_millis(u64(1)));
         }
         asynchronous += started.elapsed().as_secs_f64() * 1000;
-        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(3));
+        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(4));
     }
-    std::printf("model pipelines: %u samples, 3 recipes; empty driver native "
+    std::printf("model pipelines: %u samples, 4 recipes; empty driver native "
                 "preparation %.3f ms; loaded driver %.3f ms; %u target queries "
-                "%.3f ms; deferred init and ready %.3f ms; peak entries 3\n",
+                "%.3f ms; deferred init and ready %.3f ms; peak entries 4\n",
                 samples,
                 cold / samples,
                 warm / samples,
@@ -492,6 +492,327 @@ TEST(Render, SharedDepth) {
     near(u8(cleared_pixels[usize((48 * 32 + 16) * 4 + 2)]).to_primitive(), 255);
     rstd_assert(session.validation_errors() == 0);
 }
+TEST(Render, MaterialWorkflows) {
+    auto session  = vrento::vulkan::DeviceSession::create({ .validation = true }).unwrap();
+    auto queue    = vrento::vulkan::TextureContext::create(session).unwrap();
+    auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    vrento::texture::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.format = vrento::TextureFormat::RGBA8_SRGB;
+    desc.usage  = vrento::texture::Usage::ColorAttachment | vrento::texture::Usage::Sampled |
+                  vrento::texture::Usage::TransferSource;
+    auto target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    View view { look_at({ 0, 0, 2 }, {}), perspective(0.8f, 1, 0.1f, 10), { 0, 0, 2 } };
+    auto draw = [&](Arc<Asset> asset, DebugView debug = DebugView::None, float exposure = 1) {
+        auto          prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneInstance instance(asset.clone());
+        auto          work = queue.Begin().unwrap();
+        auto          recorded =
+            renderer.record(work, target, prepared, instance, view, { exposure, debug });
+        if (recorded.is_err()) {
+            auto error = recorded.unwrap_err();
+            rstd::io::eprintln("{}: {}", error.location, error.message);
+            rstd_assert(false);
+        }
+        recorded.unwrap();
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        return read_pixels(session, queue, target);
+    };
+    auto  asset               = triangle({ 0.5f, 0.5f, 0.5f, 1 });
+    auto& material            = at(asset->materials, 0);
+    material.unlit            = false;
+    material.workflow         = MaterialWorkflow::SpecularGlossiness;
+    material.specular         = { 0.8f, 0.6f, 0.4f };
+    material.glossiness       = 0.5f;
+    material.physical.texture = 0;
+    Image image;
+    image.width = image.height = 1;
+    unsigned physical_pixels[] { 128, 64, 32, 128 };
+    for (unsigned value : physical_pixels) image.rgba.push(u8(value));
+    asset->images.push(rstd::move(image));
+    Texture texture;
+    texture.image = 0;
+    asset->textures.push(rstd::move(texture));
+    auto sampled   = draw(asset.clone());
+    auto roughness = draw(asset.clone(), DebugView::Roughness);
+    auto center    = [](const Vec<u8>& pixels, unsigned channel) {
+        return pixels[usize((32 * 64 + 32) * 4 + channel)].to_primitive();
+    };
+    near(center(roughness, 0), 224);
+
+    auto  decoded       = triangle({ 0.5f, 0.5f, 0.5f, 1 });
+    auto& expected      = at(decoded->materials, 0);
+    expected.unlit      = false;
+    expected.workflow   = MaterialWorkflow::SpecularGlossiness;
+    expected.specular   = { 0.8f * 0.2158605f, 0.6f * 0.05126946f, 0.4f * 0.01444384f };
+    expected.glossiness = 0.5f * (128.0f / 255);
+    auto factored       = draw(decoded.clone());
+    for (unsigned channel = 0; channel < 3; ++channel)
+        near(center(sampled, channel), center(factored, channel));
+
+    auto metallic_sample = [&](float metallic) {
+        auto  sample    = triangle({ 0.8f, 0.4f, 0.1f, 1 });
+        auto& value     = at(sample->materials, 0);
+        value.unlit     = false;
+        value.metallic  = metallic;
+        value.roughness = 0.8f;
+        return draw(rstd::move(sample), DebugView::None, 0.1f);
+    };
+    auto dielectric = metallic_sample(0), metal = metallic_sample(1), mixed = metallic_sample(0.5f);
+    auto hdr = [](unsigned pixel) {
+        float value = float(pixel) / 255;
+        float y     = value <= 0.04045f
+                          ? value / 12.92f
+                          : rstd::f32((value + 0.055f) / 1.055f).powf(f32(2.4f)).to_primitive();
+        float a = 2.51f - 2.43f * y, b = 0.03f - 0.59f * y;
+        return (-b + square_root(b * b + 0.56f * y * a)) / (2 * a);
+    };
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        float value = (hdr(center(dielectric, channel)) + hdr(center(metal, channel))) * 0.5f;
+        float mapped =
+            (value * (2.51f * value + 0.03f)) / (value * (2.43f * value + 0.59f) + 0.14f);
+        float encoded =
+            mapped <= 0.0031308f
+                ? mapped * 12.92f
+                : 1.055f * rstd::f32(mapped).powf(f32(1.0f / 2.4f)).to_primitive() - 0.055f;
+        near(center(mixed, channel), unsigned(encoded * 255 + 0.5f));
+    }
+    auto  coordinates     = triangle({ 1, 1, 1, 1 });
+    auto& mapped          = at(coordinates->materials, 0);
+    mapped.base.texture   = 0;
+    mapped.base.uv        = 2;
+    mapped.normal.texture = 1;
+    mapped.normal.uv      = 3;
+    auto&       primitive = at(at(coordinates->meshes, 0).primitives, 0);
+    TexcoordSet color_uv, normal_uv;
+    color_uv.index  = 2;
+    normal_uv.index = 3;
+    for (unsigned i = 0; i < 3; ++i) {
+        color_uv.coordinates.push({ 0.75f, 0.5f });
+        normal_uv.coordinates.push({ 0.25f, 0.5f });
+    }
+    primitive.extra_texcoords.push(rstd::move(color_uv));
+    primitive.extra_texcoords.push(rstd::move(normal_uv));
+    unsigned        colors[] { 255, 0, 0, 255, 0, 0, 255, 255 };
+    unsigned        normals[] { 128, 128, 255, 255, 255, 128, 128, 255 };
+    slice<unsigned> maps[] { slice<unsigned>::from_raw_parts(colors, usize(8)),
+                             slice<unsigned>::from_raw_parts(normals, usize(8)) };
+    for (auto pixels : maps) {
+        Image values;
+        values.width  = 2;
+        values.height = 1;
+        for (unsigned value : pixels) values.rgba.push(u8(value));
+        Texture sampler;
+        sampler.image = count(coordinates->images);
+        coordinates->images.push(rstd::move(values));
+        coordinates->textures.push(rstd::move(sampler));
+    }
+    auto base_color = draw(coordinates.clone(), DebugView::BaseColor);
+    near(center(base_color, 0), 0);
+    near(center(base_color, 2), 255);
+    auto normal_color = draw(coordinates.clone(), DebugView::Normal);
+    near(center(normal_color, 0), 188);
+    near(center(normal_color, 2), 255);
+    rstd_assert(session.validation_errors() == 0);
+}
+
+TEST(Render, BlendOcclusion) {
+    namespace vk              = vrento::vulkan;
+    namespace tex             = vrento::texture;
+    auto             session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             queue    = vk::TextureContext::create(session).unwrap();
+    auto             renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    tex::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.format = vrento::TextureFormat::RGBA8_SRGB;
+    desc.usage  = tex::Usage::ColorAttachment | tex::Usage::Sampled | tex::Usage::TransferSource;
+    auto target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    View view { look_at({ 0, 0, 2 }, {}), perspective(0.8f, 1, 0.1f, 10), { 0, 0, 2 } };
+    struct Sample {
+        float    factor, vertex;
+        unsigned texture, red, blue;
+        bool     split {}, opaque_rear {};
+    };
+    Sample samples[] { { 1, 1, 255, 255, 0 },       { 1, 0.5f, 255, 188, 188 },
+                       { 1, 0, 255, 0, 255 },       { 1, 1, 128, 188, 187 },
+                       { 1, 0.5f, 128, 137, 224 },  { 0.5f, 0.5f, 128, 99, 240, true, true },
+                       { 1, 1, 255, 255, 0, true }, { 0, 1, 255, 0, 255, true, true } };
+    for (const auto& sample : samples) {
+        auto  asset           = triangle({ 1, 1, 1, sample.factor });
+        auto& material        = at(asset->materials, 0);
+        material.alpha        = AlphaMode::Blend;
+        material.base.texture = 0;
+        Image image;
+        image.width  = 2;
+        image.height = 1;
+        unsigned pixels[] { 255, 255, 255, sample.texture, 255, 255, 255, 255 };
+        for (unsigned value : pixels) image.rgba.push(u8(value));
+        asset->images.push(rstd::move(image));
+        Texture texture;
+        texture.image       = 0;
+        texture.sampler.min = texture.sampler.mag = Filter::Nearest;
+        texture.sampler.mip                       = MipFilter::None;
+        asset->textures.push(rstd::move(texture));
+        auto& mesh       = at(asset->meshes, 0);
+        auto& primitive  = at(mesh.primitives, 0);
+        primitive.bounds = {};
+        for (auto& vertex : primitive.vertices) {
+            vertex.position.z = 0.25f;
+            vertex.color      = { 1, 0, 0, sample.vertex };
+            vertex.uv0        = { 0.25f, 0.5f };
+            primitive.bounds.include(vertex.position);
+        }
+        Primitive rear;
+        for (unsigned i = 0; i < 3; ++i) {
+            auto vertex       = Vertex(at(primitive.vertices, i));
+            vertex.position.z = -0.25f;
+            vertex.color      = { 0, 0, 1, 1 };
+            vertex.uv0        = { 0.75f, 0.5f };
+            if (sample.split) {
+                rear.bounds.include(vertex.position);
+                rear.vertices.push(rstd::move(vertex));
+            } else {
+                primitive.bounds.include(vertex.position);
+                primitive.vertices.push(rstd::move(vertex));
+            }
+        }
+        if (sample.split) {
+            Material background;
+            background.alpha = sample.opaque_rear ? AlphaMode::Opaque : AlphaMode::Blend;
+            rear.material    = count(asset->materials);
+            asset->materials.push(rstd::move(background));
+            mesh.primitives.push(rstd::move(rear));
+        }
+        auto          prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneInstance instance(asset.clone());
+        auto          work = queue.Begin().unwrap();
+        renderer.record(work, target, prepared, instance, view, { 1, DebugView::BaseColor })
+            .unwrap();
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        auto result = read_pixels(session, queue, target);
+        auto center = [&](unsigned channel) {
+            return u8(result[usize((32 * 64 + 32) * 4 + channel)]).to_primitive();
+        };
+        near(center(0), sample.red);
+        near(center(1), 0);
+        near(center(2), sample.blue);
+    }
+    rstd_assert(session.validation_errors() == 0);
+}
+
+TEST(Render, TranslatedCoordinates) {
+    auto session  = vrento::vulkan::DeviceSession::create({ .validation = true }).unwrap();
+    auto queue    = vrento::vulkan::TextureContext::create(session).unwrap();
+    auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    vrento::texture::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.usage  = vrento::texture::Usage::ColorAttachment | vrento::texture::Usage::Sampled |
+                  vrento::texture::Usage::TransferSource;
+    auto target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    Vec3 offset { 600, -50, 50 }, eye { 1, 0.5f, 2 };
+    auto camera = [&](Vec3 origin) {
+        return View { look_at(origin + eye, origin),
+                      perspective(0.8f, 1, 0.0004f, 500),
+                      origin + eye };
+    };
+    auto make = [&](Vec3 origin, bool skinned) {
+        auto     asset = triangle();
+        Material back;
+        back.base_color = { 0, 1, 0, 1 };
+        back.unlit      = true;
+        asset->materials.push(rstd::move(back));
+        auto&     mesh = at(asset->meshes, 0);
+        Primitive rear;
+        rear.material = 1;
+        for (const auto& vertex : at(mesh.primitives, 0).vertices) {
+            auto value = vertex;
+            value.position.z -= 0.02f;
+            rear.bounds.include(value.position);
+            rear.vertices.push(rstd::move(value));
+        }
+        mesh.primitives.push(rstd::move(rear));
+        if (skinned) {
+            for (auto& primitive : mesh.primitives) {
+                primitive.skin_attributes = true;
+                for (auto& vertex : primitive.vertices) vertex.weights = { 1, 0, 0, 0 };
+            }
+            at(asset->nodes, 0).skin = 0;
+            Node joint;
+            joint.translation = origin;
+            asset->nodes.push(rstd::move(joint));
+            at(asset->scenes, 0).roots.push(1);
+            Skin skin;
+            skin.joints.push(1);
+            skin.inverse_bind.push(Mat4::Identity());
+            asset->skins.push(rstd::move(skin));
+        } else {
+            at(asset->nodes, 0).translation = origin;
+        }
+        return asset;
+    };
+    auto record = [&](const PreparedAsset& prepared,
+                      const SceneInstance& instance,
+                      View                 view,
+                      RenderOptions        options = { 1, DebugView::BaseColor }) {
+        auto work = queue.Begin().unwrap();
+        renderer.record(work, target, prepared, instance, view, options).unwrap();
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        return read_pixels(session, queue, target);
+    };
+    auto          baseline     = make({}, false);
+    auto          baseline_gpu = renderer.prepare(baseline.clone()).unwrap();
+    SceneInstance baseline_scene(baseline.clone());
+    auto          expected = record(baseline_gpu, baseline_scene, camera({}));
+    auto          compare  = [&](const Vec<u8>& pixels) {
+        unsigned changed {};
+        for (unsigned i = 0; i < 64 * 64; ++i)
+            for (unsigned channel = 0; channel < 3; ++channel) {
+                auto index = usize(i * 4 + channel);
+                if (absolute(float(u8(pixels[index]).to_primitive()) -
+                             float(u8(expected[index]).to_primitive())) > 2) {
+                    ++changed;
+                    break;
+                }
+            }
+        rstd_assert(changed <= 4);
+    };
+    bool variants[] { false, true };
+    for (bool skinned : variants) {
+        auto          asset    = make(offset, skinned);
+        auto          prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneInstance instance(asset.clone());
+        compare(record(prepared, instance, camera(offset)));
+        auto lighting_eye = camera(offset);
+        lighting_eye.eye  = {};
+        compare(record(prepared, instance, lighting_eye));
+        compare(record(prepared, instance, camera(offset)));
+    }
+    HdrImage environment { 16, 8 };
+    for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 16; ++x) {
+            environment.rgba.push(float(x + 1) / 16);
+            environment.rgba.push(float(y + 1) / 8);
+            environment.rgba.push(0.25f);
+            environment.rgba.push(1.0f);
+        }
+    renderer.set_environment(rstd::move(environment)).unwrap();
+    at(baseline->materials, 0).unlit    = false;
+    at(baseline->materials, 0).metallic = 0.4f;
+    baseline_gpu                        = renderer.prepare(baseline.clone()).unwrap();
+    auto origin_view                    = camera({});
+    origin_view.projection              = perspective(0.8f, 1, 0.0004f);
+    expected   = record(baseline_gpu, baseline_scene, origin_view, { 1, DebugView::None, true });
+    auto moved = make(offset, false);
+    at(moved->materials, 0).unlit    = false;
+    at(moved->materials, 0).metallic = 0.4f;
+    auto          moved_gpu          = renderer.prepare(moved.clone()).unwrap();
+    SceneInstance moved_scene(moved.clone());
+    auto          moved_view = camera(offset);
+    moved_view.projection    = origin_view.projection;
+    compare(record(moved_gpu, moved_scene, moved_view, { 1, DebugView::None, true }));
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(Render, Integration) {
     static rstd::log::EnvLogger logger("info"_str);
     rstd::log::set_logger(logger);

@@ -244,19 +244,20 @@ struct Loader {
         TextureBinding result;
         if (! view.texture) return Ok(result);
         result.texture  = unsigned(view.texture - data.textures);
-        result.uv       = unsigned(view.texcoord);
+        auto texcoord   = view.texcoord;
         result.strength = view.scale;
         if (view.has_transform) {
             const auto& t   = view.transform;
             result.offset   = { t.offset[0], t.offset[1] };
             result.scale    = { t.scale[0], t.scale[1] };
             result.rotation = t.rotation;
-            if (t.has_texcoord) result.uv = unsigned(t.texcoord);
+            if (t.has_texcoord) texcoord = t.texcoord;
         }
-        if (result.uv > 1)
-            return Err(error(ErrorKind::Unsupported,
+        if (texcoord < 0)
+            return Err(error(ErrorKind::InvalidAsset,
                              rstd::move(location),
-                             "only TEXCOORD_0 and TEXCOORD_1 are supported"));
+                             "texcoord index must be non-negative"));
+        result.uv = unsigned(texcoord);
         return Ok(result);
     }
     auto materials() -> Result<empty, Error> {
@@ -293,7 +294,33 @@ struct Loader {
                                                  &m.normal_texture,
                                                  &m.occlusion_texture,
                                                  &m.emissive_texture };
-            TextureBinding*           outputs[] {
+            if (m.has_pbr_specular_glossiness) {
+                const auto& sg   = m.pbr_specular_glossiness;
+                auto        unit = [](float value) {
+                    return rstd::f32(value).is_finite() && value >= 0 && value <= 1;
+                };
+                bool valid = unit(sg.glossiness_factor);
+                for (float value : sg.diffuse_factor) valid = valid && unit(value);
+                for (float value : sg.specular_factor) valid = valid && unit(value);
+                if (! valid)
+                    return Err(error(
+                        ErrorKind::InvalidAsset,
+                        rstd::format("materials[{}].extensions.KHR_materials_pbrSpecularGlossiness",
+                                     i),
+                        "factors must be finite and between zero and one"));
+                result.workflow   = MaterialWorkflow::SpecularGlossiness;
+                result.base_color = { sg.diffuse_factor[0],
+                                      sg.diffuse_factor[1],
+                                      sg.diffuse_factor[2],
+                                      sg.diffuse_factor[3] };
+                result.specular   = { sg.specular_factor[0],
+                                      sg.specular_factor[1],
+                                      sg.specular_factor[2] };
+                result.glossiness = sg.glossiness_factor;
+                inputs[0]         = &sg.diffuse_texture;
+                inputs[1]         = &sg.specular_glossiness_texture;
+            }
+            TextureBinding* outputs[] {
                 &result.base, &result.physical, &result.normal, &result.occlusion, &result.emission
             };
             for (unsigned slot = 0; slot < 5; ++slot) {
@@ -476,6 +503,25 @@ struct Loader {
         result.material = input.material ? unsigned(input.material - data.materials)
                                          : unsigned(data.materials_count);
         result.vertices.resize(usize(position->count), Vertex {});
+        const auto&           material = at(asset->materials, result.material);
+        const TextureBinding* bindings[] { &material.base,
+                                           &material.physical,
+                                           &material.normal,
+                                           &material.occlusion,
+                                           &material.emission };
+        auto                  uses_texcoord = [&](unsigned set) {
+            for (const auto* binding : bindings)
+                if (binding->texture != invalid_index && binding->uv == set) return true;
+            return false;
+        };
+        for (const auto* binding : bindings)
+            if (binding->texture != invalid_index && ! attribute(input.attributes,
+                                                                 input.attributes_count,
+                                                                 cgltf_attribute_type_texcoord,
+                                                                 binding->uv))
+                return Err(error(ErrorKind::InvalidAsset,
+                                 rstd::format("{}.attributes.TEXCOORD_{}", location, binding->uv),
+                                 "material references a missing texcoord set"));
         bool has_normal {}, has_tangent {}, has_joints {}, has_weights {};
         for (cgltf_size a = 0; a < input.attributes_count; ++a) {
             const auto& attr       = input.attributes[a];
@@ -487,7 +533,19 @@ struct Loader {
                 if (components != 2)
                     return Err(
                         error(ErrorKind::InvalidAsset, location.clone(), "texcoord must be VEC2"));
-                if (attr.index > 1) continue;
+                if (attr.index > 1) {
+                    if (! uses_texcoord(unsigned(attr.index))) continue;
+                    auto values = floats(attr.data, 2, location.clone());
+                    if (values.is_err()) return Err(values.unwrap_err());
+                    auto        unpacked = values.unwrap();
+                    TexcoordSet stream;
+                    stream.index = unsigned(attr.index);
+                    stream.coordinates.reserve(usize(position->count));
+                    for (cgltf_size v = 0; v < position->count; ++v)
+                        stream.coordinates.push({ at(unpacked, v * 2), at(unpacked, v * 2 + 1) });
+                    result.extra_texcoords.push(rstd::move(stream));
+                    continue;
+                }
             }
             if (attr.index > 1 || (attr.index != 0 && attr.type != cgltf_attribute_type_texcoord))
                 return Err(
@@ -637,6 +695,13 @@ struct Loader {
             }
             Vec<Vertex> expanded;
             for (auto index : result.indices) expanded.push(Vertex(at(result.vertices, index)));
+            for (auto& stream : result.extra_texcoords) {
+                Vec<Vec2> coordinates;
+                coordinates.reserve(result.indices.len());
+                for (auto index : result.indices)
+                    coordinates.push(Vec2(at(stream.coordinates, index)));
+                stream.coordinates = rstd::move(coordinates);
+            }
             for (auto& morph : result.morphs) {
                 MorphTarget expanded_morph;
                 for (auto index : result.indices) {
@@ -667,12 +732,12 @@ struct Loader {
                 vc.normal = vc.normal + n;
             }
             if (! has_tangent) {
-                auto uv = [&](const Vertex& v) {
-                    return at(asset->materials, result.material).normal.uv == 1 ? v.uv1 : v.uv0;
-                };
-                auto  ua = uv(va), ub = uv(vb), uc = uv(vc);
-                float sx = ub.x - ua.x, sy = ub.y - ua.y, tx = uc.x - ua.x, ty = uc.y - ua.y;
-                float determinant = sx * ty - tx * sy;
+                unsigned uv_set = material.normal.texture == invalid_index ? 0 : material.normal.uv;
+                auto     ua     = result.texcoord(uv_set, a).unwrap();
+                auto     ub     = result.texcoord(uv_set, b).unwrap();
+                auto     uc     = result.texcoord(uv_set, c).unwrap();
+                float    sx = ub.x - ua.x, sy = ub.y - ua.y, tx = uc.x - ua.x, ty = uc.y - ua.y;
+                float    determinant = sx * ty - tx * sy;
                 if (absolute(determinant) > 1e-12f) {
                     Vec3     tangent   = (e1 * ty - e2 * sy) / determinant,
                              bitangent = (e2 * sx - e1 * tx) / determinant;
@@ -952,6 +1017,7 @@ auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> 
     auto   supported = [](const char* ext) {
         return strcmp(ext, "KHR_materials_unlit") == 0 ||
                strcmp(ext, "KHR_texture_transform") == 0 ||
+               strcmp(ext, "KHR_materials_pbrSpecularGlossiness") == 0 ||
                strcmp(ext, "KHR_materials_emissive_strength") == 0;
     };
     for (cgltf_size i = 0; i < parsed.data->extensions_required_count; ++i)

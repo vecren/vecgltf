@@ -3,6 +3,7 @@ export import :output;
 import :asset;
 import :attributes;
 import :emissive;
+import :materials;
 import :resources;
 import :scene;
 import :render;

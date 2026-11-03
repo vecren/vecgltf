@@ -55,6 +55,10 @@ struct Vertex {
 struct MorphTarget {
     Vec<Vec3> positions, normals, tangents;
 };
+struct TexcoordSet {
+    unsigned  index {};
+    Vec<Vec2> coordinates;
+};
 struct Primitive {
     Vec<Vertex>      vertices;
     Vec<unsigned>    indices;
@@ -62,6 +66,16 @@ struct Primitive {
     unsigned         material {};
     bool             indexed {}, skin_attributes {};
     Bounds           bounds;
+    Vec<TexcoordSet> extra_texcoords;
+    auto             texcoord(unsigned set, unsigned vertex) const -> Option<Vec2> {
+        if (vertex >= count(vertices)) return None();
+        if (set == 0) return Some(Vec2(at(vertices, vertex).uv0));
+        if (set == 1) return Some(Vec2(at(vertices, vertex).uv1));
+        for (const auto& stream : extra_texcoords)
+            if (stream.index == set && stream.coordinates.len() == vertices.len())
+                return Some(Vec2(at(stream.coordinates, vertex)));
+        return None();
+    }
 };
 struct Mesh {
     String         name;
@@ -110,14 +124,20 @@ enum class AlphaMode
     Mask,
     Blend
 };
+enum class MaterialWorkflow
+{
+    MetallicRoughness,
+    SpecularGlossiness
+};
 struct Material {
-    String         name;
-    Vec4           base_color { 1, 1, 1, 1 };
-    Vec3           emissive {};
-    float          metallic { 1 }, roughness { 1 }, alpha_cutoff { 0.5f };
-    TextureBinding base, physical, normal, occlusion, emission;
-    AlphaMode      alpha { AlphaMode::Opaque };
-    bool           double_sided {}, unlit {};
+    String           name;
+    Vec4             base_color { 1, 1, 1, 1 };
+    Vec3             emissive {}, specular { 1, 1, 1 };
+    float            metallic { 1 }, roughness { 1 }, glossiness { 1 }, alpha_cutoff { 0.5f };
+    TextureBinding   base, physical, normal, occlusion, emission;
+    MaterialWorkflow workflow { MaterialWorkflow::MetallicRoughness };
+    AlphaMode        alpha { AlphaMode::Opaque };
+    bool             double_sided {}, unlit {};
 };
 struct Node {
     String   name;

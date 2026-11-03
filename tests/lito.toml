@@ -23,6 +23,7 @@ sources = [
   "tests/asset.cppm",
   "tests/attributes.cppm",
   "tests/emissive.cppm",
+  "tests/materials.cppm",
   "tests/resources.cppm",
   "tests/scene.cppm",
   "tests/render.cppm",
