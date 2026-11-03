@@ -42,6 +42,163 @@ void projection_step(const gltf::CameraFrame& a, const gltf::CameraFrame& b) {
     same_view(track.sample(2).unwrap(), b);
 }
 
+void looks_at(const gltf::CameraFrame& frame, gltf::Vec3 target) {
+    auto local = frame.view(1.5f).unwrap().view.point(target);
+    near(local.x, 0);
+    near(local.y, 0);
+    near(local.z, -frame.focus_distance);
+}
+
+TEST(Camera, LookAt) {
+    gltf::CameraLookAt camera { { 0, 0, 10 }, {} };
+    auto               frame = gltf::camera_frame(camera).unwrap();
+    near(frame.position.z, 10);
+    near(frame.focus_distance, 10);
+    near(frame.orientation.w, 1);
+    looks_at(frame, camera.target);
+    auto restored = frame.look_at().unwrap();
+    near(restored.position.z, camera.position.z);
+    near(restored.target.x, camera.target.x);
+    near(restored.target.y, camera.target.y);
+    near(restored.target.z, camera.target.z);
+    auto tilted = gltf::camera_frame(camera, {}, { 1, 1, 0 }).unwrap();
+    looks_at(tilted, camera.target);
+    rstd_assert(gltf::absolute(tilted.orientation.z) > 0.1f);
+    rstd_assert(gltf::camera_frame(gltf::CameraLookAt { {}, {} }).is_none());
+    rstd_assert(gltf::camera_frame(camera, {}, {}).is_none());
+    rstd_assert(gltf::camera_frame(camera, {}, { 0, 0, 1 }).is_none());
+    auto invalid       = camera;
+    invalid.position.x = rstd::f32::INFINITY_.to_primitive();
+    rstd_assert(gltf::camera_frame(invalid).is_none());
+    gltf::CameraProjection projection;
+    projection.yfov = 0;
+    rstd_assert(gltf::camera_frame(camera, projection).is_none());
+}
+
+TEST(Camera, Transition) {
+    gltf::CameraLookAt     from { { 10, 4, 10 }, { 1, 2, 0 } };
+    gltf::CameraLookAt     to { { 0, 0, 2 }, from.target };
+    gltf::CameraTransition transition;
+    rstd_assert(! transition.playing() && transition.sample(0).is_none());
+    rstd_assert(! transition.update(1));
+    gltf::CameraProjection projection;
+    projection.yfov = 0.7f;
+    projection.near = 0.01f;
+    projection.far  = 0;
+    rstd_assert(transition.start(from, to, projection));
+    near(transition.duration(), 2.5f);
+    near(transition.time(), 0);
+    rstd_assert(transition.playing());
+    auto source = dyn<gltf::CameraSource>::from_ref(transition);
+    same_view(source->Snapshot(1.5f).unwrap(), gltf::camera_frame(from, projection).unwrap());
+    rstd_assert(source->Snapshot(0).is_none());
+    rstd_assert(source->Snapshot(rstd::f32::NAN_.to_primitive()).is_none());
+    auto middle = transition.sample(1.25f).unwrap();
+    near(middle.position.x, 0.625f);
+    near(middle.position.y, 0.25f);
+    near(middle.position.z, 2.5f);
+    looks_at(middle, to.target);
+    near(middle.projection.yfov, projection.yfov);
+    near(middle.projection.far, 0);
+    near(transition.time(), 0);
+    rstd_assert(! transition.update(1.25f));
+    same_view(source->Snapshot(1.5f).unwrap(), middle);
+    auto portrait  = source->Snapshot(0.5f).unwrap().view(0.5f).unwrap();
+    auto landscape = middle.view(1.5f).unwrap();
+    near(portrait.projection.m[0], landscape.projection.m[0] * 3);
+    rstd_assert(! transition.update(-1));
+    rstd_assert(! transition.update(rstd::f32::NAN_.to_primitive()));
+    rstd_assert(! transition.update(rstd::f32::INFINITY_.to_primitive()));
+    near(transition.time(), 1.25f);
+    rstd_assert(transition.update(100));
+    rstd_assert(! transition.playing() && ! transition.update(1));
+    near(transition.time(), 2.5f);
+    same_view(source->Snapshot(1.5f).unwrap(), gltf::camera_frame(to, projection).unwrap());
+    same_view(transition.sample(-10).unwrap(), gltf::camera_frame(from, projection).unwrap());
+    same_view(transition.sample(100).unwrap(), gltf::camera_frame(to, projection).unwrap());
+    rstd_assert(transition.sample(rstd::f32::NAN_.to_primitive()).is_none());
+
+    gltf::CameraTransitionOptions options;
+    options.duration = 2;
+    options.easing   = gltf::CameraEasing::Linear;
+    rstd_assert(transition.start(from, to, projection, options));
+    rstd_assert(! transition.update(1));
+    middle = source->Snapshot(1.5f).unwrap();
+    near(middle.position.x, 5);
+    near(middle.position.y, 2);
+    near(middle.position.z, 6);
+    looks_at(middle, to.target);
+    transition.stop();
+    rstd_assert(! transition.playing() && ! transition.update(100));
+    same_view(source->Snapshot(1.5f).unwrap(), middle);
+
+    auto current = middle.look_at().unwrap();
+    rstd_assert(transition.start(current, from, projection, options));
+    same_view(source->Snapshot(1.5f).unwrap(), middle);
+    auto invalid     = options;
+    invalid.duration = -1;
+    rstd_assert(! transition.start(from, to, projection, invalid));
+    invalid.duration = rstd::f32::INFINITY_.to_primitive();
+    rstd_assert(! transition.start(from, to, projection, invalid));
+    invalid    = options;
+    invalid.up = {};
+    rstd_assert(! transition.start(from, to, projection, invalid));
+    gltf::CameraLookAt opposite_a { { 0, 0, 1 }, {} }, opposite_b { { 0, 0, -1 }, {} };
+    rstd_assert(gltf::camera_frame(opposite_a).is_some());
+    rstd_assert(gltf::camera_frame(opposite_b).is_some());
+    rstd_assert(! transition.start(opposite_a, opposite_b));
+    gltf::CameraLookAt pole_a { { -1, 2, 0 }, {} }, pole_b { { 1, 2, 0 }, {} };
+    rstd_assert(! transition.start(pole_a, pole_b));
+    gltf::CameraLookAt crossing_a { { 1, 0, 1 }, {} }, crossing_b { { -7.3f, 0, -7.3f }, {} };
+    rstd_assert(! transition.start(crossing_a, crossing_b));
+    rstd_assert(transition.playing());
+    near(transition.time(), 0);
+    same_view(source->Snapshot(1.5f).unwrap(), middle);
+
+    auto moving   = to;
+    moving.target = { 2, 3, -1 };
+    rstd_assert(transition.start(from, moving, projection, options));
+    looks_at(transition.sample(1).unwrap(), { 1.5f, 2.5f, -0.5f });
+    options.duration = 0;
+    rstd_assert(transition.start(from, to, projection, options));
+    rstd_assert(! transition.playing() && ! transition.update(1));
+    same_view(source->Snapshot(1.5f).unwrap(), gltf::camera_frame(to, projection).unwrap());
+    rstd_assert(transition.start(opposite_a, opposite_b, projection, options));
+    same_view(source->Snapshot(1.5f).unwrap(), gltf::camera_frame(opposite_b, projection).unwrap());
+
+    options.up              = { 0, 0, 1 };
+    projection.orthographic = true;
+    projection.near         = 0;
+    projection.far          = 20;
+    projection.xmag         = 3;
+    projection.ymag         = 2;
+    to.position             = { 3, 4, 5 };
+    rstd_assert(transition.start(from, to, projection, options));
+    auto z_up = source->Snapshot(1.5f).unwrap();
+    same_view(z_up, gltf::camera_frame(to, projection, options.up).unwrap());
+    looks_at(z_up, to.target);
+    gltf::OrbitCamera orbit;
+    rstd_assert(orbit.restore(z_up, 1.5f));
+    same_view(orbit.frame(1.5f), z_up);
+
+    gltf::CameraLookAt far_from { { 100000000, 0, 0 }, { 99999992, 0, 0 } };
+    gltf::CameraLookAt far_to { { 100000008, 0, 0 }, { 100000000, 0, 0 } };
+    options.duration = 2;
+    options.up       = { 0, 1, 0 };
+    rstd_assert(transition.start(far_from, far_to, {}, options));
+    auto distant = transition.sample(1).unwrap();
+    rstd_assert(distant.valid());
+    near(distant.focus_distance, 8);
+    near(distant.view(1.5f)->view.vector({ 1, 0, 0 }).z, 1);
+
+    options.duration = 1;
+    rstd_assert(transition.start(from, to, {}, options));
+    rstd_assert(! transition.update(0.5f));
+    rstd_assert(transition.update(0.49999997f));
+    rstd_assert(! transition.playing() && ! transition.update(1));
+    near(transition.time(), 1);
+}
+
 TEST(Viewer, CameraTrack) {
     viewer::CameraTrack track;
     rstd_assert(track.keys().is_empty() && track.sample(0).is_none());
