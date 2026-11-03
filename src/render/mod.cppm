@@ -74,11 +74,21 @@ float view_depth(const Mat4& view, Vec3 point) {
                double(view.m[11]) * point.z + view.m[15];
     return float(z / w);
 }
+auto reversed_projection(const Mat4& projection) -> Mat4 {
+    auto result = projection;
+    for (unsigned column = 0; column < 4; ++column)
+        result.m[column * 4 + 2] =
+            float(double(projection.m[column * 4 + 3]) - projection.m[column * 4 + 2]);
+    return result;
+}
 enum class ModelPipeline : unsigned
 {
     Opaque,
     BlendOpaque,
     Blend,
+    ReversedOpaque,
+    ReversedBlendOpaque,
+    ReversedBlend,
     Background
 };
 struct RenderCore {
@@ -202,6 +212,7 @@ struct ModelFrameData {
     Arc<ModelFrameResources> resources;
     Vec<ModelDraw>           draws;
     bool                     background {};
+    bool                     reversed_depth {};
 };
 template<rstd::size_t N>
 auto shader(const unsigned (&code)[N], vrento::ShaderType stage) -> vk::Uni_ShaderSpv {
@@ -334,26 +345,32 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
     pipeline.shader_stages.push(shader(shaders::model_vertex.words, vrento::ShaderType::VERTEX));
     pipeline.shader_stages.push(
         shader(shaders::model_fragment.words, vrento::ShaderType::FRAGMENT));
-    auto opaque = add(pipeline.clone());
-    if (opaque.is_err()) return opaque;
-    auto coverage = pipeline.clone();
-    coverage.shader_stages[usize(1)] =
-        shader(shaders::model_opaque_fragment.words, vrento::ShaderType::FRAGMENT);
-    auto blend_opaque = add(rstd::move(coverage));
-    if (blend_opaque.is_err()) return blend_opaque;
     VkPipelineColorBlendAttachmentState blend {};
-    blend.blendEnable               = VK_TRUE;
-    blend.srcColorBlendFactor       = VK_BLEND_FACTOR_SRC_ALPHA;
-    blend.dstColorBlendFactor       = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.colorBlendOp              = VK_BLEND_OP_ADD;
-    blend.srcAlphaBlendFactor       = VK_BLEND_FACTOR_ONE;
-    blend.dstAlphaBlendFactor       = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.alphaBlendOp              = VK_BLEND_OP_ADD;
-    blend.colorWriteMask            = 15;
-    pipeline.color_blend            = blend;
-    pipeline.depth.depthWriteEnable = VK_FALSE;
-    auto transparent                = add(rstd::move(pipeline));
-    if (transparent.is_err()) return transparent;
+    blend.blendEnable         = VK_TRUE;
+    blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.colorBlendOp        = VK_BLEND_OP_ADD;
+    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.alphaBlendOp        = VK_BLEND_OP_ADD;
+    blend.colorWriteMask      = 15;
+    const bool directions[] { false, true };
+    for (bool reversed : directions) {
+        auto model = pipeline.clone();
+        model.depth.depthCompareOp =
+            reversed ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
+        auto opaque = add(model.clone());
+        if (opaque.is_err()) return opaque;
+        auto coverage = model.clone();
+        coverage.shader_stages[usize(1)] =
+            shader(shaders::model_opaque_fragment.words, vrento::ShaderType::FRAGMENT);
+        auto blend_opaque = add(rstd::move(coverage));
+        if (blend_opaque.is_err()) return blend_opaque;
+        model.color_blend            = blend;
+        model.depth.depthWriteEnable = VK_FALSE;
+        auto transparent             = add(rstd::move(model));
+        if (transparent.is_err()) return transparent;
+    }
     core.zero_buffer =
         core.buffers.Allocate({ 16,
                                 core.session.device().limits().minStorageBufferOffsetAlignment,
@@ -453,12 +470,21 @@ struct ModelPrepared {
                 d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
         };
         for (const auto& draw : inputs->draws)
-            if (! draw.transparent) record(draw, ModelPipeline::Opaque);
+            if (! draw.transparent)
+                record(draw,
+                       inputs->reversed_depth ? ModelPipeline::ReversedOpaque
+                                              : ModelPipeline::Opaque);
         // Opaque texels in BLEND meshes need depth before any fractional-alpha color.
         for (const auto& draw : inputs->draws)
-            if (draw.transparent) record(draw, ModelPipeline::BlendOpaque);
+            if (draw.transparent)
+                record(draw,
+                       inputs->reversed_depth ? ModelPipeline::ReversedBlendOpaque
+                                              : ModelPipeline::BlendOpaque);
         for (const auto& draw : inputs->draws)
-            if (draw.transparent) record(draw, ModelPipeline::Blend);
+            if (draw.transparent)
+                record(draw,
+                       inputs->reversed_depth ? ModelPipeline::ReversedBlend
+                                              : ModelPipeline::Blend);
         return Ok(empty {});
     }
 };
@@ -555,11 +581,19 @@ struct RenderOptions {
     DebugView debug {};
     bool      background {};
 };
+enum class DepthEncoding
+{
+    Forward,
+    Reversed
+};
 struct RenderTarget {
     vrento::texture::TextureViewRef         color;
     Option<vrento::texture::TextureViewRef> depth;
     vrento::vulkan::AttachmentLoad          color_load { vrento::vulkan::AttachmentLoad::Clear };
     vrento::vulkan::AttachmentLoad          depth_load { vrento::vulkan::AttachmentLoad::Clear };
+    // None selects Reversed for owned depth, Forward for supplied depth; Load must match its producer.
+    // View.projection always uses the forward [0,1] convention.
+    Option<DepthEncoding> depth_encoding;
 };
 class PreparedAsset {
     friend class Renderer;
@@ -965,6 +999,10 @@ public:
             if (resized.is_err()) return resized;
         }
         auto depth = destination.depth ? *destination.depth : *depth_;
+        bool reversed_depth =
+            destination.depth_encoding.unwrap_or(destination.depth ? DepthEncoding::Forward
+                                                                   : DepthEncoding::Reversed) ==
+            DepthEncoding::Reversed;
         struct RecordingGuard {
             vrento::texture::Submission& work;
             bool                         accepted {};
@@ -978,7 +1016,7 @@ public:
         auto resources =
             Arc<ModelFrameResources>::make(prepared.data_.clone(), depth, work.receipt());
         resources->environment = Some(environment_->clone());
-        ModelFrameData inputs { resources.clone(), {}, options.background };
+        ModelFrameData inputs { resources.clone(), {}, options.background, reversed_depth };
         const auto     origin        = view.eye;
         const auto     relative_view = camera_relative_view(view.view, origin);
         struct PoseOffsets {
@@ -1039,7 +1077,7 @@ public:
               options.background ? 1.0f : 0.0f,
               7 },
             (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity()),
-            view.projection
+            reversed_depth ? reversed_projection(view.projection) : view.projection
         };
         resources->frame_buffer = core_->buffers.Allocate(
             { sizeof(FrameParameters),
@@ -1208,7 +1246,7 @@ public:
             Some(vrento::vulkan::GraphAttachment { color_id, 1, destination.color_load });
         graphics.depth =
             Some(vrento::vulkan::GraphAttachment { depth_id, 1, destination.depth_load });
-        graphics.depth->clear[usize()] = 1;
+        graphics.depth->clear[usize()] = reversed_depth ? 0 : 1;
         pass.graphics                  = Some(graphics);
         auto sampled_use               = [&](const vrento::texture::TextureViewRef& view) {
             auto id = bind(view);

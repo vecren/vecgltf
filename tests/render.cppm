@@ -111,7 +111,7 @@ TEST(Render, PreparationTimings) {
         auto session  = vk::DeviceSession::create().unwrap();
         auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
         auto stats    = session.graphics_resources().pipelines.stats();
-        rstd_assert(stats.creations == u64(4) && stats.peak_entries == usize(4));
+        rstd_assert(stats.creations == u64(7) && stats.peak_entries == usize(7));
         cold += stats.creation_nanoseconds.to_primitive() / 1e6;
         auto encoded =
             session.graphics_resources().pipelines.driver_cache().encode(session.device()).unwrap();
@@ -119,7 +119,7 @@ TEST(Render, PreparationTimings) {
             vk::DeviceSession::create({ .pipeline_cache_data = encoded.as_slice() }).unwrap();
         auto warmed       = Renderer::create(loaded, { 64, 64 }).unwrap();
         auto warmed_stats = loaded.graphics_resources().pipelines.stats();
-        rstd_assert(warmed_stats.creations == u64(4));
+        rstd_assert(warmed_stats.creations == u64(7));
         warm += warmed_stats.creation_nanoseconds.to_primitive() / 1e6;
         auto                         queue = vk::TextureContext::create(loaded).unwrap();
         vrento::texture::TextureDesc desc;
@@ -144,11 +144,11 @@ TEST(Render, PreparationTimings) {
             rstd::thread::sleep(rstd::time::Duration::from_millis(u64(1)));
         }
         asynchronous += started.elapsed().as_secs_f64() * 1000;
-        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(4));
+        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(7));
     }
-    std::printf("model pipelines: %u samples, 4 recipes; empty driver native "
+    std::printf("model pipelines: %u samples, 7 recipes; empty driver native "
                 "preparation %.3f ms; loaded driver %.3f ms; %u target queries "
-                "%.3f ms; deferred init and ready %.3f ms; peak entries 4\n",
+                "%.3f ms; deferred init and ready %.3f ms; peak entries 7\n",
                 samples,
                 cold / samples,
                 warm / samples,
@@ -696,6 +696,169 @@ TEST(Render, BlendOcclusion) {
         near(center(0), sample.red);
         near(center(1), 0);
         near(center(2), sample.blue);
+    }
+    rstd_assert(session.validation_errors() == 0);
+}
+
+TEST(Render, DepthPrecision) {
+    namespace vk              = vrento::vulkan;
+    namespace tex             = vrento::texture;
+    auto             session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             queue    = vk::TextureContext::create(session).unwrap();
+    auto             renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    tex::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.format = vrento::TextureFormat::RGBA8_SRGB;
+    desc.usage  = tex::Usage::ColorAttachment | tex::Usage::Sampled | tex::Usage::TransferSource;
+    auto             target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    CameraProjection orthographic;
+    orthographic.orthographic = true;
+    orthographic.near         = 0.001f;
+    orthographic.far          = 200;
+    orthographic.xmag = orthographic.ymag = 1;
+    auto ortho = camera_frame(CameraLookAt { { 0, 0, 5 }, {} }, orthographic).unwrap();
+    View views[] { { look_at({ 0, 0, 5 }, {}), perspective(0.8f, 1, 0.001f, 200), { 0, 0, 5 } },
+                   { look_at({ 0, 0, 5 }, {}), perspective(0.8f, 1, 0.001f), { 0, 0, 5 } },
+                   ortho.view(1).unwrap() };
+    bool variants[] { false, true };
+    for (bool skinned : variants) {
+        auto  asset     = triangle({ 1, 1, 1, 1 });
+        auto& primitive = at(at(asset->meshes, 0).primitives, 0);
+        for (auto& vertex : primitive.vertices) vertex.color = { 1, 0, 0, 1 };
+        for (unsigned i = 0; i < 3; ++i) {
+            auto vertex       = Vertex(at(primitive.vertices, i));
+            vertex.position.z = -0.0001f;
+            vertex.color      = { 0, 0, 1, 1 };
+            primitive.bounds.include(vertex.position);
+            primitive.vertices.push(rstd::move(vertex));
+        }
+        if (skinned) {
+            primitive.skin_attributes = true;
+            for (auto& vertex : primitive.vertices) vertex.weights = { 1, 0, 0, 0 };
+            at(asset->nodes, 0).skin = 0;
+            asset->nodes.push(Node {});
+            at(asset->scenes, 0).roots.push(1);
+            Skin skin;
+            skin.joints.push(1);
+            skin.inverse_bind.push(Mat4::Identity());
+            asset->skins.push(rstd::move(skin));
+        }
+        auto          prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneInstance instance(asset.clone());
+        for (const auto& view : views) {
+            auto work = queue.Begin().unwrap();
+            renderer.record(work, target, prepared, instance, view, { 1, DebugView::BaseColor })
+                .unwrap();
+            queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+            auto pixels = read_pixels(session, queue, target);
+            auto center = [&](unsigned channel) {
+                return u8(pixels[usize((32 * 64 + 32) * 4 + channel)]).to_primitive();
+            };
+            near(center(0), 255);
+            near(center(1), 0);
+            near(center(2), 0);
+        }
+    }
+    rstd_assert(session.validation_errors() == 0);
+}
+
+TEST(Render, DepthEncoding) {
+    namespace vk  = vrento::vulkan;
+    namespace tex = vrento::texture;
+    auto session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto queue    = vk::TextureContext::create(session).unwrap();
+    auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    auto front = triangle(), back = triangle({ 0, 0, 1, 1 }), overlay = triangle({ 0, 1, 0, 0.5f });
+    at(front->materials, 0).alpha   = AlphaMode::Blend;
+    at(overlay->materials, 0).alpha = AlphaMode::Blend;
+    for (auto& vertex : at(at(back->meshes, 0).primitives, 0).vertices) vertex.position.z = -0.5f;
+    for (auto& vertex : at(at(overlay->meshes, 0).primitives, 0).vertices) vertex.position.z = 0.5f;
+    auto          front_gpu   = renderer.prepare(front.clone()).unwrap();
+    auto          back_gpu    = renderer.prepare(back.clone()).unwrap();
+    auto          overlay_gpu = renderer.prepare(overlay.clone()).unwrap();
+    SceneInstance front_scene(front.clone()), back_scene(back.clone()),
+        overlay_scene(overlay.clone());
+    View view { look_at({ 0, 0, 5 }, {}), perspective(0.8f, 1, 0.1f, 200), { 0, 0, 5 } };
+    tex::TextureDesc color_desc;
+    color_desc.extent = { 64, 64 };
+    color_desc.format = vrento::TextureFormat::RGBA8_SRGB;
+    color_desc.usage =
+        tex::Usage::ColorAttachment | tex::Usage::Sampled | tex::Usage::TransferSource;
+    auto depth_desc   = color_desc;
+    depth_desc.format = vrento::TextureFormat::D32F;
+    depth_desc.usage  = tex::Usage::DepthAttachment;
+    auto depth        = queue
+                            .CreateView(queue.CreateTexture(depth_desc).unwrap(),
+                                        { tex::Dimension::D2, { tex::Aspect::Depth } })
+                            .unwrap();
+    struct Sample {
+        Option<DepthEncoding> encoding;
+        bool                  external;
+    };
+    Sample samples[] {
+        { Some(DepthEncoding::Forward), true },  { Some(DepthEncoding::Reversed), true },
+        { Some(DepthEncoding::Forward), true },  { None<DepthEncoding>(), true },
+        { Some(DepthEncoding::Forward), false }, { Some(DepthEncoding::Reversed), false }
+    };
+    VkSemaphoreTypeCreateInfo semaphore_type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo semaphore_info { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    semaphore_info.pNext = &semaphore_type;
+    vvk::Semaphore semaphore;
+    rstd_assert(session.device().handle().CreateSemaphore(semaphore_info, semaphore) == VK_SUCCESS);
+    auto handle = *semaphore;
+    auto gate =
+        queue.ImportDependency(handle, 1, Arc<dyn<rstd::any::Any>>::make(rstd::move(semaphore)))
+            .unwrap();
+    Vec<tex::TextureViewRef> outputs;
+    tex::SubmissionToken     last;
+    auto                     record = [&](const RenderTarget&  destination,
+                                          const PreparedAsset& prepared,
+                                          const SceneInstance& instance) {
+        auto work = queue.Begin().unwrap();
+        work.commands()->Wait(gate, tex::Stages::All).unwrap();
+        RenderTarget frame { tex::TextureViewRef(destination.color),
+                             destination.depth ? Some(tex::TextureViewRef(*destination.depth))
+                                               : None<tex::TextureViewRef>(),
+                             destination.color_load,
+                             destination.depth_load,
+                             destination.depth_encoding };
+        renderer
+            .record(work, rstd::move(frame), prepared, instance, view, { 1, DebugView::BaseColor })
+            .unwrap();
+        last = queue.Submit(rstd::move(work)).unwrap();
+        rstd_assert(! last.poll().unwrap());
+    };
+    for (const auto& sample : samples) {
+        auto color = queue.CreateView(queue.CreateTexture(color_desc).unwrap(), {}).unwrap();
+        outputs.push(tex::TextureViewRef(color));
+        RenderTarget destination { color,
+                                   sample.external ? Some(tex::TextureViewRef(depth))
+                                                   : None<tex::TextureViewRef>(),
+                                   vk::AttachmentLoad::Clear,
+                                   vk::AttachmentLoad::Clear,
+                                   sample.encoding };
+        record(destination, front_gpu, front_scene);
+        destination.color_load = destination.depth_load = vk::AttachmentLoad::Load;
+        record(destination, back_gpu, back_scene);
+        record(destination, overlay_gpu, overlay_scene);
+    }
+    auto signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
+        session.device().handle().Dispatch().vkGetDeviceProcAddr(*session.device().handle(),
+                                                                 "vkSignalSemaphoreKHR"));
+    VkSemaphoreSignalInfo release { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+    release.semaphore = handle;
+    release.value     = 1;
+    rstd_assert(signal && signal(*session.device().handle(), &release) == VK_SUCCESS);
+    queue.wait(last).unwrap();
+    for (const auto& output : outputs) {
+        auto pixels = read_pixels(session, queue, output);
+        auto center = [&](unsigned channel) {
+            return u8(pixels[usize((32 * 64 + 32) * 4 + channel)]).to_primitive();
+        };
+        near(center(0), 188);
+        near(center(1), 188);
+        near(center(2), 0);
     }
     rstd_assert(session.validation_errors() == 0);
 }
