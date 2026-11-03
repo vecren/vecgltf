@@ -31,16 +31,14 @@ auto backend_error(ref<str> location, T error, ErrorKind kind = ErrorKind::Devic
              Some(Arc<dyn<rstd::error::Error>>::make(rstd::move(error))) };
 }
 auto texture_error(vrento::texture::Error error) -> Error {
-    return backend_error("texture"_str,
-                         error,
-                         error.kind == vrento::texture::ErrorKind::Busy ? ErrorKind::Busy
-                                                                        : ErrorKind::Device);
+    auto kind =
+        error.kind == vrento::texture::ErrorKind::Busy ? ErrorKind::Busy : ErrorKind::Device;
+    return backend_error("texture"_str, rstd::move(error), kind);
 }
 auto graph_error(vk::GraphExecutionError error) -> Error {
-    auto kind =
-        error.texture_error() && error.texture_error()->kind == vrento::texture::ErrorKind::Busy
-            ? ErrorKind::Busy
-            : ErrorKind::Device;
+    auto texture = error.texture_error();
+    auto kind = texture && (*texture)->kind == vrento::texture::ErrorKind::Busy ? ErrorKind::Busy
+                                                                                : ErrorKind::Device;
     return backend_error("model pass"_str, rstd::move(error), kind);
 }
 auto graph_error(vrento::fg::Error error) -> Error {
@@ -425,16 +423,14 @@ struct ModelPassFactory {
                     vk::GraphExecutionStage::Prepare,
                     execution.id,
                     {},
-                    vk::GraphExecutionCause::Resource(
-                        res::ResourceErrorSnapshot(prepared.unwrap_err())) });
+                    vk::GraphExecutionCause::Resource(rstd::move(prepared).unwrap_err()) });
             auto value = prepared.unwrap();
             if (value.error)
                 return Err(vk::GraphExecutionError {
                     vk::GraphExecutionStage::Prepare,
                     execution.id,
                     {},
-                    vk::GraphExecutionCause::Resource(
-                        res::ResourceErrorSnapshot(value.error.take().unwrap())) });
+                    vk::GraphExecutionCause::Resource(value.error.take().unwrap()) });
             if (value.status == registry::PipelineReadiness::Pending)
                 return Ok(vrento::PendingPreparation {});
             if (! value.pipeline)
