@@ -207,6 +207,37 @@ public:
         fail(location, "expected world, view, scene-root or a node index"_str);
         return {};
     }
+    auto shadow(const Json& input, ref<str> path) -> gltf::DirectionalShadow {
+        gltf::DirectionalShadow result;
+        if (! object(input, path)) return result;
+        if (auto input_resolution = field(input, "resolution"_str)) {
+            auto value = input_resolution->as_f64();
+            if (value && value->is_finite() && value->to_primitive() >= 1 &&
+                value->to_primitive() <= 4294967295.0 &&
+                value->to_primitive() == value->floor().to_primitive())
+                result.resolution = unsigned(value->to_primitive());
+            else
+                fail(rstd::format("{}.resolution", path).as_str(),
+                     "expected an integer from one to 4294967295"_str);
+        }
+        if (auto input_filter = field(input, "filter"_str)) {
+            auto name = text(*input_filter, rstd::format("{}.filter", path).as_str());
+            if (name == "nearest"_str)
+                result.filter = gltf::ShadowFilter::Nearest;
+            else if (name == "bilinear"_str)
+                result.filter = gltf::ShadowFilter::Bilinear;
+            else
+                fail(rstd::format("{}.filter", path).as_str(),
+                     "shadow filter must be nearest or bilinear"_str);
+        }
+        nonnegative(input, "bias"_str, result.bias, path);
+        nonnegative(input, "slope_bias"_str, result.slope_bias, path);
+        nonnegative(input, "max_bias"_str, result.max_bias, path);
+        nonnegative(input, "normal_bias"_str, result.normal_bias, path);
+        if (result.max_bias < result.bias)
+            fail(rstd::format("{}.max_bias", path).as_str(), "max bias must be at least bias"_str);
+        return result;
+    }
     void lights(const Json& input, ViewSettings& settings) {
         auto values = input.as_array();
         if (! values || values.unwrap().get().len() > usize(gltf::max_directional_lights)) {
@@ -233,6 +264,8 @@ public:
             nonnegative(value, "intensity"_str, entry.light.intensity, path.as_str());
             if (auto input = field(value, "reference"_str))
                 entry.reference = reference(*input, rstd::format("{}.reference", path).as_str());
+            if (auto input = field(value, "shadow"_str))
+                entry.light.shadow = Some(shadow(*input, rstd::format("{}.shadow", path).as_str()));
             entry.light.space = entry.reference.space == SettingsSpace::View
                                     ? gltf::LightSpace::View
                                     : gltf::LightSpace::World;

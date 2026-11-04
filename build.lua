@@ -13,6 +13,8 @@ for _, shader in ipairs({
   { name = "model_fragment", source = "model.frag", stage = "fragment" },
   { name = "model_opaque_fragment", source = "model.frag", stage = "fragment",
     output = "model-opaque.frag", definitions = { "BLEND_OPAQUE=1" } },
+  { name = "model_shadow_fragment", source = "model.frag", stage = "fragment",
+    output = "model-shadow.frag", definitions = { "SHADOW_CAST=1" } },
 }) do
   local result = spirv.compile({
     backend = "glslang", tool = lito.tool("glslang"), language = "glsl",

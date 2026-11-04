@@ -17,12 +17,26 @@ enum class LightSpace
     World,
     View
 };
+enum class ShadowFilter
+{
+    Nearest,
+    Bilinear
+};
+struct DirectionalShadow {
+    unsigned     resolution { 1024 };
+    ShadowFilter filter { ShadowFilter::Bilinear };
+    // Receiver depth bias is clamp(slope_bias * tan(theta), bias, max_bias).
+    float bias { 0.00005f }, slope_bias { 0.05f }, max_bias { 0.01f };
+    // Offset along the world-space surface normal, in scene units.
+    float normal_bias {};
+};
 struct DirectionalLight {
     // Direction toward the light; magnitude does not affect intensity.
-    Vec3       direction { 0.3f, 0.7f, 1 };
-    Vec3       color { 1, 1, 1 };
-    float      intensity { 3 };
-    LightSpace space { LightSpace::World };
+    Vec3                      direction { 0.3f, 0.7f, 1 };
+    Vec3                      color { 1, 1, 1 };
+    float                     intensity { 3 };
+    LightSpace                space { LightSpace::World };
+    Option<DirectionalShadow> shadow;
 };
 inline constexpr unsigned max_directional_lights = 8;
 class DirectionalLights {

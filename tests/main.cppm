@@ -13,6 +13,7 @@ import :render;
 import :lighting;
 import :display;
 import :coverage;
+import :shadows;
 import :postprocess;
 import :mipmaps;
 import :controls;

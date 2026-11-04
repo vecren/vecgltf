@@ -5,7 +5,9 @@ layout(location=2) in vec3 relative_position;
 layout(location=3) in vec4 world_tangent;
 layout(location=4) in vec2 texcoords[5];
 layout(location=9) flat in float winding;
+#ifndef SHADOW_CAST
 layout(location=0) out vec4 result;
+#endif
 layout(set=0,binding=0) uniform Frame {
     vec4 eye;
     vec4 options;
@@ -20,6 +22,15 @@ layout(set=0,binding=0) uniform Frame {
 layout(set=0,binding=1) uniform sampler2D specular_environment;
 layout(set=0,binding=2) uniform sampler2D diffuse_environment;
 layout(set=0,binding=3) uniform sampler2D brdf_lut;
+#ifndef SHADOW_CAST
+layout(set=0,binding=5) uniform Shadows {
+    mat4 matrices[8];
+    vec4 rectangles[8];
+    vec4 biases[8];
+    vec4 atlas;
+} shadows;
+layout(set=0,binding=6) uniform sampler2D shadow_map;
+#endif
 layout(set=1,binding=0) uniform sampler2D base_texture;
 layout(set=1,binding=1) uniform sampler2D physical_texture;
 layout(set=1,binding=2) uniform sampler2D normal_texture;
@@ -71,11 +82,41 @@ vec3 tone_map(vec3 color) {
     if(frame.lighting.y==2) return color;
     return clamp((color*(2.51*color+0.03))/(color*(2.43*color+0.59)+0.14),0,1);
 }
+#ifndef SHADOW_CAST
+float shadow_compare(vec2 pixel,vec4 rectangle,float depth) {
+    pixel=clamp(pixel,vec2(0),vec2(rectangle.z-1));
+    vec2 position=(rectangle.xy+pixel+0.5)*shadows.atlas.xy;
+    return depth<=texture(shadow_map,position).r ? 1 : 0;
+}
+float shadow_visibility(int light,vec3 normal,vec3 direction) {
+    vec4 rectangle=shadows.rectangles[light];
+    if(rectangle.z==0) return 1;
+    vec4 bias=shadows.biases[light];
+    vec4 projected=shadows.matrices[light]*vec4(relative_position+normal*bias.w,1);
+    vec3 position=projected.xyz/projected.w;
+    if(any(lessThan(position,vec3(-1,-1,0))) || any(greaterThan(position,vec3(1)))) return 1;
+    float cosine=clamp(dot(normal,direction),0.0005,1);
+    float offset=clamp(bias.y*sqrt(max(1-cosine*cosine,0))/cosine,bias.x,bias.z);
+    float depth=position.z-offset;
+    vec2 uv=position.xy*0.5+0.5;
+    if(rectangle.w==0) return shadow_compare(floor(uv*rectangle.z),rectangle,depth);
+    vec2 pixel=uv*rectangle.z-0.5;
+    vec2 first=floor(pixel),weight=fract(pixel);
+    float a=shadow_compare(first,rectangle,depth);
+    float b=shadow_compare(first+vec2(1,0),rectangle,depth);
+    float c=shadow_compare(first+vec2(0,1),rectangle,depth);
+    float d=shadow_compare(first+vec2(1),rectangle,depth);
+    return mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
+}
+#endif
 void main() {
     bool front=gl_FrontFacing!=(winding<0);
     if(!front && material.flags.z==0) discard;
     vec4 base=material.base*vertex_color*texture(base_texture,uv(0));
     if(material.flags.x==1 && base.a<material.flags.y) discard;
+#ifdef SHADOW_CAST
+    if(material.flags.x==2 && base.a<1) discard;
+#else
     if(material.flags.x==2) {
 #ifdef BLEND_OPAQUE
         if(base.a<1) discard;
@@ -112,7 +153,9 @@ void main() {
         float visibility=0.5/max(nl*sqrt(nv*nv*(1-a2)+a2)+nv*sqrt(nl*nl*(1-a2)+a2),0.0001);
         vec3 diffuse_fresnel=specular_glossiness ? fresnel:vec3(0.04+0.96*pow(1-vh,5));
         vec3 diffuse=(1-diffuse_fresnel)*diffuse_color/pi;
-        color+=(diffuse+distribution*visibility*fresnel)*nl*frame.light_radiances[index].rgb;
+        vec3 geometry_normal=normalize(world_normal)*(front ? 1 : -1);
+        float shadow=shadow_visibility(index,geometry_normal,l);
+        color+=(diffuse+distribution*visibility*fresnel)*nl*frame.light_radiances[index].rgb*shadow;
     }
     float occlusion=mix(1,texture(occlusion_texture,uv(3)).r,material.factors.w);
     vec3 reflected=reflect(-v,n);
@@ -131,4 +174,5 @@ void main() {
     if(debug_view==4) color=vec3(roughness);
     if(debug_view==5) color=material.emissive.rgb*texture(emissive_texture,uv(4)).rgb;
     result=vec4(debug_view==0 ? tone_map(color):color,alpha);
+#endif
 }

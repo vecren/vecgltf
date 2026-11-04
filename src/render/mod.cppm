@@ -9,6 +9,7 @@ export import vecgltf.environment;
 export import vrento;
 import vecgltf.shaders;
 import vecgltf.textures;
+import vecgltf.render.shadow;
 
 using namespace rstd::literals;
 
@@ -58,10 +59,11 @@ bool valid_environment_image(const HdrImage& image) {
     return true;
 }
 struct LightingParameters {
-    Vec4     directions[max_directional_lights], radiances[max_directional_lights];
-    unsigned count {};
+    Vec4                     directions[max_directional_lights], radiances[max_directional_lights];
+    unsigned                 count {};
+    Vec<shadow::ShadowLight> shadows;
 };
-auto lower_lighting(const RenderOptions& options, const View& view)
+auto lower_lighting(const RenderOptions& options, const View& view, unsigned max_extent)
     -> Result<LightingParameters, Error> {
     auto invalid = []() {
         return render_error("render options"_str,
@@ -117,7 +119,12 @@ auto lower_lighting(const RenderOptions& options, const View& view)
             direction = normalize(inverse_view->vector(direction.unwrap()));
             if (! direction) return Err(invalid());
         }
-        auto value                       = direction.unwrap();
+        auto value = direction.unwrap();
+        if (light.shadow) {
+            auto valid = shadow::ValidateShadow(*light.shadow, max_extent);
+            if (valid.is_err()) return Err(valid.unwrap_err());
+            result.shadows.push({ result.count, value, *light.shadow });
+        }
         result.directions[result.count]  = { value.x, value.y, value.z, 0 };
         result.radiances[result.count++] = { light.color.x * light.intensity,
                                              light.color.y * light.intensity,
@@ -138,7 +145,7 @@ auto lower_lighting(const RenderOptions& options, const View& view)
         auto added = append(*options.direct_light);
         if (added.is_err()) return Err(added.unwrap_err());
     }
-    return Ok(result);
+    return Ok(rstd::move(result));
 }
 auto camera_relative_model(const Mat4& model, Vec3 origin) -> Mat4 {
     auto         result = model;
@@ -182,7 +189,8 @@ enum class ModelPipeline : unsigned
     ReversedOpaque,
     ReversedBlendOpaque,
     ReversedBlend,
-    Background
+    Background,
+    Shadow
 };
 struct RenderCore {
     vk::DeviceSession                          session;
@@ -199,6 +207,7 @@ struct RenderCore {
     vk::GraphicsScopeCache                     scopes;
     Vec<registry::PipelineResourceResult>      warmed;
     Option<vrento::texture::SubmissionReceipt> latest;
+    Option<vrento::texture::SamplerRef>        shadow_sampler;
     explicit RenderCore(vk::DeviceSession device, LoadTrace observer)
         : session(rstd::move(device)),
           trace(rstd::move(observer)),
@@ -255,6 +264,12 @@ struct FrameParameters {
     Vec4 environment_lod;
 };
 static_assert(sizeof(FrameParameters) == 512);
+struct ShadowParameters {
+    Mat4 matrices[max_directional_lights];
+    Vec4 rectangles[max_directional_lights], biases[max_directional_lights];
+    Vec4 atlas;
+};
+static_assert(sizeof(ShadowParameters) == 784);
 struct PreparedEnvironment {
     Arc<RenderCore>                          core;
     Vec<Arc<vrento::texture::PreparedImage>> textures;
@@ -283,6 +298,11 @@ struct ModelDraw {
     DrawConstants constants;
     bool          transparent {};
 };
+struct ShadowFrame {
+    shadow::ShadowView                          view;
+    Option<vk::BufferAllocation>                buffer;
+    Option<registry::PreparedDescriptorBinding> binding;
+};
 struct ModelFrameResources {
     Arc<PreparedData>                           prepared;
     vrento::texture::TextureViewRef             depth;
@@ -295,6 +315,9 @@ struct ModelFrameResources {
     Option<registry::PreparedDescriptorBinding> coverage_frame_binding;
     Option<registry::PreparedDescriptorBinding> pose_binding;
     Option<vrento::texture::TextureViewRef>     coverage;
+    Option<vrento::texture::TextureViewRef>     shadow_atlas;
+    Option<vk::BufferAllocation>                shadow_parameters;
+    Vec<ShadowFrame>                            shadows;
     ModelFrameResources(Arc<PreparedData>                  source,
                         vrento::texture::TextureViewRef    depth_view,
                         vrento::texture::SubmissionReceipt submission)
@@ -336,6 +359,14 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
     auto image_device = vk::TextureContext::create(core.session);
     if (image_device.is_err()) return Err(texture_error(image_device.unwrap_err()));
     core.image_device = Some(image_device.unwrap());
+    vrento::texture::SamplerDesc shadow_sampler;
+    shadow_sampler.sample.minFilter = shadow_sampler.sample.magFilter =
+        vrento::TextureFilter::NEAREST;
+    shadow_sampler.sample.mipFilter = vrento::TextureMipmapFilter::None;
+    shadow_sampler.sample.wrapS = shadow_sampler.sample.wrapT = vrento::TextureWrap::CLAMP_TO_EDGE;
+    auto sampled = core.image_device->CreateSampler(shadow_sampler);
+    if (sampled.is_err()) return Err(texture_error(sampled.unwrap_err()));
+    core.shadow_sampler = Some(sampled.unwrap());
     vk::DescriptorSetInfo frame_info, material_info;
     frame_info.bindings.push({ 0,
                                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -356,6 +387,10 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
                                    1,
                                    VK_SHADER_STAGE_FRAGMENT_BIT,
                                    nullptr });
+    frame_info.bindings.push(
+        { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
+    frame_info.bindings.push(
+        { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
     auto frame_layout    = core.descriptor_layouts.Ensure(core.session.device(), frame_info);
     auto material_layout = core.descriptor_layouts.Ensure(core.session.device(), material_info);
     if (frame_layout.is_err())
@@ -399,13 +434,14 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     pipeline.color_load_op = pipeline.depth_load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
     pipeline.color_blend.colorWriteMask             = 15;
-    auto add = [&](vk::PipelineResourceRequest value) -> Result<empty, Error> {
+    auto add = [&](vk::PipelineResourceRequest value, bool warm = true) -> Result<empty, Error> {
         auto signature = vk::MakeRenderPassResourceDesc(value);
         auto recipe    = graphics.pipelines.RegisterRecipe(rstd::move(value), graphics.layouts);
         if (recipe.is_none())
             return Err(render_error("pipeline recipe"_str, "registration failed"_str));
         auto handle = recipe.unwrap();
         core.recipes.push(res::PipelineRecipeHandle(handle));
+        if (! warm) return Ok(empty {});
         auto ready = core.preparation->prepare(handle, signature);
         if (ready.is_err()) return Err(backend_error("pipeline"_str, ready.unwrap_err()));
         auto prepared = ready.unwrap();
@@ -502,7 +538,13 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         shader(shaders::background_vertex.words, vrento::ShaderType::VERTEX));
     background.shader_stages.push(
         shader(shaders::background_fragment.words, vrento::ShaderType::FRAGMENT));
-    return add(rstd::move(background));
+    auto added = add(rstd::move(background));
+    if (added.is_err()) return added;
+    auto caster                 = pipeline.clone();
+    caster.has_color_attachment = false;
+    caster.shader_stages[usize(1)] =
+        shader(shaders::model_shadow_fragment.words, vrento::ShaderType::FRAGMENT);
+    return add(rstd::move(caster), false);
 }
 auto bind_storage(RenderCore& core, const vk::BufferAllocation& buffer, unsigned set)
     -> Result<registry::PreparedDescriptorBinding, Error> {
@@ -520,7 +562,36 @@ auto bind_storage(RenderCore& core, const vk::BufferAllocation& buffer, unsigned
     return Ok(result.unwrap());
 }
 
-constexpr vrento::vulkan::GraphSerial model_kind = 0x5647434c54464401ull;
+void record_geometry(ModelFrameResources&                    resources,
+                     const ModelDraw&                        draw,
+                     VkCommandBuffer                         cmd,
+                     VkPipeline                              pipeline,
+                     registry::DescriptorBindingRecordState& state,
+                     const Mat4*                             view = nullptr) {
+    auto&              core     = *resources.prepared->core;
+    const auto&        dispatch = core.session.device().handle().Dispatch();
+    vvk::CommandBuffer command(cmd, dispatch);
+    auto               layout = *core.layout->physical->layout;
+    const auto& gpu = at(at(resources.prepared->meshes, draw.mesh).primitives, draw.primitive);
+    dispatch.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    at(resources.prepared->materials, draw.material).descriptor.Record(command, layout, state);
+    gpu.morph_binding->Record(command, layout, state);
+    auto constants = draw.constants;
+    if (view) constants.view = *view;
+    dispatch.vkCmdPushConstants(
+        cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(constants), &constants);
+    auto buffer = gpu.vertices.buffer();
+    auto offset = gpu.vertices.offset();
+    dispatch.vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
+    if (gpu.indices) {
+        dispatch.vkCmdBindIndexBuffer(
+            cmd, gpu.indices->buffer(), gpu.indices->offset(), VK_INDEX_TYPE_UINT32);
+        dispatch.vkCmdDrawIndexed(cmd, gpu.index_count, 1, 0, 0, 0);
+    } else
+        dispatch.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
+}
+constexpr vrento::vulkan::GraphSerial shadow_kind = 0x5647434c54464402ull;
+constexpr vrento::vulkan::GraphSerial model_kind  = 0x5647434c54464401ull;
 struct ModelPrepared {
     Arc<ModelFrameData>                        inputs;
     Arc<Vec<registry::PipelineResourceResult>> pipelines;
@@ -550,29 +621,11 @@ struct ModelPrepared {
         }
         inputs->resources->pose_binding->Record(command, layout, binding_state);
         auto record = [&](const ModelDraw& draw, ModelPipeline pipeline) {
-            const auto& gpu =
-                at(at(inputs->resources->prepared->meshes, draw.mesh).primitives, draw.primitive);
-            d.vkCmdBindPipeline(cmd,
-                                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                *(*pipelines)[usize(unsigned(pipeline))].pipeline->pipeline.handle);
-            at(inputs->resources->prepared->materials, draw.material)
-                .descriptor.Record(command, layout, binding_state);
-            gpu.morph_binding->Record(command, layout, binding_state);
-            d.vkCmdPushConstants(cmd,
-                                 layout,
-                                 VK_SHADER_STAGE_VERTEX_BIT,
-                                 0,
-                                 sizeof(draw.constants),
-                                 &draw.constants);
-            auto buffer = gpu.vertices.buffer();
-            auto offset = gpu.vertices.offset();
-            d.vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
-            if (gpu.indices) {
-                d.vkCmdBindIndexBuffer(
-                    cmd, gpu.indices->buffer(), gpu.indices->offset(), VK_INDEX_TYPE_UINT32);
-                d.vkCmdDrawIndexed(cmd, gpu.index_count, 1, 0, 0, 0);
-            } else
-                d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
+            record_geometry(*inputs->resources,
+                            draw,
+                            cmd,
+                            *(*pipelines)[usize(unsigned(pipeline))].pipeline->pipeline.handle,
+                            binding_state);
         };
         for (const auto& draw : *inputs->draws)
             if (! draw.transparent)
@@ -618,8 +671,8 @@ struct ModelPassFactory {
                             const vk::PassCompileContext&)
         -> Result<vrento::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
         Vec<registry::PipelineResourceResult> pipelines;
-        for (const auto& recipe : core->recipes) {
-            auto prepared = core->preparation->prepare(recipe, desc.signature);
+        for (unsigned i = 0; i < unsigned(ModelPipeline::Shadow); ++i) {
+            auto prepared = core->preparation->prepare(core->recipes[usize(i)], desc.signature);
             if (prepared.is_err())
                 return Err(vk::GraphExecutionError {
                     vk::GraphExecutionStage::Prepare,
@@ -643,6 +696,94 @@ struct ModelPassFactory {
         return Ok(Arc<dyn<vk::VulkanPass>>::make(
             ModelPass { core.clone(),
                         Arc<Vec<registry::PipelineResourceResult>>::make(rstd::move(pipelines)) }));
+    }
+};
+struct ShadowPrepared {
+    Arc<ModelFrameData>                   inputs;
+    Arc<registry::PipelineResourceResult> pipeline;
+    auto Record(vk::GraphRecordContext& context) const -> Result<empty, vk::GraphExecutionError> {
+        auto& resources = *inputs->resources;
+        auto& core      = *resources.prepared->core;
+        auto  native    = vk::native_recording(context.submission, core.session);
+        if (native.is_err())
+            return Err(
+                vk::GraphExecutionError { vk::GraphExecutionStage::Record,
+                                          {},
+                                          {},
+                                          vk::GraphExecutionCause::Texture(native.unwrap_err()) });
+        auto                                   cmd      = native.unwrap();
+        const auto&                            dispatch = core.session.device().handle().Dispatch();
+        vvk::CommandBuffer                     command(cmd, dispatch);
+        auto                                   layout = *core.layout->physical->layout;
+        registry::DescriptorBindingRecordState state;
+        resources.pose_binding->Record(command, layout, state);
+        for (const auto& shadow : resources.shadows) {
+            VkViewport viewport { float(shadow.view.x),
+                                  float(shadow.view.y),
+                                  float(shadow.view.resolution),
+                                  float(shadow.view.resolution),
+                                  0,
+                                  1 };
+            VkRect2D   scissor { { int(shadow.view.x), int(shadow.view.y) },
+                                 { shadow.view.resolution, shadow.view.resolution } };
+            dispatch.vkCmdSetViewport(cmd, 0, 1, &viewport);
+            dispatch.vkCmdSetScissor(cmd, 0, 1, &scissor);
+            shadow.binding->Record(command, layout, state);
+            for (const auto& draw : *inputs->draws)
+                record_geometry(resources,
+                                draw,
+                                cmd,
+                                *pipeline->pipeline->pipeline.handle,
+                                state,
+                                &shadow.view.view);
+        }
+        return Ok(empty {});
+    }
+};
+struct ShadowPass {
+    using FrameData = ModelFrameData;
+    Arc<registry::PipelineResourceResult> pipeline;
+    auto Instantiate(const vk::GraphPrepareContext& context, Arc<FrameData> frame) const
+        -> Result<vrento::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
+        if (! context.scope)
+            return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Schema });
+        return Ok(
+            Arc<dyn<vk::VulkanPass>>::make(ShadowPrepared { rstd::move(frame), pipeline.clone() }));
+    }
+};
+struct ShadowPassDesc {
+    using PassDescriptor = ShadowPassDesc;
+    vk::VulkanPassIO           io;
+    vk::RenderPassResourceDesc signature;
+};
+struct ShadowPassFactory {
+    using Pass = ShadowPass;
+    Arc<RenderCore> core;
+    auto            Compile(const ShadowPassDesc&        desc,
+                            const vk::PassExecutionInfo& execution,
+                            const vk::PassCompileContext&)
+        -> Result<vrento::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
+        auto prepared = core->preparation->prepare(
+            core->recipes[usize(unsigned(ModelPipeline::Shadow))], desc.signature);
+        if (prepared.is_err())
+            return Err(vk::GraphExecutionError {
+                vk::GraphExecutionStage::Prepare,
+                execution.id,
+                {},
+                vk::GraphExecutionCause::Resource(prepared.unwrap_err()) });
+        auto value = prepared.unwrap();
+        if (value.error)
+            return Err(vk::GraphExecutionError {
+                vk::GraphExecutionStage::Prepare,
+                execution.id,
+                {},
+                vk::GraphExecutionCause::Resource(value.error.take().unwrap()) });
+        if (value.status == registry::PipelineReadiness::Pending)
+            return Ok(vrento::PendingPreparation {});
+        if (! value.pipeline)
+            return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Prepare, execution.id });
+        return Ok(Arc<dyn<vk::VulkanPass>>::make(ShadowPass {
+            Arc<registry::PipelineResourceResult>::make(value.pipeline.take().unwrap()) }));
     }
 };
 struct ModelScopes {
@@ -1117,7 +1258,47 @@ private:
         }
         return Ok(empty {});
     }
-    auto prepare_target_impl(const RenderTarget& destination, bool retry, bool linear_scene)
+    auto prepare_shadows(const LightingParameters& lights, bool retry)
+        -> Result<registry::PipelineReadiness, Error> {
+        if (lights.shadows.is_empty()) return Ok(registry::PipelineReadiness::Ready);
+        Bounds bounds;
+        bounds.include({});
+        auto plan = shadow::BuildShadowPlan(lights.shadows.as_slice(),
+                                            bounds,
+                                            core_->session.device().limits().maxImageDimension2D);
+        if (plan.is_err()) return Err(plan.unwrap_err());
+        vrento::texture::TextureDesc description;
+        description.extent = { plan->width, plan->height };
+        description.format = vrento::TextureFormat::D32F;
+        description.usage =
+            vrento::texture::Usage::DepthAttachment | vrento::texture::Usage::Sampled;
+        auto supported = core_->image_device->QuerySupport(description);
+        if (supported.is_err()) return Err(texture_error(supported.unwrap_err()));
+        vk::RenderPassResourceDesc signature;
+        signature.has_color_attachment = false;
+        signature.has_depth_attachment = true;
+        signature.depth_format         = VK_FORMAT_D32_SFLOAT;
+        auto prepared                  = core_->preparation->prepare(
+            core_->recipes[usize(unsigned(ModelPipeline::Shadow))], signature, retry);
+        if (prepared.is_err())
+            return Err(backend_error("shadow preparation"_str, prepared.unwrap_err()));
+        auto value = prepared.unwrap();
+        if (value.error)
+            return Err(backend_error("shadow preparation"_str, value.error.take().unwrap()));
+        if (value.status == registry::PipelineReadiness::Failed)
+            return Err(render_error("shadow preparation"_str, "pipeline preparation failed"_str));
+        if (value.pipeline) {
+            bool retained {};
+            for (const auto& cached : core_->warmed)
+                retained |= cached.handle == value.pipeline->handle;
+            if (! retained) core_->warmed.push(value.pipeline.take().unwrap());
+        }
+        return Ok(value.status);
+    }
+    auto prepare_target_impl(const RenderTarget&       destination,
+                             bool                      retry,
+                             bool                      linear_scene,
+                             const LightingParameters* lighting = nullptr)
         -> Result<registry::PipelineReadiness, Error> {
         auto coverage_valid = validate_coverage(destination, linear_scene);
         if (coverage_valid.is_err()) return Err(coverage_valid.unwrap_err());
@@ -1137,8 +1318,13 @@ private:
             signature.depth_format =
                 vk::ToVkType(destination.depth->texture().description().format);
         auto status = registry::PipelineReadiness::Ready;
-        for (const auto& recipe : core_->recipes) {
-            auto result = core_->preparation->prepare(recipe, signature, retry);
+        if (lighting) {
+            auto ready = prepare_shadows(*lighting, retry);
+            if (ready.is_err()) return Err(ready.unwrap_err());
+            status = ready.unwrap();
+        }
+        for (unsigned i = 0; i < unsigned(ModelPipeline::Shadow); ++i) {
+            auto result = core_->preparation->prepare(core_->recipes[usize(i)], signature, retry);
             if (result.is_err())
                 return Err(backend_error("prepare target"_str, result.unwrap_err()));
             auto value = result.unwrap();
@@ -1173,6 +1359,41 @@ public:
     auto prepare_target(vrento::texture::TextureViewRef target, bool retry = false)
         -> Result<registry::PipelineReadiness, Error> {
         return prepare_target(RenderTarget { rstd::move(target) }, retry);
+    }
+    auto prepare_target(const RenderTarget& target, RenderOptions options, bool retry = false)
+        -> Result<registry::PipelineReadiness, Error> {
+        auto lights = lower_lighting(options,
+                                     { Mat4::Identity(), Mat4::Identity(), {} },
+                                     core_->session.device().limits().maxImageDimension2D);
+        if (lights.is_err()) return Err(lights.unwrap_err());
+        return prepare_target_impl(target, retry, false, &*lights);
+    }
+    auto prepare_scene_target(const RenderTarget& target, SceneOptions options, bool retry = false)
+        -> Result<registry::PipelineReadiness, Error> {
+        RenderOptions values { 1,
+                               options.debug,
+                               options.background,
+                               options.direct_light,
+                               options.ibl_intensity,
+                               ToneMapping::Linear,
+                               options.directional_lights,
+                               options.world_to_environment,
+                               options.background_intensity };
+        auto          lights = lower_lighting(values,
+                                              { Mat4::Identity(), Mat4::Identity(), {} },
+                                              core_->session.device().limits().maxImageDimension2D);
+        if (lights.is_err()) return Err(lights.unwrap_err());
+        return prepare_target_impl(target, retry, true, &*lights);
+    }
+    auto prepare_scene_target(vrento::texture::TextureViewRef target,
+                              SceneOptions                    options,
+                              bool retry = false) -> Result<registry::PipelineReadiness, Error> {
+        return prepare_scene_target(RenderTarget { rstd::move(target) }, options, retry);
+    }
+    auto prepare_target(vrento::texture::TextureViewRef target,
+                        RenderOptions                   options,
+                        bool retry = false) -> Result<registry::PipelineReadiness, Error> {
+        return prepare_target(RenderTarget { rstd::move(target) }, options, retry);
     }
     auto record(vrento::texture::Submission&    work,
                 vrento::texture::TextureViewRef target,
@@ -1253,7 +1474,8 @@ private:
             return Err(render_error("render options"_str,
                                     "invalid exposure, IBL intensity or tone mapping"_str,
                                     ErrorKind::InvalidAsset));
-        auto lowered = lower_lighting(options, view);
+        auto lowered =
+            lower_lighting(options, view, core_->session.device().limits().maxImageDimension2D);
         if (lowered.is_err()) return Err(lowered.unwrap_err());
         auto        lights      = lowered.unwrap();
         const auto& target_desc = target.texture().description();
@@ -1281,7 +1503,52 @@ private:
                                             "coverage aliases an environment texture"_str,
                                             ErrorKind::InvalidAsset));
         }
-        auto readiness = prepare_target_impl(destination, false, linear_scene);
+        const auto& asset = instance.asset();
+        struct Draw {
+            unsigned node {}, primitive {};
+            float    depth {};
+            bool     transparent {};
+        };
+        Vec<Draw>  draws;
+        Bounds     caster_bounds;
+        const auto origin = view.eye;
+        for (unsigned n = 0; n < count(asset.nodes); ++n) {
+            auto mesh_index = at(asset.nodes, n).mesh;
+            if (! instance.visible(n) || mesh_index == invalid_index) continue;
+            const auto& pose = instance.pose(n);
+            if (pose.skin_palette.is_empty() && absolute(pose.world.determinant3()) < 1e-12f)
+                continue;
+            const auto& mesh = at(asset.meshes, mesh_index);
+            for (unsigned p = 0; p < count(mesh.primitives); ++p) {
+                const auto& primitive = at(mesh.primitives, p);
+                auto        position  = at(instance.pose(n).primitive_bounds, p).center();
+                if (! lights.shadows.is_empty() &&
+                    (at(asset.materials, primitive.material).alpha != AlphaMode::Blend ||
+                     at(asset.materials, primitive.material).base_color.w >= 1)) {
+                    auto bounds = instance.relative_primitive_bounds(n, p, origin);
+                    if (bounds.valid) {
+                        caster_bounds.include(bounds.min);
+                        caster_bounds.include(bounds.max);
+                    }
+                }
+                draws.push({ n,
+                             p,
+                             view_depth(view.view, position),
+                             at(asset.materials, primitive.material).alpha == AlphaMode::Blend });
+            }
+        }
+        rstd::slice_::sort_unstable_by(
+            draws.as_mut_slice().as_mut_ref(), [](const Draw& a, const Draw& b) {
+                if (a.transparent != b.transparent) return ! a.transparent;
+                return a.transparent ? a.depth < b.depth : a.depth > b.depth;
+            });
+        auto planned =
+            shadow::BuildShadowPlan(lights.shadows.as_slice(),
+                                    caster_bounds,
+                                    core_->session.device().limits().maxImageDimension2D);
+        if (planned.is_err()) return Err(planned.unwrap_err());
+        auto shadow_plan = planned.unwrap();
+        auto readiness   = prepare_target_impl(destination, false, linear_scene, &lights);
         if (readiness.is_err()) return Err(readiness.unwrap_err());
         auto status = readiness.unwrap();
         if (status != registry::PipelineReadiness::Ready)
@@ -1317,7 +1584,6 @@ private:
         ModelFrameData inputs {
             resources.clone(), Arc<Vec<ModelDraw>>::make(), options.background, reversed_depth
         };
-        const auto origin        = view.eye;
         const auto relative_view = camera_relative_view(view.view, origin);
         struct PoseOffsets {
             unsigned skin { invalid_index }, weights {};
@@ -1405,58 +1671,111 @@ private:
                                 usize(sizeof(frame_parameters))))
                 .is_none())
             return Err(render_error("frame"_str, "view parameter upload failed"_str));
-        registry::DescriptorImageBinding images[4];
+        ShadowParameters shadow_parameters {};
+        if (! shadow_plan.views.is_empty()) {
+            vrento::texture::TextureDesc description;
+            description.extent = { shadow_plan.width, shadow_plan.height };
+            description.format = vrento::TextureFormat::D32F;
+            description.usage =
+                vrento::texture::Usage::DepthAttachment | vrento::texture::Usage::Sampled;
+            auto texture = core_->image_device->CreateTexture(description);
+            if (texture.is_err()) return Err(texture_error(texture.unwrap_err()));
+            auto atlas = core_->image_device->CreateView(
+                texture.unwrap(),
+                { vrento::texture::Dimension::D2, { vrento::texture::Aspect::Depth } });
+            if (atlas.is_err()) return Err(texture_error(atlas.unwrap_err()));
+            resources->shadow_atlas = Some(atlas.unwrap());
+            shadow_parameters.atlas = {
+                1.0f / float(shadow_plan.width), 1.0f / float(shadow_plan.height), 0, 0
+            };
+            for (auto& shadow : shadow_plan.views) {
+                unsigned index                      = shadow.light_index;
+                shadow_parameters.matrices[index]   = shadow.matrix;
+                shadow_parameters.rectangles[index] = {
+                    float(shadow.x),
+                    float(shadow.y),
+                    float(shadow.resolution),
+                    shadow.options.filter == ShadowFilter::Bilinear ? 1.0f : 0.0f
+                };
+                shadow_parameters.biases[index] = { shadow.options.bias,
+                                                    shadow.options.slope_bias,
+                                                    shadow.options.max_bias,
+                                                    shadow.options.normal_bias };
+                resources->shadows.push(ShadowFrame { rstd::move(shadow) });
+            }
+        }
+        auto upload_uniform = [&](const auto& values) -> Result<vk::BufferAllocation, Error> {
+            auto buffer = core_->buffers.Allocate(
+                { sizeof(values),
+                  core_->session.device().limits().minUniformBufferOffsetAlignment,
+                  vk::BufferUploadClass::Uniform });
+            if (! buffer || core_->buffers
+                                .QueueWrite(*buffer,
+                                            slice<rstd::uint8_t>::from_raw_parts(
+                                                reinterpret_cast<const rstd::uint8_t*>(&values),
+                                                usize(sizeof(values))))
+                                .is_none())
+                return Err(render_error("shadow parameters"_str, "uniform upload failed"_str));
+            return Ok(buffer.take().unwrap());
+        };
+        auto shadow_uniform = upload_uniform(shadow_parameters);
+        if (shadow_uniform.is_err()) return Err(shadow_uniform.unwrap_err());
+        resources->shadow_parameters = Some(shadow_uniform.unwrap());
+        registry::DescriptorImageBinding images[5];
         for (unsigned i = 0; i < 4; ++i) {
             auto sampled = vk::sampled_image(at((*resources->environment)->textures, i)->view,
                                              at((*resources->environment)->textures, i)->sampler)
                                .unwrap();
             images[i]    = { i + 1, sampled.image, sampled.layout };
         }
-        registry::DescriptorBufferBinding frame { 0,
-                                                  resources->frame_buffer->buffer(),
-                                                  resources->frame_buffer->offset(),
-                                                  sizeof(FrameParameters) };
-        auto                              descriptor = core_->descriptors.Prepare(
-            core_->session.device(),
-            0,
-            **core_->descriptor_layouts.Resolve(core_->frame_layout),
-            slice<registry::DescriptorImageBinding>::from_raw_parts(images, usize(4)),
-            slice<registry::DescriptorBufferBinding>::from_raw_parts(&frame, usize(1)),
-            registry::DescriptorBindingReuse::Shared);
-        if (descriptor.is_err())
-            return Err(backend_error("frame descriptor"_str, descriptor.unwrap_err()));
-        resources->frame_binding = Some(descriptor.unwrap());
-        if (resources->coverage) {
-            frame_parameters.options.z       = 2;
-            resources->coverage_frame_buffer = core_->buffers.Allocate(
-                { sizeof(FrameParameters),
-                  core_->session.device().limits().minUniformBufferOffsetAlignment,
-                  vk::BufferUploadClass::Uniform });
-            if (! resources->coverage_frame_buffer ||
-                core_->buffers
-                    .QueueWrite(*resources->coverage_frame_buffer,
-                                slice<rstd::uint8_t>::from_raw_parts(
-                                    reinterpret_cast<const rstd::uint8_t*>(&frame_parameters),
-                                    usize(sizeof(frame_parameters))))
-                    .is_none())
-                return Err(render_error("coverage frame"_str, "view parameter upload failed"_str));
-            registry::DescriptorBufferBinding coverage_frame {
-                0,
-                resources->coverage_frame_buffer->buffer(),
-                resources->coverage_frame_buffer->offset(),
-                sizeof(FrameParameters)
+        auto atlas_sampled = vk::sampled_image(
+            resources->shadow_atlas ? *resources->shadow_atlas
+                                    : at((*resources->environment)->textures, 2)->view,
+            *core_->shadow_sampler);
+        if (atlas_sampled.is_err()) return Err(texture_error(atlas_sampled.unwrap_err()));
+        images[4]       = { 6, atlas_sampled->image, atlas_sampled->layout };
+        auto bind_frame = [&](const vk::BufferAllocation& buffer)
+            -> Result<registry::PreparedDescriptorBinding, Error> {
+            registry::DescriptorBufferBinding bindings[] {
+                { 0, buffer.buffer(), buffer.offset(), sizeof(FrameParameters) },
+                { 5,
+                  resources->shadow_parameters->buffer(),
+                  resources->shadow_parameters->offset(),
+                  sizeof(ShadowParameters) }
             };
-            auto coverage_descriptor = core_->descriptors.Prepare(
+            auto descriptor = core_->descriptors.Prepare(
                 core_->session.device(),
                 0,
                 **core_->descriptor_layouts.Resolve(core_->frame_layout),
-                slice<registry::DescriptorImageBinding>::from_raw_parts(images, usize(4)),
-                slice<registry::DescriptorBufferBinding>::from_raw_parts(&coverage_frame, usize(1)),
+                slice<registry::DescriptorImageBinding>::from_raw_parts(images, usize(5)),
+                slice<registry::DescriptorBufferBinding>::from_raw_parts(bindings, usize(2)),
                 registry::DescriptorBindingReuse::Shared);
-            if (coverage_descriptor.is_err())
-                return Err(backend_error("coverage frame descriptor"_str,
-                                         coverage_descriptor.unwrap_err()));
-            resources->coverage_frame_binding = Some(coverage_descriptor.unwrap());
+            if (descriptor.is_err())
+                return Err(backend_error("frame descriptor"_str, descriptor.unwrap_err()));
+            return Ok(descriptor.unwrap());
+        };
+        auto descriptor = bind_frame(*resources->frame_buffer);
+        if (descriptor.is_err()) return Err(descriptor.unwrap_err());
+        resources->frame_binding = Some(descriptor.unwrap());
+        if (resources->coverage) {
+            auto values      = frame_parameters;
+            values.options.z = 2;
+            auto buffer      = upload_uniform(values);
+            if (buffer.is_err()) return Err(buffer.unwrap_err());
+            resources->coverage_frame_buffer = Some(buffer.unwrap());
+            auto binding                     = bind_frame(*resources->coverage_frame_buffer);
+            if (binding.is_err()) return Err(binding.unwrap_err());
+            resources->coverage_frame_binding = Some(binding.unwrap());
+        }
+        for (auto& shadow : resources->shadows) {
+            auto values       = frame_parameters;
+            values.projection = shadow.view.projection;
+            auto buffer       = upload_uniform(values);
+            if (buffer.is_err()) return Err(buffer.unwrap_err());
+            shadow.buffer = Some(buffer.unwrap());
+            auto binding  = bind_frame(*shadow.buffer);
+            if (binding.is_err()) return Err(binding.unwrap_err());
+            shadow.binding = Some(binding.unwrap());
         }
         LoadScope                 uploads(core_->trace, LoadEvent::Uploads);
         vk::RecordedBufferUploads recorded;
@@ -1477,31 +1796,6 @@ private:
             if (result.is_err()) return Err(texture_error(result.unwrap_err()));
         }
         uploads.finish();
-        const auto& asset = instance.asset();
-        struct Draw {
-            unsigned node {}, primitive {};
-            float    depth {};
-            bool     transparent {};
-        };
-        Vec<Draw> draws;
-        for (unsigned n = 0; n < count(asset.nodes); ++n) {
-            auto mesh_index = at(asset.nodes, n).mesh;
-            if (! instance.visible(n) || mesh_index == invalid_index) continue;
-            const auto& mesh = at(asset.meshes, mesh_index);
-            for (unsigned p = 0; p < count(mesh.primitives); ++p) {
-                const auto& primitive = at(mesh.primitives, p);
-                auto        position  = at(instance.pose(n).primitive_bounds, p).center();
-                draws.push({ n,
-                             p,
-                             view_depth(view.view, position),
-                             at(asset.materials, primitive.material).alpha == AlphaMode::Blend });
-            }
-        }
-        rstd::slice_::sort_unstable_by(
-            draws.as_mut_slice().as_mut_ref(), [](const Draw& a, const Draw& b) {
-                if (a.transparent != b.transparent) return ! a.transparent;
-                return a.transparent ? a.depth < b.depth : a.depth > b.depth;
-            });
         for (const auto& draw : draws) {
             auto        n = draw.node, p = draw.primitive, mesh_index = at(asset.nodes, n).mesh;
             const auto& mesh     = at(asset.meshes, mesh_index);
@@ -1526,12 +1820,20 @@ private:
             inputs.draws->push({ mesh_index, p, primitive.material, constants, draw.transparent });
         }
         GraphShape shape;
+        bool       has_shadows = resources->shadow_atlas.is_some();
+        if (has_shadows) shape.passes.push(vk::PassExecutionInfo {});
         shape.passes.push(vk::PassExecutionInfo {});
         if (resources->coverage) shape.passes.push(vk::PassExecutionInfo {});
-        auto& pass         = shape.passes[usize()];
+        unsigned first     = has_shadows ? 1 : 0;
+        auto&    pass      = shape.passes[usize(first)];
         pass.id            = { 1 };
         pass.kind          = model_kind;
-        auto coverage_pass = resources->coverage ? &shape.passes[usize(1)] : nullptr;
+        auto coverage_pass = resources->coverage ? &shape.passes[usize(first + 1)] : nullptr;
+        auto shadow_pass   = has_shadows ? &shape.passes[usize()] : nullptr;
+        if (shadow_pass) {
+            shadow_pass->id   = { 3 };
+            shadow_pass->kind = shadow_kind;
+        }
         if (coverage_pass) {
             coverage_pass->id   = { 2 };
             coverage_pass->kind = model_kind;
@@ -1627,28 +1929,51 @@ private:
                 Some(vk::GraphAttachment { depth_id, 2, vk::AttachmentLoad::Load });
             coverage_pass->graphics = Some(coverage_graphics);
         }
+        if (shadow_pass) {
+            auto atlas_id                                       = bind(*resources->shadow_atlas);
+            shape.resources[usize(atlas_id.value - 1)].imported = false;
+            attachment(*shadow_pass,
+                       atlas_id,
+                       vk::PassUsage::DepthAttachment,
+                       vk::PassStages::Depth,
+                       vk::AttachmentLoad::Clear,
+                       2);
+            vk::GraphicsDescription shadow_graphics;
+            shadow_graphics.depth =
+                Some(vk::GraphAttachment { atlas_id, 1, vk::AttachmentLoad::Clear });
+            shadow_graphics.depth->clear[usize()] = 1;
+            shadow_pass->graphics                 = Some(shadow_graphics);
+        }
         auto sampled_use = [&](vk::PassExecutionInfo&                 execution,
-                               const vrento::texture::TextureViewRef& view) {
+                               const vrento::texture::TextureViewRef& view,
+                               unsigned                               version = 0) {
             auto id = bind(view);
             for (const auto& use : execution.uses)
                 if (use.resource == id) return;
             vrento::vulkan::PassResourceUse use { id,
-                                                  0,
+                                                  version,
                                                   vrento::vulkan::GraphAccess::Read,
                                                   vrento::vulkan::PassUsage::Sampled,
                                                   vrento::vulkan::PassStages::Fragment };
             const auto                      range = view.description().range;
             use.range.mip_count                   = range.mip_count;
             use.range.layer_count                 = range.layer_count;
+            use.range.aspect = range.aspect == vrento::texture::Aspect::Depth ? 2 : 1;
             execution.uses.push(rstd::move(use));
         };
         for (const auto& source : prepared.data_->images) {
             sampled_use(pass, source.source->image.view);
+            if (shadow_pass) sampled_use(*shadow_pass, source.source->image.view);
             if (coverage_pass) sampled_use(*coverage_pass, source.source->image.view);
         }
         for (const auto& source : (*environment_)->textures) {
             sampled_use(pass, source->view);
+            if (shadow_pass) sampled_use(*shadow_pass, source->view);
             if (coverage_pass) sampled_use(*coverage_pass, source->view);
+        }
+        if (shadow_pass) {
+            sampled_use(pass, *resources->shadow_atlas, 1);
+            if (coverage_pass) sampled_use(*coverage_pass, *resources->shadow_atlas, 1);
         }
         struct BufferResource {
             rstd::uint64_t identity;
@@ -1690,11 +2015,23 @@ private:
                        *resources->coverage_frame_buffer,
                        vk::PassUsage::Uniform,
                        vk::PassStages::Vertex | vk::PassStages::Fragment);
+        buffer_use(
+            pass, *resources->shadow_parameters, vk::PassUsage::Uniform, vk::PassStages::Fragment);
+        if (coverage_pass)
+            buffer_use(*coverage_pass,
+                       *resources->shadow_parameters,
+                       vk::PassUsage::Uniform,
+                       vk::PassStages::Fragment);
+        if (shadow_pass)
+            for (const auto& shadow : resources->shadows)
+                buffer_use(
+                    *shadow_pass, *shadow.buffer, vk::PassUsage::Uniform, vk::PassStages::Vertex);
         auto shared_buffer_use = [&](const vk::BufferAllocation& allocation,
                                      vk::PassUsage               usage,
                                      vk::PassStages              stages) {
             buffer_use(pass, allocation, usage, stages);
             if (coverage_pass) buffer_use(*coverage_pass, allocation, usage, stages);
+            if (shadow_pass) buffer_use(*shadow_pass, allocation, usage, stages);
         };
         shared_buffer_use(*core_->zero_buffer,
                           vrento::vulkan::PassUsage::Storage,
@@ -1728,6 +2065,11 @@ private:
                     vk::TypedPassFactory<ModelPassDesc, ModelPassFactory> {
                         ModelPassFactory { core_.clone() } }))
                 .unwrap();
+            compiler_
+                ->bind(Arc<dyn<vk::PassFactory>>::make(
+                    vk::TypedPassFactory<ShadowPassDesc, ShadowPassFactory> {
+                        ShadowPassFactory { core_.clone() } }))
+                .unwrap();
         }
         if (! graph_shape_ || *graph_shape_ != shape) {
             vrento::fg::FrameGraphBuilder builder(1);
@@ -1747,11 +2089,15 @@ private:
                 auto added = builder.add_pass(execution.id);
                 if (added.is_err()) return Err(graph_error(added.unwrap_err()));
                 ModelPassDesc desc;
-                desc.io.kind                        = model_kind;
+                desc.io.kind                        = execution.kind;
                 desc.io.graphics                    = execution.graphics;
                 desc.signature.color_format         = vk::ToVkType(target_desc.format);
                 desc.signature.has_depth_attachment = true;
                 desc.signature.depth_format = vk::ToVkType(depth.texture().description().format);
+                if (execution.kind == shadow_kind) {
+                    desc.signature.has_color_attachment = false;
+                    desc.signature.depth_format         = VK_FORMAT_D32_SFLOAT;
+                }
                 for (const auto& use : execution.uses) {
                     if (use.access != vk::GraphAccess::Write) continue;
                     bool inherits {};
@@ -1780,7 +2126,14 @@ private:
                     else
                         desc.io.outputs.push(rstd::move(value));
                 }
-                auto published = vk::declare_input(builder, execution.id, rstd::move(desc));
+                auto published = [&]() {
+                    if (execution.kind != shadow_kind)
+                        return vk::declare_input(builder, execution.id, rstd::move(desc));
+                    ShadowPassDesc shadow_desc;
+                    shadow_desc.io        = rstd::move(desc.io);
+                    shadow_desc.signature = desc.signature;
+                    return vk::declare_input(builder, execution.id, rstd::move(shadow_desc));
+                }();
                 if (published.is_err()) return Err(graph_error(published.unwrap_err()));
                 descriptions.push(published.unwrap());
             }
@@ -1802,6 +2155,12 @@ private:
         if (frame_binding.is_err()) return Err(graph_error(frame_binding.unwrap_err()));
         Vec<vk::PassFrameBinding> frames;
         frames.push(frame_binding.unwrap());
+        if (has_shadows) {
+            auto shadow_binding = compiled.frame<ShadowPass>(
+                { 3 }, 1, ModelFrameData { resources.clone(), shared_draws.clone() });
+            if (shadow_binding.is_err()) return Err(graph_error(shadow_binding.unwrap_err()));
+            frames.push(shadow_binding.unwrap());
+        }
         if (resources->coverage) {
             auto coverage_binding = compiled.frame<ModelPass>(
                 { 2 },

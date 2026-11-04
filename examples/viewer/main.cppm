@@ -616,7 +616,7 @@ int main(int argc, char** argv) {
                 coverage_write         = Some(coverage_pool->acquire().unwrap());
                 scene_target->coverage = Some(coverage_write->view());
             }
-            auto scene_ready = renderer.prepare_scene_target(*scene_target);
+            auto scene_ready = renderer.prepare_scene_target(*scene_target, *scene_options);
             auto display_ready =
                 display->prepare_target(gltf::DisplayTarget { write.view() }, display_options);
             if (scene_ready.is_err()) {

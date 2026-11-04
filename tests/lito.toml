@@ -33,6 +33,7 @@ sources = [
   "tests/lighting.cppm",
   "tests/display.cppm",
   "tests/coverage.cppm",
+  "tests/shadows.cppm",
   "tests/postprocess.cppm",
   "tests/mipmaps.cppm",
   "tests/controls.cppm",

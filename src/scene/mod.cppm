@@ -22,6 +22,24 @@ class SceneInstance {
     u64           revision_ { 1 };
     Bounds        bounds_;
 
+    struct Position {
+        double x, y, z;
+    };
+    static auto relative_point(const Mat4& matrix, Vec3 point, Vec3 origin) -> Position {
+        const auto& m = matrix.m;
+        double      w =
+            double(m[3]) * point.x + double(m[7]) * point.y + double(m[11]) * point.z + m[15];
+        return { ((double(m[12]) - double(origin.x) * w) + double(m[0]) * point.x +
+                  double(m[4]) * point.y + double(m[8]) * point.z) /
+                     w,
+                 ((double(m[13]) - double(origin.y) * w) + double(m[1]) * point.x +
+                  double(m[5]) * point.y + double(m[9]) * point.z) /
+                     w,
+                 ((double(m[14]) - double(origin.z) * w) + double(m[2]) * point.x +
+                  double(m[6]) * point.y + double(m[10]) * point.z) /
+                     w };
+    }
+
     void visit(unsigned index) {
         if (at(visible_, index)) return;
         at(visible_, index) = true;
@@ -128,19 +146,8 @@ class SceneInstance {
             const auto& node = at(asset_->nodes, i);
             if (! at(visible_, i) || node.mesh == invalid_index) continue;
             const auto& mesh = at(asset_->meshes, node.mesh);
-            for (const auto& primitive : mesh.primitives) {
-                Bounds bounds;
-                if (node.skin != invalid_index || ! primitive.morphs.is_empty()) {
-                    for (unsigned v = 0; v < count(primitive.vertices); ++v)
-                        bounds.include(world_position(i, primitive, v));
-                } else if (primitive.bounds.valid) {
-                    for (unsigned corner = 0; corner < 8; ++corner) {
-                        const auto& b = primitive.bounds;
-                        bounds.include(pose.world.point({ corner & 1 ? b.max.x : b.min.x,
-                                                          corner & 2 ? b.max.y : b.min.y,
-                                                          corner & 4 ? b.max.z : b.min.z }));
-                    }
-                }
+            for (unsigned p = 0; p < count(mesh.primitives); ++p) {
+                auto bounds = relative_primitive_bounds(i, p, {});
                 if (bounds.valid) {
                     bounds_.include(bounds.min);
                     bounds_.include(bounds.max);
@@ -266,21 +273,55 @@ public:
         }
         set_time(value);
     }
-    Vec3
-    world_position(unsigned node_index, const Primitive& primitive, unsigned vertex_index) const {
+    Vec3 world_position(unsigned         node_index,
+                        const Primitive& primitive,
+                        unsigned         vertex_index,
+                        Vec3             origin = {}) const {
         const auto& node   = at(asset_->nodes, node_index);
         const auto& pose   = at(poses_, node_index);
         const auto& vertex = at(primitive.vertices, vertex_index);
         auto        p      = vertex.position;
         for (unsigned i = 0; i < count(primitive.morphs) && i < count(pose.weights); ++i)
             p = p + at(at(primitive.morphs, i).positions, vertex_index) * at(pose.weights, i);
-        if (node.skin == invalid_index) return pose.world.point(p);
-        Vec3  result {};
+        if (node.skin == invalid_index) {
+            auto result = relative_point(pose.world, p, origin);
+            return { float(result.x), float(result.y), float(result.z) };
+        }
+        Position result {};
         float weights[] { vertex.weights.x, vertex.weights.y, vertex.weights.z, vertex.weights.w };
         for (unsigned j = 0; j < 4; ++j)
             if (weights[j] > 0 && vertex.joints[j] < count(pose.skin_palette)) {
-                result = result + at(pose.skin_palette, vertex.joints[j]).point(p) * weights[j];
+                auto point = relative_point(at(pose.skin_palette, vertex.joints[j]), p, origin);
+                result.x += point.x * weights[j];
+                result.y += point.y * weights[j];
+                result.z += point.z * weights[j];
             }
+        return { float(result.x), float(result.y), float(result.z) };
+    }
+    auto relative_primitive_bounds(unsigned node_index, unsigned primitive_index, Vec3 origin) const
+        -> Bounds {
+        Bounds result;
+        if (! visible(node_index)) return result;
+        const auto& node = at(asset_->nodes, node_index);
+        if (node.mesh == invalid_index || node.mesh >= count(asset_->meshes)) return result;
+        const auto& mesh = at(asset_->meshes, node.mesh);
+        if (primitive_index >= count(mesh.primitives)) return result;
+        const auto& primitive = at(mesh.primitives, primitive_index);
+        if (node.skin != invalid_index || ! primitive.morphs.is_empty()) {
+            for (unsigned v = 0; v < count(primitive.vertices); ++v)
+                result.include(world_position(node_index, primitive, v, origin));
+        } else if (primitive.bounds.valid) {
+            const auto& bounds = primitive.bounds;
+            const auto& world  = at(poses_, node_index).world;
+            for (unsigned corner = 0; corner < 8; ++corner) {
+                auto point = relative_point(world,
+                                            { corner & 1 ? bounds.max.x : bounds.min.x,
+                                              corner & 2 ? bounds.max.y : bounds.min.y,
+                                              corner & 4 ? bounds.max.z : bounds.min.z },
+                                            origin);
+                result.include({ float(point.x), float(point.y), float(point.z) });
+            }
+        }
         return result;
     }
 };
