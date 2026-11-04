@@ -7,6 +7,8 @@ for _, shader in ipairs({
   { name = "background_fragment", source = "background.frag", stage = "fragment" },
   { name = "display_vertex", source = "display.vert", stage = "vertex" },
   { name = "display_fragment", source = "display.frag", stage = "fragment" },
+  { name = "bloom_fragment", source = "bloom.frag", stage = "fragment" },
+  { name = "postprocess_fragment", source = "postprocess.frag", stage = "fragment" },
   { name = "model_vertex", source = "model.vert", stage = "vertex" },
   { name = "model_fragment", source = "model.frag", stage = "fragment" },
   { name = "model_opaque_fragment", source = "model.frag", stage = "fragment",

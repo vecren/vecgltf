@@ -290,8 +290,11 @@ struct ModelFrameResources {
     Option<Arc<PreparedEnvironment>>            environment;
     Option<vk::BufferUploadBatchLease>          uploads;
     Option<vk::BufferAllocation>                poses, frame_buffer;
+    Option<vk::BufferAllocation>                coverage_frame_buffer;
     Option<registry::PreparedDescriptorBinding> frame_binding;
+    Option<registry::PreparedDescriptorBinding> coverage_frame_binding;
     Option<registry::PreparedDescriptorBinding> pose_binding;
+    Option<vrento::texture::TextureViewRef>     coverage;
     ModelFrameResources(Arc<PreparedData>                  source,
                         vrento::texture::TextureViewRef    depth_view,
                         vrento::texture::SubmissionReceipt submission)
@@ -309,9 +312,10 @@ struct ModelFrameResources {
 };
 struct ModelFrameData {
     Arc<ModelFrameResources> resources;
-    Vec<ModelDraw>           draws;
+    Arc<Vec<ModelDraw>>      draws;
     bool                     background {};
     bool                     reversed_depth {};
+    bool                     coverage {};
 };
 template<rstd::size_t N>
 auto shader(const unsigned (&code)[N], vrento::ShaderType stage) -> vk::Uni_ShaderSpv {
@@ -534,7 +538,9 @@ struct ModelPrepared {
         vvk::CommandBuffer                     command(cmd, d);
         auto                                   layout = *core.layout->physical->layout;
         registry::DescriptorBindingRecordState binding_state;
-        inputs->resources->frame_binding->Record(command, layout, binding_state);
+        const auto& frame_binding = inputs->coverage ? inputs->resources->coverage_frame_binding
+                                                     : inputs->resources->frame_binding;
+        frame_binding->Record(command, layout, binding_state);
         if (inputs->background) {
             d.vkCmdBindPipeline(cmd,
                                 VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -568,18 +574,18 @@ struct ModelPrepared {
             } else
                 d.vkCmdDraw(cmd, gpu.vertex_count, 1, 0, 0);
         };
-        for (const auto& draw : inputs->draws)
+        for (const auto& draw : *inputs->draws)
             if (! draw.transparent)
                 record(draw,
                        inputs->reversed_depth ? ModelPipeline::ReversedOpaque
                                               : ModelPipeline::Opaque);
         // Opaque texels in BLEND meshes need depth before any fractional-alpha color.
-        for (const auto& draw : inputs->draws)
+        for (const auto& draw : *inputs->draws)
             if (draw.transparent)
                 record(draw,
                        inputs->reversed_depth ? ModelPipeline::ReversedBlendOpaque
                                               : ModelPipeline::BlendOpaque);
-        for (const auto& draw : inputs->draws)
+        for (const auto& draw : *inputs->draws)
             if (draw.transparent)
                 record(draw,
                        inputs->reversed_depth ? ModelPipeline::ReversedBlend
@@ -679,6 +685,9 @@ struct RenderTarget {
     // None selects Reversed for owned depth, Forward for supplied depth; Load must match its producer.
     // View.projection always uses the forward [0,1] convention.
     Option<DepthEncoding> depth_encoding;
+    // record_scene clears this sampled RGBA16F view and writes geometry coverage to alpha.
+    // Its extent matches color; the environment background contributes zero coverage.
+    Option<vrento::texture::TextureViewRef> coverage;
 };
 struct PrepareOptions {
     // Upper bound for mipmapped linear samplers, limited by enabled device capabilities.
@@ -717,9 +726,9 @@ class Renderer {
             unsigned                 width {}, height {}, aspects { 1 };
             friend bool              operator==(const Resource&, const Resource&) = default;
         };
-        Vec<Resource>         resources;
-        vk::PassExecutionInfo pass;
-        friend bool           operator==(const GraphShape&, const GraphShape&) = default;
+        Vec<Resource>              resources;
+        Vec<vk::PassExecutionInfo> passes;
+        friend bool                operator==(const GraphShape&, const GraphShape&) = default;
     };
     Option<GraphShape> graph_shape_;
     explicit Renderer(Arc<RenderCore> core): core_(rstd::move(core)) {}
@@ -1049,8 +1058,69 @@ public:
     }
 
 private:
+    auto validate_coverage(const RenderTarget& destination, bool linear_scene)
+        -> Result<empty, Error> {
+        if (! destination.coverage) return Ok(empty {});
+        auto invalid = []() {
+            return render_error(
+                "coverage target"_str, "invalid scene coverage view"_str, ErrorKind::InvalidAsset);
+        };
+        const auto& coverage = *destination.coverage;
+        if (! linear_scene || ! destination.color.valid() || ! coverage.valid() ||
+            destination.color.texture().identity().epoch != core_->session.epoch() ||
+            ! destination.color.permits(true) ||
+            coverage.texture().identity().epoch != core_->session.epoch() ||
+            ! coverage.permits(true) ||
+            coverage.texture().identity() == destination.color.texture().identity())
+            return Err(invalid());
+        const auto& color_desc  = destination.color.texture().description();
+        const auto& color_range = destination.color.description().range;
+        if (color_desc.format != vrento::TextureFormat::RGBA16F || color_desc.samples != 1 ||
+            destination.color.description().dimension != vrento::texture::Dimension::D2 ||
+            color_range.aspect != vrento::texture::Aspect::Color || color_range.mip_count != 1 ||
+            color_range.layer_count != 1 || color_range.first_mip >= color_desc.mip_levels ||
+            color_range.first_layer >= color_desc.layers ||
+            ! vrento::texture::has(color_desc.usage,
+                                   vrento::texture::Usage::ColorAttachment |
+                                       vrento::texture::Usage::Sampled))
+            return Err(invalid());
+        const auto& desc  = coverage.texture().description();
+        const auto& range = coverage.description().range;
+        if (desc.format != vrento::TextureFormat::RGBA16F || desc.samples != 1 ||
+            coverage.description().dimension != vrento::texture::Dimension::D2 ||
+            range.aspect != vrento::texture::Aspect::Color || range.mip_count != 1 ||
+            range.layer_count != 1 || range.first_mip >= desc.mip_levels ||
+            range.first_layer >= desc.layers ||
+            ! vrento::texture::has(desc.usage,
+                                   vrento::texture::Usage::ColorAttachment |
+                                       vrento::texture::Usage::Sampled))
+            return Err(invalid());
+        auto size = vrento::texture::mip_extent(destination.color.texture().description(),
+                                                destination.color.description().range.first_mip);
+        if (vrento::texture::mip_extent(desc, range.first_mip) != size) return Err(invalid());
+        if (destination.depth) {
+            const auto& depth = *destination.depth;
+            if (! depth.valid() || ! depth.permits(true) ||
+                depth.texture().identity().epoch != core_->session.epoch() ||
+                depth.texture().identity() == coverage.texture().identity())
+                return Err(invalid());
+            const auto& depth_desc  = depth.texture().description();
+            const auto& depth_range = depth.description().range;
+            if (depth.description().dimension != vrento::texture::Dimension::D2 ||
+                depth_desc.samples != 1 || depth_range.mip_count != 1 ||
+                depth_range.layer_count != 1 || depth_range.first_mip >= depth_desc.mip_levels ||
+                depth_range.first_layer >= depth_desc.layers ||
+                depth_range.aspect != vrento::texture::Aspect::Depth ||
+                ! vrento::texture::has(depth_desc.usage, vrento::texture::Usage::DepthAttachment) ||
+                vrento::texture::mip_extent(depth_desc, depth_range.first_mip) != size)
+                return Err(invalid());
+        }
+        return Ok(empty {});
+    }
     auto prepare_target_impl(const RenderTarget& destination, bool retry, bool linear_scene)
         -> Result<registry::PipelineReadiness, Error> {
+        auto coverage_valid = validate_coverage(destination, linear_scene);
+        if (coverage_valid.is_err()) return Err(coverage_valid.unwrap_err());
         auto target = destination.color;
         if (! target.valid() || target.texture().identity().epoch != core_->session.epoch())
             return Err(render_error("prepare target"_str, "invalid target"_str));
@@ -1159,6 +1229,14 @@ private:
         if (! target.valid() || &*prepared.data_->core != &*core_ ||
             prepared.generation() != instance.asset().generation)
             return Err(render_error("render"_str, "asset or renderer identity mismatch"_str));
+        auto coverage_valid = validate_coverage(destination, linear_scene);
+        if (coverage_valid.is_err()) return coverage_valid;
+        if (! work.valid() ||
+            work.receipt().status() != vrento::texture::SubmissionStatus::Recording)
+            return Err(
+                render_error("record"_str, "submission is not recording"_str, ErrorKind::Busy));
+        auto queue = vk::native_queue(work, core_->session);
+        if (queue.is_err()) return Err(texture_error(queue.unwrap_err()));
         if (core_->latest &&
             (core_->latest->status() == vrento::texture::SubmissionStatus::Recording ||
              core_->latest->uncertain()))
@@ -1185,6 +1263,24 @@ private:
                              target_desc.format != vrento::TextureFormat::RGBA8_SRGB)) ||
             target_desc.samples != 1 || range.mip_count != 1 || range.layer_count != 1)
             return Err(render_error("record"_str, "unsupported target view"_str));
+        if (destination.coverage) {
+            auto identity = destination.coverage->texture().identity();
+            for (const auto& texture : prepared.data_->textures)
+                if (texture.view.texture().identity() == identity)
+                    return Err(render_error("coverage target"_str,
+                                            "coverage aliases an asset texture"_str,
+                                            ErrorKind::InvalidAsset));
+            for (const auto& image : prepared.data_->images)
+                if (image.source->image.view.texture().identity() == identity)
+                    return Err(render_error("coverage target"_str,
+                                            "coverage aliases an asset image"_str,
+                                            ErrorKind::InvalidAsset));
+            for (const auto& texture : (*environment_)->textures)
+                if (texture->view.texture().identity() == identity)
+                    return Err(render_error("coverage target"_str,
+                                            "coverage aliases an environment texture"_str,
+                                            ErrorKind::InvalidAsset));
+        }
         auto readiness = prepare_target_impl(destination, false, linear_scene);
         if (readiness.is_err()) return Err(readiness.unwrap_err());
         auto status = readiness.unwrap();
@@ -1217,9 +1313,12 @@ private:
         auto resources =
             Arc<ModelFrameResources>::make(prepared.data_.clone(), depth, work.receipt());
         resources->environment = Some(environment_->clone());
-        ModelFrameData inputs { resources.clone(), {}, options.background, reversed_depth };
-        const auto     origin        = view.eye;
-        const auto     relative_view = camera_relative_view(view.view, origin);
+        resources->coverage    = rstd::move(destination.coverage);
+        ModelFrameData inputs {
+            resources.clone(), Arc<Vec<ModelDraw>>::make(), options.background, reversed_depth
+        };
+        const auto origin        = view.eye;
+        const auto relative_view = camera_relative_view(view.view, origin);
         struct PoseOffsets {
             unsigned skin { invalid_index }, weights {};
         };
@@ -1327,6 +1426,38 @@ private:
         if (descriptor.is_err())
             return Err(backend_error("frame descriptor"_str, descriptor.unwrap_err()));
         resources->frame_binding = Some(descriptor.unwrap());
+        if (resources->coverage) {
+            frame_parameters.options.z       = 2;
+            resources->coverage_frame_buffer = core_->buffers.Allocate(
+                { sizeof(FrameParameters),
+                  core_->session.device().limits().minUniformBufferOffsetAlignment,
+                  vk::BufferUploadClass::Uniform });
+            if (! resources->coverage_frame_buffer ||
+                core_->buffers
+                    .QueueWrite(*resources->coverage_frame_buffer,
+                                slice<rstd::uint8_t>::from_raw_parts(
+                                    reinterpret_cast<const rstd::uint8_t*>(&frame_parameters),
+                                    usize(sizeof(frame_parameters))))
+                    .is_none())
+                return Err(render_error("coverage frame"_str, "view parameter upload failed"_str));
+            registry::DescriptorBufferBinding coverage_frame {
+                0,
+                resources->coverage_frame_buffer->buffer(),
+                resources->coverage_frame_buffer->offset(),
+                sizeof(FrameParameters)
+            };
+            auto coverage_descriptor = core_->descriptors.Prepare(
+                core_->session.device(),
+                0,
+                **core_->descriptor_layouts.Resolve(core_->frame_layout),
+                slice<registry::DescriptorImageBinding>::from_raw_parts(images, usize(4)),
+                slice<registry::DescriptorBufferBinding>::from_raw_parts(&coverage_frame, usize(1)),
+                registry::DescriptorBindingReuse::Shared);
+            if (coverage_descriptor.is_err())
+                return Err(backend_error("coverage frame descriptor"_str,
+                                         coverage_descriptor.unwrap_err()));
+            resources->coverage_frame_binding = Some(coverage_descriptor.unwrap());
+        }
         LoadScope                 uploads(core_->trace, LoadEvent::Uploads);
         vk::RecordedBufferUploads recorded;
         if (core_->buffers.HasPendingUploads()) {
@@ -1392,12 +1523,19 @@ private:
             constants.weight_offset = at(pose_offsets, n).weights;
             constants.morph_count   = unsigned(count(primitive.morphs));
             constants.vertex_count  = gpu.vertex_count;
-            inputs.draws.push({ mesh_index, p, primitive.material, constants, draw.transparent });
+            inputs.draws->push({ mesh_index, p, primitive.material, constants, draw.transparent });
         }
         GraphShape shape;
-        auto&      pass = shape.pass;
-        pass.id         = { 1 };
-        pass.kind       = model_kind;
+        shape.passes.push(vk::PassExecutionInfo {});
+        if (resources->coverage) shape.passes.push(vk::PassExecutionInfo {});
+        auto& pass         = shape.passes[usize()];
+        pass.id            = { 1 };
+        pass.kind          = model_kind;
+        auto coverage_pass = resources->coverage ? &shape.passes[usize(1)] : nullptr;
+        if (coverage_pass) {
+            coverage_pass->id   = { 2 };
+            coverage_pass->kind = model_kind;
+        }
         vk::GraphBindings                    bindings(1);
         Vec<vrento::texture::TextureViewRef> references;
         auto                                 bind = [&](vrento::texture::TextureViewRef view) {
@@ -1428,29 +1566,33 @@ private:
         auto color_id = bind(target), depth_id = bind(depth);
         shape.resources[usize()].imported  = destination.color_load == vk::AttachmentLoad::Load;
         shape.resources[usize(1)].imported = destination.depth_load == vk::AttachmentLoad::Load;
-        auto attachment                    = [&](vrento::vulkan::ResourceId     id,
+        auto attachment                    = [&](vk::PassExecutionInfo&         execution,
+                                                 vrento::vulkan::ResourceId     id,
                                                  vrento::vulkan::PassUsage      usage,
                                                  vrento::vulkan::PassStages     stages,
                                                  vrento::vulkan::AttachmentLoad load,
-                                                 unsigned                       aspect) {
+                                                 unsigned                       aspect,
+                                                 unsigned                       version = 1) {
             vrento::vulkan::PassResourceUse use {
-                id, 1, vrento::vulkan::GraphAccess::Write, usage, stages
+                id, version, vrento::vulkan::GraphAccess::Write, usage, stages
             };
             use.range.aspect = aspect;
             if (load == vrento::vulkan::AttachmentLoad::Load) {
                 auto read    = use;
-                read.version = 0;
+                read.version = version - 1;
                 read.access  = vrento::vulkan::GraphAccess::Read;
-                pass.uses.push(rstd::move(read));
+                execution.uses.push(rstd::move(read));
             }
-            pass.uses.push(rstd::move(use));
+            execution.uses.push(rstd::move(use));
         };
-        attachment(color_id,
+        attachment(pass,
+                   color_id,
                    vrento::vulkan::PassUsage::ColorAttachment,
                    vrento::vulkan::PassStages::Color,
                    destination.color_load,
                    1);
-        attachment(depth_id,
+        attachment(pass,
+                   depth_id,
                    vrento::vulkan::PassUsage::DepthAttachment,
                    vrento::vulkan::PassStages::Depth,
                    destination.depth_load,
@@ -1462,9 +1604,33 @@ private:
             Some(vrento::vulkan::GraphAttachment { depth_id, 1, destination.depth_load });
         graphics.depth->clear[usize()] = reversed_depth ? 0 : 1;
         pass.graphics                  = Some(graphics);
-        auto sampled_use               = [&](const vrento::texture::TextureViewRef& view) {
+        if (coverage_pass) {
+            auto coverage_id                   = bind(*resources->coverage);
+            shape.resources[usize(2)].imported = false;
+            attachment(*coverage_pass,
+                       coverage_id,
+                       vk::PassUsage::ColorAttachment,
+                       vk::PassStages::Color,
+                       vk::AttachmentLoad::Clear,
+                       1);
+            attachment(*coverage_pass,
+                       depth_id,
+                       vk::PassUsage::DepthAttachment,
+                       vk::PassStages::Depth,
+                       vk::AttachmentLoad::Load,
+                       2,
+                       2);
+            vk::GraphicsDescription coverage_graphics;
+            coverage_graphics.color =
+                Some(vk::GraphAttachment { coverage_id, 1, vk::AttachmentLoad::Clear });
+            coverage_graphics.depth =
+                Some(vk::GraphAttachment { depth_id, 2, vk::AttachmentLoad::Load });
+            coverage_pass->graphics = Some(coverage_graphics);
+        }
+        auto sampled_use = [&](vk::PassExecutionInfo&                 execution,
+                               const vrento::texture::TextureViewRef& view) {
             auto id = bind(view);
-            for (const auto& use : pass.uses)
+            for (const auto& use : execution.uses)
                 if (use.resource == id) return;
             vrento::vulkan::PassResourceUse use { id,
                                                   0,
@@ -1474,57 +1640,85 @@ private:
             const auto                      range = view.description().range;
             use.range.mip_count                   = range.mip_count;
             use.range.layer_count                 = range.layer_count;
-            pass.uses.push(rstd::move(use));
+            execution.uses.push(rstd::move(use));
         };
-        for (const auto& source : prepared.data_->images) sampled_use(source.source->image.view);
-        for (const auto& source : (*environment_)->textures) sampled_use(source->view);
-        Vec<rstd::uint64_t> allocations;
+        for (const auto& source : prepared.data_->images) {
+            sampled_use(pass, source.source->image.view);
+            if (coverage_pass) sampled_use(*coverage_pass, source.source->image.view);
+        }
+        for (const auto& source : (*environment_)->textures) {
+            sampled_use(pass, source->view);
+            if (coverage_pass) sampled_use(*coverage_pass, source->view);
+        }
+        struct BufferResource {
+            rstd::uint64_t identity;
+            vk::ResourceId id;
+        };
+        Vec<BufferResource> allocations;
         auto                next_binding = references.len().to_primitive() + 1;
-        auto                buffer_use   = [&](const vk::BufferAllocation& allocation,
+        auto                buffer_use   = [&](vk::PassExecutionInfo&      execution,
+                                               const vk::BufferAllocation& allocation,
                                                vrento::vulkan::PassUsage   usage,
                                                vrento::vulkan::PassStages  stages) {
-            for (auto identity : allocations)
-                if (identity == allocation.identity()) return;
-            allocations.push(rstd::uint64_t(allocation.identity()));
-            vrento::vulkan::ResourceId id { next_binding++, 1 };
-            bindings
-                .bind(id,
-                      Arc<dyn<vk::GraphBinding>>::make(
-                          vk::GraphUploadedBufferBinding(core_->session, allocation.clone())))
-                .unwrap();
+            vk::ResourceId id {};
+            for (const auto& resource : allocations)
+                if (resource.identity == allocation.identity()) id = resource.id;
+            if (! id.value) {
+                id = { next_binding++, 1 };
+                allocations.push({ allocation.identity(), id });
+                bindings
+                    .bind(id,
+                          Arc<dyn<vk::GraphBinding>>::make(
+                              vk::GraphUploadedBufferBinding(core_->session, allocation.clone())))
+                    .unwrap();
+                shape.resources.push({ id, vrento::fg::ResourceKind::Buffer, allocation.size() });
+            }
+            for (const auto& use : execution.uses)
+                if (use.resource == id) return;
             vrento::vulkan::PassResourceUse use {
                 id, 0, vrento::vulkan::GraphAccess::Read, usage, stages
             };
             use.range.size = allocation.size();
-            shape.resources.push({ id, vrento::fg::ResourceKind::Buffer, allocation.size() });
-            pass.uses.push(rstd::move(use));
+            execution.uses.push(rstd::move(use));
         };
-        buffer_use(*resources->frame_buffer,
+        buffer_use(pass,
+                   *resources->frame_buffer,
                    vrento::vulkan::PassUsage::Uniform,
                    vrento::vulkan::PassStages::Vertex | vrento::vulkan::PassStages::Fragment);
-        buffer_use(*core_->zero_buffer,
-                   vrento::vulkan::PassUsage::Storage,
-                   vrento::vulkan::PassStages::Vertex);
-        buffer_use(*resources->poses,
-                   vrento::vulkan::PassUsage::Storage,
-                   vrento::vulkan::PassStages::Vertex);
+        if (coverage_pass)
+            buffer_use(*coverage_pass,
+                       *resources->coverage_frame_buffer,
+                       vk::PassUsage::Uniform,
+                       vk::PassStages::Vertex | vk::PassStages::Fragment);
+        auto shared_buffer_use = [&](const vk::BufferAllocation& allocation,
+                                     vk::PassUsage               usage,
+                                     vk::PassStages              stages) {
+            buffer_use(pass, allocation, usage, stages);
+            if (coverage_pass) buffer_use(*coverage_pass, allocation, usage, stages);
+        };
+        shared_buffer_use(*core_->zero_buffer,
+                          vrento::vulkan::PassUsage::Storage,
+                          vrento::vulkan::PassStages::Vertex);
+        shared_buffer_use(*resources->poses,
+                          vrento::vulkan::PassUsage::Storage,
+                          vrento::vulkan::PassStages::Vertex);
         for (const auto& material : prepared.data_->materials)
-            buffer_use(material.parameters,
-                       vrento::vulkan::PassUsage::Uniform,
-                       vrento::vulkan::PassStages::Fragment);
+            shared_buffer_use(material.parameters,
+                              vrento::vulkan::PassUsage::Uniform,
+                              vrento::vulkan::PassStages::Fragment);
         for (const auto& mesh : prepared.data_->meshes)
             for (const auto& primitive : mesh.primitives) {
-                buffer_use(primitive.vertices,
-                           vrento::vulkan::PassUsage::Vertex,
-                           vrento::vulkan::PassStages::Vertex);
+                shared_buffer_use(primitive.vertices,
+                                  vrento::vulkan::PassUsage::Vertex,
+                                  vrento::vulkan::PassStages::Vertex);
                 if (primitive.indices)
-                    buffer_use(*primitive.indices,
-                               vrento::vulkan::PassUsage::Index,
-                               vrento::vulkan::PassStages::Vertex);
+                    shared_buffer_use(*primitive.indices,
+                                      vrento::vulkan::PassUsage::Index,
+                                      vrento::vulkan::PassStages::Vertex);
                 if (primitive.morphs)
-                    buffer_use(*primitive.morphs,
-                               vrento::vulkan::PassUsage::Storage,
-                               vrento::vulkan::PassStages::Vertex);
+                    shared_buffer_use(*primitive.morphs,
+                                      vrento::vulkan::PassUsage::Storage,
+                                      vrento::vulkan::PassStages::Vertex);
             }
         core_->scopes.collect();
         if (! compiler_) {
@@ -1548,43 +1742,50 @@ private:
                                                   : builder.create_resource(rstd::move(desc));
                 if (declared.is_err()) return Err(graph_error(declared.unwrap_err()));
             }
-            auto added = builder.add_pass(pass.id);
-            if (added.is_err()) return Err(graph_error(added.unwrap_err()));
-            ModelPassDesc desc;
-            desc.io.kind                        = model_kind;
-            desc.io.graphics                    = pass.graphics;
-            desc.signature.color_format         = vk::ToVkType(target_desc.format);
-            desc.signature.has_depth_attachment = true;
-            desc.signature.depth_format = vk::ToVkType(depth.texture().description().format);
-            for (const auto& use : pass.uses) {
-                if (use.access != vk::GraphAccess::Write) continue;
-                bool inherits = use.resource == color_id
-                                    ? destination.color_load == vk::AttachmentLoad::Load
-                                    : destination.depth_load == vk::AttachmentLoad::Load;
-                auto output =
-                    builder.reserve_write(pass.id, { use.resource, 0 }, inherits, inherits);
-                if (output.is_err()) return Err(graph_error(output.unwrap_err()));
-                if (inherits)
-                    desc.io.storage.push(
-                        { vrento::pass::ContentRef::bind(builder, { use.resource, 1 }).unwrap(),
-                          vrento::pass::ContentRef::bind(builder, { use.resource, 0 }).unwrap() });
+            Vec<vk::PassInput> descriptions;
+            for (const auto& execution : shape.passes) {
+                auto added = builder.add_pass(execution.id);
+                if (added.is_err()) return Err(graph_error(added.unwrap_err()));
+                ModelPassDesc desc;
+                desc.io.kind                        = model_kind;
+                desc.io.graphics                    = execution.graphics;
+                desc.signature.color_format         = vk::ToVkType(target_desc.format);
+                desc.signature.has_depth_attachment = true;
+                desc.signature.depth_format = vk::ToVkType(depth.texture().description().format);
+                for (const auto& use : execution.uses) {
+                    if (use.access != vk::GraphAccess::Write) continue;
+                    bool inherits {};
+                    for (const auto& read : execution.uses)
+                        if (read.resource == use.resource && read.access == vk::GraphAccess::Read &&
+                            read.version + 1 == use.version)
+                            inherits = true;
+                    auto previous = vrento::fg::ResourceVersion { use.resource, use.version - 1 };
+                    auto output = builder.reserve_write(execution.id, previous, inherits, inherits);
+                    if (output.is_err()) return Err(graph_error(output.unwrap_err()));
+                    if (inherits)
+                        desc.io.storage.push(
+                            { vrento::pass::ContentRef::bind(builder, { use.resource, use.version })
+                                  .unwrap(),
+                              vrento::pass::ContentRef::bind(builder, previous).unwrap() });
+                }
+                for (const auto& use : execution.uses) {
+                    auto content =
+                        vrento::pass::ContentRef::bind(builder, { use.resource, use.version });
+                    if (content.is_err()) return Err(graph_error(content.unwrap_err()));
+                    vk::VulkanResourceUse value {
+                        content.unwrap(), use.usage, use.stages, use.range
+                    };
+                    if (use.access == vk::GraphAccess::Read)
+                        desc.io.inputs.push(rstd::move(value));
+                    else
+                        desc.io.outputs.push(rstd::move(value));
+                }
+                auto published = vk::declare_input(builder, execution.id, rstd::move(desc));
+                if (published.is_err()) return Err(graph_error(published.unwrap_err()));
+                descriptions.push(published.unwrap());
             }
-            for (const auto& use : pass.uses) {
-                auto content =
-                    vrento::pass::ContentRef::bind(builder, { use.resource, use.version });
-                if (content.is_err()) return Err(graph_error(content.unwrap_err()));
-                vk::VulkanResourceUse value { content.unwrap(), use.usage, use.stages, use.range };
-                if (use.access == vk::GraphAccess::Read)
-                    desc.io.inputs.push(rstd::move(value));
-                else
-                    desc.io.outputs.push(rstd::move(value));
-            }
-            auto published = vk::declare_input(builder, pass.id, rstd::move(desc));
-            if (published.is_err()) return Err(graph_error(published.unwrap_err()));
             auto graph = rstd::move(builder).finish();
             if (graph.is_err()) return Err(graph_error(graph.unwrap_err()));
-            Vec<vk::PassInput> descriptions;
-            descriptions.push(published.unwrap());
             auto compiled = compiler_->compile(graph.unwrap(), rstd::move(descriptions));
             if (compiled.is_err()) return Err(graph_error(compiled.unwrap_err()));
             graph_shape_ = Some(rstd::move(shape));
@@ -1596,10 +1797,20 @@ private:
                 return Err(render_error("model pass"_str, "prewarmed pipeline unavailable"_str));
         }
         auto compiled      = compiler_->compiled().unwrap();
+        auto shared_draws  = inputs.draws.clone();
         auto frame_binding = compiled.frame<ModelPass>({ 1 }, 1, rstd::move(inputs));
         if (frame_binding.is_err()) return Err(graph_error(frame_binding.unwrap_err()));
         Vec<vk::PassFrameBinding> frames;
         frames.push(frame_binding.unwrap());
+        if (resources->coverage) {
+            auto coverage_binding = compiled.frame<ModelPass>(
+                { 2 },
+                1,
+                ModelFrameData {
+                    resources.clone(), rstd::move(shared_draws), false, reversed_depth, true });
+            if (coverage_binding.is_err()) return Err(graph_error(coverage_binding.unwrap_err()));
+            frames.push(coverage_binding.unwrap());
+        }
         auto prepared_frame = compiled.instantiate(
             bindings,
             frames.as_slice(),
@@ -1615,6 +1826,13 @@ private:
         auto sampled = work.commands()->UseTexture(
             { target, vrento::texture::Access::Sampled, vrento::texture::Stages::Fragment });
         if (sampled.is_err()) return Err(texture_error(sampled.unwrap_err()));
+        if (resources->coverage) {
+            auto coverage_sampled =
+                work.commands()->UseTexture({ *resources->coverage,
+                                              vrento::texture::Access::Sampled,
+                                              vrento::texture::Stages::Fragment });
+            if (coverage_sampled.is_err()) return Err(texture_error(coverage_sampled.unwrap_err()));
+        }
         recording.accepted = true;
         ++statistics_.recorded_frames;
         return Ok(empty {});

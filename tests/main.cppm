@@ -12,6 +12,8 @@ import :scene;
 import :render;
 import :lighting;
 import :display;
+import :coverage;
+import :postprocess;
 import :mipmaps;
 import :controls;
 import :camera;

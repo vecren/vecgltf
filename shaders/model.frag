@@ -84,6 +84,7 @@ void main() {
 #endif
     }
     float alpha=material.flags.x==2 ? base.a:1;
+    if(frame.options.z==2) {result=vec4(0,0,0,alpha);return;}
     int debug_view=int(frame.options.y);
     if(debug_view==1) {result=vec4(base.rgb,alpha);return;}
     int shading=int(material.flags.w);

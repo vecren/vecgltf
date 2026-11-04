@@ -190,6 +190,7 @@ int main(int argc, char** argv) {
     auto output_device = dyn<vrento::texture::TextureDevice>::from_ref(output_queue);
     Option<vrento::texture::TexturePool> output_pool;
     Option<vrento::texture::TexturePool> radiance_pool;
+    Option<vrento::texture::TexturePool> coverage_pool;
     VkExtent2D                           output_extent {};
     rstd::uint64_t                       output_version {};
     if (! options.environment.is_empty()) {
@@ -541,6 +542,19 @@ int main(int argc, char** argv) {
                              options.render,
                              status.as_str(),
                              cameras.status());
+        gltf::DisplayOptions display_options;
+        if (display) {
+            display_options              = settings->display;
+            display_options.exposure     = options.render.exposure;
+            display_options.tone_mapping = options.render.tone_mapping;
+            if (options.render.debug != gltf::DebugView::None) {
+                display_options              = gltf::DisplayOptions {};
+                display_options.tone_mapping = gltf::ToneMapping::Linear;
+            }
+        }
+        bool needs_coverage =
+            display && ((display_options.bloom && display_options.bloom->intensity > 0) ||
+                        display_options.sharpen > 0);
         if (! output_pool || output_extent.width != model_extent.width ||
             output_extent.height != model_extent.height) {
             vrento::texture::TextureDesc description;
@@ -554,7 +568,8 @@ int main(int argc, char** argv) {
                 rstd::io::eprintln("output allocation kind={}", unsigned(next.unwrap_err().kind));
                 return 1;
             }
-            output_pool = Some(next.unwrap());
+            output_pool   = Some(next.unwrap());
+            coverage_pool = None();
             if (display) {
                 description.format = vrento::TextureFormat::RGBA16F;
                 auto hdr =
@@ -568,19 +583,42 @@ int main(int argc, char** argv) {
             }
             output_extent = model_extent;
         }
+        if (needs_coverage && ! coverage_pool) {
+            vrento::texture::TextureDesc description;
+            description.extent = { model_extent.width, model_extent.height };
+            description.format = vrento::TextureFormat::RGBA16F;
+            description.usage =
+                vrento::texture::Usage::Sampled | vrento::texture::Usage::ColorAttachment;
+            auto coverage =
+                vrento::texture::TexturePool::create(output_device.as_mut_ref(), description);
+            if (coverage.is_err()) {
+                rstd::io::eprintln("coverage allocation kind={}",
+                                   unsigned(coverage.unwrap_err().kind));
+                return 1;
+            }
+            coverage_pool = Some(coverage.unwrap());
+        }
         auto                                        write = output_pool->acquire().unwrap();
         Option<vrento::texture::TexturePool::Write> radiance_write;
+        Option<vrento::texture::TexturePool::Write> coverage_write;
         Option<gltf::SceneOptions>                  scene_options;
+        Option<gltf::RenderTarget>                  scene_target;
         if (display) {
             auto resolved = viewer::ResolveSceneOptions(*settings, instance, options.render);
             if (resolved.is_err()) {
                 report(resolved.unwrap_err());
                 return 1;
             }
-            scene_options      = Some(resolved.unwrap());
-            radiance_write     = Some(radiance_pool->acquire().unwrap());
-            auto scene_ready   = renderer.prepare_scene_target(radiance_write->view());
-            auto display_ready = display->prepare_target(gltf::DisplayTarget { write.view() });
+            scene_options  = Some(resolved.unwrap());
+            radiance_write = Some(radiance_pool->acquire().unwrap());
+            scene_target   = Some(gltf::RenderTarget { radiance_write->view() });
+            if (needs_coverage) {
+                coverage_write         = Some(coverage_pool->acquire().unwrap());
+                scene_target->coverage = Some(coverage_write->view());
+            }
+            auto scene_ready = renderer.prepare_scene_target(*scene_target);
+            auto display_ready =
+                display->prepare_target(gltf::DisplayTarget { write.view() }, display_options);
             if (scene_ready.is_err()) {
                 report(scene_ready.unwrap_err());
                 return 1;
@@ -597,25 +635,21 @@ int main(int argc, char** argv) {
         }
         auto work = output_queue.Begin().unwrap();
         auto frame =
-            display ? renderer.record_scene(
-                          work, radiance_write->view(), prepared, instance, view, *scene_options)
-                    : renderer.record(work, write.view(), prepared, instance, view, options.render);
+            display
+                ? renderer.record_scene(
+                      work, scene_target.take().unwrap(), prepared, instance, view, *scene_options)
+                : renderer.record(work, write.view(), prepared, instance, view, options.render);
         if (frame.is_err()) {
             report(frame.unwrap_err());
             return 1;
         }
         if (display) {
-            auto display_options         = settings->display;
-            display_options.exposure     = options.render.exposure;
-            display_options.tone_mapping = options.render.tone_mapping;
-            if (options.render.debug != gltf::DebugView::None) {
-                display_options              = gltf::DisplayOptions {};
-                display_options.tone_mapping = gltf::ToneMapping::Linear;
-            }
-            auto displayed = display->record(work,
-                                             radiance_write->view(),
-                                             gltf::DisplayTarget { write.view() },
-                                             display_options);
+            auto displayed = display->record(
+                work,
+                gltf::DisplayInput { radiance_write->view(),
+                                     coverage_write ? Some(coverage_write->view()) : None() },
+                gltf::DisplayTarget { write.view() },
+                display_options);
             if (displayed.is_err()) {
                 report(displayed.unwrap_err());
                 return 1;
@@ -629,6 +663,8 @@ int main(int argc, char** argv) {
         auto submission = submitted.unwrap();
         if (radiance_write)
             radiance_pool->publish(radiance_write.take().unwrap(), submission).unwrap();
+        if (coverage_write)
+            coverage_pool->publish(coverage_write.take().unwrap(), submission).unwrap();
         auto published = output_pool->publish(rstd::move(write), submission).unwrap();
         auto native    = vui::gpu::NativeTextureFrame::wrap(
             rstd::move(published),

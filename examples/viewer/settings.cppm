@@ -333,6 +333,30 @@ public:
                 fail("display.vignette"_str, "invalid vignette intensity or radii"_str);
             output.vignette = Some(vignette);
         }
+        if (auto value = field(input, "bloom"_str)) {
+            if (! object(*value, "display.bloom"_str)) return;
+            gltf::Bloom bloom;
+            nonnegative(*value, "intensity"_str, bloom.intensity, "display.bloom"_str);
+            nonnegative(*value, "threshold"_str, bloom.threshold, "display.bloom"_str);
+            nonnegative(*value, "radius"_str, bloom.radius, "display.bloom"_str);
+            if (bloom.radius > 1)
+                fail("display.bloom.radius"_str, "radius must be at most one"_str);
+            output.bloom = Some(bloom);
+        }
+        boolean(input, "fxaa"_str, output.fxaa, "display"_str);
+        nonnegative(input, "sharpen"_str, output.sharpen, "display"_str);
+        if (auto value = field(input, "grain"_str)) {
+            if (! object(*value, "display.grain"_str)) return;
+            gltf::Grain grain;
+            nonnegative(*value, "strength"_str, grain.strength, "display.grain"_str);
+            number(*value, "phase"_str, grain.phase, "display.grain"_str);
+            if (grain.strength > 1)
+                fail("display.grain.strength"_str, "strength must be at most one"_str);
+            output.grain = Some(grain);
+        }
+        nonnegative(input, "sampling_scale"_str, output.sampling_scale, "display"_str);
+        if (output.sampling_scale == 0)
+            fail("display.sampling_scale"_str, "sampling scale must be positive"_str);
     }
 };
 auto read_document(ref<str> source) -> Result<Vec<u8>, gltf::Error> {
