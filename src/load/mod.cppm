@@ -15,4 +15,5 @@ struct HdrImage {
     Vec<float> rgba;
 };
 auto LoadEnvironment(ref<str> path) -> Result<HdrImage, Error>;
+auto LoadEnvironment(ResourceBytes bytes, ref<str> source = {}) -> Result<HdrImage, Error>;
 } // namespace vecgltf

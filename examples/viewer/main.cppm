@@ -1,6 +1,6 @@
 export module vecgltf.viewer;
 import :options;
-import :settings;
+import vecgltf.presentation;
 import vecgltf;
 import vecgltf.render;
 import vecgltf.display;
@@ -51,20 +51,22 @@ int main(int argc, char** argv) {
     }
     auto selected = parsed.unwrap();
     if (selected.is_none()) return 0;
-    auto                         options = rstd::move(selected).unwrap();
-    Option<viewer::ViewSettings> settings;
+    auto                           options = rstd::move(selected).unwrap();
+    Option<gltf::PresentationSpec> specification;
     if (! options.settings_file.is_empty()) {
-        auto loaded_settings = viewer::LoadViewSettings(options.settings_file.as_str());
+        auto loaded_settings = gltf::LoadPresentation(options.settings_file.as_str());
         if (loaded_settings.is_err()) {
             report(loaded_settings.unwrap_err());
             return 1;
         }
-        settings          = Some(loaded_settings.unwrap());
-        const auto& scene = settings->scene;
+        specification     = Some(loaded_settings.unwrap());
+        const auto& scene = specification->scene;
         if (! options.render_overrides.exposure)
-            options.render.exposure = settings->display.exposure;
+            options.render.exposure = specification->display.exposure;
+        else
+            options.render.exposure *= specification->display.exposure;
         if (! options.render_overrides.tone_mapping)
-            options.render.tone_mapping = settings->display.tone_mapping;
+            options.render.tone_mapping = specification->display.tone_mapping;
         if (! options.render_overrides.background) options.render.background = scene.background;
         if (! options.render_overrides.ibl_intensity)
             options.render.ibl_intensity = scene.ibl_intensity;
@@ -74,7 +76,7 @@ int main(int argc, char** argv) {
         options.render.point_lights         = scene.point_lights;
         options.render.alpha_dither_seed    = scene.alpha_dither_seed;
         options.render.shadow_catcher       = scene.shadow_catcher;
-        options.prepare.material_overrides  = settings->material_overrides;
+        options.prepare.material_overrides  = specification->material_overrides;
         options.render.background_color =
             options.render_overrides.background ? None() : scene.background_color;
         if (options.render_overrides.direct_light) {
@@ -88,7 +90,19 @@ int main(int argc, char** argv) {
         report(loaded.unwrap_err());
         return 1;
     }
-    auto asset = loaded.unwrap();
+    auto                            asset = loaded.unwrap();
+    Option<gltf::BoundPresentation> settings;
+    if (specification) {
+        auto bound = gltf::BindPresentation(specification.take().unwrap(), asset.clone());
+        if (bound.is_err()) {
+            report(bound.unwrap_err());
+            return 1;
+        }
+        settings               = Some(bound.unwrap());
+        auto prepare           = settings->prepare_options();
+        prepare.max_anisotropy = options.prepare.max_anisotropy;
+        options.prepare        = rstd::move(prepare);
+    }
     for (const auto& diagnostic : asset->diagnostics)
         rstd::io::eprintln("{}: {}", diagnostic.location, diagnostic.message);
     gltf::SceneInstance instance(asset.clone());
@@ -101,6 +115,19 @@ int main(int argc, char** argv) {
     instance.set_playing(! options.fixed_time);
     viewer::CameraController cameras;
     cameras.fit(instance);
+    bool authored_camera = settings && settings->spec().camera && ! options.external_camera;
+    if (authored_camera) {
+        auto resolved = gltf::ResolvePresentation(*settings, instance);
+        if (resolved.is_err()) {
+            report(resolved.unwrap_err());
+            return 1;
+        }
+        if (! cameras.orbit().restore(*resolved->camera,
+                                      float(options.width) / float(options.height))) {
+            rstd::io::eprintln("presentation camera is invalid");
+            return 2;
+        }
+    }
     if (options.external_camera) {
         Option<gltf::AssetId> reference;
         if (options.camera_reference == CameraReference::SceneRoot) {
@@ -130,7 +157,7 @@ int main(int argc, char** argv) {
     cameras.orbit().roll(options.roll);
     if (options.camera_path.is_empty())
         options.camera_path = rstd::format("{}.camera.json", options.path);
-    if (! options.external_camera) {
+    if (! options.external_camera && ! authored_camera) {
         auto camera_file = rstd::path::PathBuf::from(options.camera_path.as_str());
         auto exists      = rstd::fs::exists(camera_file.as_path());
         if (exists.is_err()) {
@@ -212,12 +239,13 @@ int main(int argc, char** argv) {
             report(prepared_environment.unwrap_err());
             return 1;
         }
-    } else if (settings && settings->environment_images) {
-        auto prepared_environment =
-            renderer.set_environment(settings->environment_images.take().unwrap());
-        if (prepared_environment.is_err()) {
-            report(prepared_environment.unwrap_err());
-            return 1;
+    } else if (settings) {
+        if (auto environment = settings->take_environment()) {
+            auto prepared_environment = renderer.set_environment(rstd::move(environment).unwrap());
+            if (prepared_environment.is_err()) {
+                report(prepared_environment.unwrap_err());
+                return 1;
+            }
         }
     }
     auto preparing = renderer.prepare(asset.clone(), options.prepare);
@@ -552,7 +580,7 @@ int main(int argc, char** argv) {
                              cameras.status());
         gltf::DisplayOptions display_options;
         if (display) {
-            display_options              = settings->display;
+            display_options              = settings->spec().display;
             display_options.exposure     = options.render.exposure;
             display_options.tone_mapping = options.render.tone_mapping;
             if (options.render.debug != gltf::DebugView::None) {
@@ -612,12 +640,28 @@ int main(int argc, char** argv) {
         Option<gltf::SceneOptions>                  scene_options;
         Option<gltf::RenderTarget>                  scene_target;
         if (display) {
-            auto resolved = viewer::ResolveSceneOptions(*settings, instance, options.render);
+            gltf::SceneOptions current;
+            current.debug                = options.render.debug;
+            current.background           = options.render.background;
+            current.direct_light         = options.render.direct_light;
+            current.ibl_intensity        = options.render.ibl_intensity;
+            current.directional_lights   = options.render.directional_lights;
+            current.world_to_environment = options.render.world_to_environment;
+            current.background_intensity = options.render.background_intensity;
+            current.point_lights         = options.render.point_lights;
+            current.background_color     = options.render.background_color;
+            current.alpha_dither_seed    = options.render.alpha_dither_seed;
+            current.shadow_catcher       = options.render.shadow_catcher;
+            auto resolved = gltf::ResolvePresentation(*settings,
+                                                      instance,
+                                                      { .camera  = camera_frame,
+                                                        .scene   = Some(rstd::move(current)),
+                                                        .display = Some(display_options) });
             if (resolved.is_err()) {
                 report(resolved.unwrap_err());
                 return 1;
             }
-            scene_options  = Some(resolved.unwrap());
+            scene_options  = Some(resolved.unwrap().scene);
             radiance_write = Some(radiance_pool->acquire().unwrap());
             scene_target   = Some(gltf::RenderTarget { radiance_write->view() });
             if (needs_coverage) {

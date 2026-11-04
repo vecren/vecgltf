@@ -961,6 +961,36 @@ struct PrepareOptions {
     float             max_anisotropy { 1 };
     MaterialOverrides material_overrides;
 };
+auto ValidateSceneOptions(const SceneOptions& options,
+                          const View&         view,
+                          unsigned            max_extent = 4294967295u) -> Result<empty, Error> {
+    auto checked = lower_lighting(scene_render_options(options), view, max_extent);
+    if (checked.is_err()) return Err(checked.unwrap_err());
+    return Ok(empty {});
+}
+auto ValidatePrepareOptions(const Asset& asset, const PrepareOptions& options)
+    -> Result<empty, Error> {
+    if (! rstd::f32(options.max_anisotropy).is_finite() || options.max_anisotropy < 1)
+        return Err(render_error("prepare options"_str,
+                                "anisotropy must be finite and at least one"_str,
+                                ErrorKind::InvalidAsset));
+    Vec<unsigned> seen;
+    if (options.material_overrides)
+        for (const auto& override : options.material_overrides.values()) {
+            bool duplicate {};
+            for (auto index : seen) duplicate |= index == override.material;
+            if (override.material >= count(asset.materials) || duplicate ||
+                (override.alpha_mode != MaterialAlphaMode::Asset &&
+                 override.alpha_mode != MaterialAlphaMode::Dither) ||
+                (override.alpha_mode == MaterialAlphaMode::Dither &&
+                 at(asset.materials, override.material).alpha != AlphaMode::Blend))
+                return Err(render_error("prepare options"_str,
+                                        "invalid material alpha override"_str,
+                                        ErrorKind::InvalidAsset));
+            seen.push(unsigned(override.material));
+        }
+    return Ok(empty {});
+}
 class PreparedAsset {
     friend class Renderer;
     Arc<PreparedData> data_;
@@ -1104,26 +1134,12 @@ public:
         return upload_environment(rstd::move(source));
     }
     auto prepare(Arc<Asset> asset, PrepareOptions options = {}) -> Result<PreparedAsset, Error> {
-        if (! rstd::f32(options.max_anisotropy).is_finite() || options.max_anisotropy < 1)
-            return Err(render_error("prepare options"_str,
-                                    "anisotropy must be finite and at least one"_str,
-                                    ErrorKind::InvalidAsset));
+        auto valid = ValidatePrepareOptions(*asset, options);
+        if (valid.is_err()) return Err(valid.unwrap_err());
         Vec<bool> dither;
         dither.resize(asset->materials.len(), false);
         if (options.material_overrides) {
-            Vec<unsigned> seen;
             for (const auto& override : options.material_overrides.values()) {
-                bool duplicate {};
-                for (auto index : seen) duplicate |= index == override.material;
-                if (override.material >= count(asset->materials) || duplicate ||
-                    (override.alpha_mode != MaterialAlphaMode::Asset &&
-                     override.alpha_mode != MaterialAlphaMode::Dither) ||
-                    (override.alpha_mode == MaterialAlphaMode::Dither &&
-                     at(asset->materials, override.material).alpha != AlphaMode::Blend))
-                    return Err(render_error("prepare options"_str,
-                                            "invalid material alpha override"_str,
-                                            ErrorKind::InvalidAsset));
-                seen.push(unsigned(override.material));
                 at(dither, override.material) = override.alpha_mode == MaterialAlphaMode::Dither;
             }
         }

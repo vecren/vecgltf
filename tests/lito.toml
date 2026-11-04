@@ -42,6 +42,7 @@ sources = [
   "tests/mipmaps.cppm",
   "tests/controls.cppm",
   "tests/camera.cppm",
+  "tests/presentation.cppm",
   "tests/window.cppm",
   "examples/viewer/panel.cppm",
   "examples/viewer/model.cppm",

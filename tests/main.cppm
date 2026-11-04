@@ -22,6 +22,7 @@ import :postprocess;
 import :mipmaps;
 import :controls;
 import :camera;
+import :presentation;
 import :window;
 import rstd.test;
 

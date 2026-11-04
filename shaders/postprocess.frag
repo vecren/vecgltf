@@ -120,5 +120,5 @@ void main() {
         float grain=noise(coordinate+1000*fract(display.post.w));
         color=mix(color,color*(color+(1-color)*2*grain),display.post.z);
     }
-    result=vec4(linear(color)*alpha,alpha);
+    result=vec4((display.vignette.w>0 ? color : linear(color))*alpha,alpha);
 }

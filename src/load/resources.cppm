@@ -78,6 +78,7 @@ public:
         return (*owner_)->Read(request);
     }
 };
+auto FileResources() -> ResourceAccess;
 struct LoadOptions {
     usize                         max_vertices { 10000000 }, max_image_pixels { 67108864 };
     LoadTrace                     trace;
@@ -202,6 +203,9 @@ struct Impl<vecgltf::ResourceResolver, vecgltf::FileResourceResolver>
 
 namespace vecgltf
 {
+auto FileResources() -> ResourceAccess {
+    return ResourceAccess(Arc<dyn<ResourceResolver>>::make(FileResourceResolver {}));
+}
 auto make_context(ref<str> source, LoadOptions options, bool file_origin)
     -> Result<LoadContext, Error> {
     if (contains_nul(source))
@@ -245,8 +249,7 @@ auto make_context(ref<str> source, LoadOptions options, bool file_origin)
         context.base_directory =
             Some(parent ? rstd::path::PathBuf::from(*parent) : rstd::path::PathBuf::from("."_str));
         if (! context.options.resource_resolver.present())
-            context.options.resource_resolver =
-                ResourceAccess(Arc<dyn<ResourceResolver>>::make(FileResourceResolver {}));
+            context.options.resource_resolver = FileResources();
     }
     return Ok(rstd::move(context));
 }

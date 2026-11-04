@@ -1,50 +1,123 @@
-export module vecgltf.viewer:settings;
-import :options;
-import vecgltf.display;
-import vecgltf.environment;
+export module vecgltf.presentation;
+export import vecgltf.display;
+export import vecgltf.render;
+export import vecgltf.environment;
 import rstd.json;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 namespace gltf = vecgltf;
 
-export namespace viewer
+export namespace vecgltf
 {
-enum class SettingsSpace
+enum class PresentationSpace
 {
     World,
     View,
     SceneRoot,
     Node
 };
-struct SettingsReference {
-    SettingsSpace space { SettingsSpace::World };
-    unsigned      node { gltf::invalid_index };
+struct PresentationReference {
+    PresentationSpace space { PresentationSpace::World };
+    unsigned          node { gltf::invalid_index };
 };
-struct SettingsLight {
+struct PresentationLight {
     gltf::DirectionalLight light;
-    SettingsReference      reference;
+    PresentationReference  reference;
 };
-struct SettingsPointLight {
-    gltf::PointLight  light;
-    SettingsReference reference;
+struct PresentationPointLight {
+    gltf::PointLight      light;
+    PresentationReference reference;
+    bool                  reference_attenuation {};
 };
-struct ViewSettings {
+struct PresentationCamera {
+    CameraLookAt          look_at;
+    Vec3                  up { 0, 1, 0 };
+    CameraProjection      projection;
+    PresentationReference reference;
+    // Omitted clip lengths use fitted world near and infinite far, independent of reference scale.
+    bool reference_clip {}, explicit_near {}, explicit_far {};
+};
+struct PresentationEnvironment {
+    String                background, diffuse, brdf;
+    Vec<String>           specular;
+    float                 lod_scale { -1 }, lod_exponent { 1 };
+    vrento::TextureFilter brdf_filter { vrento::TextureFilter::LINEAR };
+};
+struct PresentationSpec {
     String                          source;
+    Option<rstd::path::PathBuf>     resource_base_directory;
     gltf::SceneOptions              scene;
     gltf::DisplayOptions            display;
-    Option<gltf::EnvironmentImages> environment_images;
-    Vec<SettingsLight>              lights;
-    Vec<SettingsPointLight>         point_lights;
+    Option<PresentationEnvironment> environment;
+    Vec<PresentationLight>          lights;
+    Vec<PresentationPointLight>     point_lights;
     gltf::MaterialOverrides         material_overrides;
-    SettingsReference               shadow_catcher_reference;
-    SettingsReference               environment_reference;
+    PresentationReference           shadow_catcher_reference;
+    PresentationReference           environment_reference;
     gltf::Mat4                      environment_to_reference { gltf::Mat4::Identity() };
     bool                            environment_transform {};
+    Option<PresentationCamera>      camera;
 };
-} // namespace viewer
+struct PresentationResources {
+    ResourceAccess              resolver;
+    rstd::path::PathBuf         base_directory;
+    Option<rstd::path::PathBuf> root;
+    // Cumulative encoded bytes; repeated paths are read and decoded once.
+    usize max_bytes { 64 * 1024 * 1024 };
+};
+struct PresentationOverrides {
+    float                  exposure_multiplier { 1 };
+    Option<CameraFrame>    camera;
+    Option<SceneOptions>   scene;
+    Option<DisplayOptions> display;
+};
+struct ResolvedPresentation {
+    Option<CameraFrame> camera;
+    SceneOptions        scene;
+    DisplayOptions      display;
+};
+class BoundPresentation {
+    Arc<Asset>                asset_;
+    u64                       generation_;
+    PresentationSpec          spec_;
+    Option<EnvironmentImages> environment_;
+    friend auto               BindPresentation(PresentationSpec, Arc<Asset>, PresentationResources)
+        -> Result<BoundPresentation, Error>;
+    friend auto ResolvePresentation(const BoundPresentation&,
+                                    const SceneInstance&,
+                                    const PresentationOverrides&)
+        -> Result<ResolvedPresentation, Error>;
+    BoundPresentation(PresentationSpec          spec,
+                      Arc<Asset>                asset,
+                      Option<EnvironmentImages> environment)
+        : asset_(rstd::move(asset)),
+          generation_(asset_->generation),
+          spec_(rstd::move(spec)),
+          environment_(rstd::move(environment)) {}
 
-namespace viewer::settings
+public:
+    BoundPresentation(BoundPresentation&&)                                       = default;
+    auto                    operator=(BoundPresentation&&) -> BoundPresentation& = default;
+    const PresentationSpec& spec() const { return spec_; }
+    auto                    asset() const -> Arc<Asset> { return asset_.clone(); }
+    auto                    generation() const -> u64 { return generation_; }
+    auto                    prepare_options() const -> PrepareOptions {
+        return { .material_overrides = spec_.material_overrides };
+    }
+    auto take_environment() -> Option<EnvironmentImages> { return environment_.take(); }
+};
+auto ParsePresentation(slice<u8> bytes, ref<str> source = {}) -> Result<PresentationSpec, Error>;
+auto LoadPresentation(ref<str> source) -> Result<PresentationSpec, Error>;
+auto BindPresentation(PresentationSpec spec, Arc<Asset> asset, PresentationResources resources = {})
+    -> Result<BoundPresentation, Error>;
+auto ResolvePresentation(const BoundPresentation&     bound,
+                         const SceneInstance&         instance,
+                         const PresentationOverrides& overrides = {})
+    -> Result<ResolvedPresentation, Error>;
+} // namespace vecgltf
+
+namespace vecgltf::presentation_detail
 {
 using Json = rstd::json::Value;
 
@@ -114,12 +187,7 @@ auto transpose(const gltf::Mat4& matrix) -> gltf::Mat4 {
             result.m[column * 4 + row] = matrix.m[row * 4 + column];
     return result;
 }
-struct EnvironmentFiles {
-    String                background, diffuse, brdf;
-    Vec<String>           specular;
-    float                 lod_scale { -1 }, lod_exponent { 1 };
-    vrento::TextureFilter brdf_filter { vrento::TextureFilter::LINEAR };
-};
+using EnvironmentFiles = PresentationEnvironment;
 class Reader {
     ref<str>            source_;
     Option<gltf::Error> error_;
@@ -209,7 +277,7 @@ public:
         fail(path, "expected an integer from zero to 4294967295"_str);
         return 0;
     }
-    void materials(const Json& input, ViewSettings& settings) {
+    void materials(const Json& input, PresentationSpec& settings) {
         auto values = input.as_array();
         if (! values) {
             fail("material_overrides"_str, "expected an array"_str);
@@ -240,7 +308,7 @@ public:
         }
         settings.material_overrides = gltf::MaterialOverrides(rstd::move(overrides));
     }
-    void shadow_catcher(const Json& input, ViewSettings& settings) {
+    void shadow_catcher(const Json& input, PresentationSpec& settings) {
         if (! object(input, "shadow_catcher"_str)) return;
         gltf::ShadowCatcher result;
         gltf::Vec3          position {};
@@ -251,7 +319,7 @@ public:
         if (scale <= 0) fail("shadow_catcher.scale"_str, "scale must be positive"_str);
         if (auto value = field(input, "reference"_str))
             settings.shadow_catcher_reference = reference(*value, "shadow_catcher.reference"_str);
-        if (settings.shadow_catcher_reference.space == SettingsSpace::View)
+        if (settings.shadow_catcher_reference.space == PresentationSpace::View)
             fail("shadow_catcher.reference"_str,
                  "view-space shadow catcher references are unsupported"_str,
                  gltf::ErrorKind::Unsupported);
@@ -262,19 +330,58 @@ public:
         result.transform = gltf::compose(position, { 0, 0, 0, 1 }, { scale, scale, scale });
         settings.scene.shadow_catcher = Some(result);
     }
-    auto reference(const Json& value, ref<str> location) -> SettingsReference {
+    auto reference(const Json& value, ref<str> location) -> PresentationReference {
         if (auto input = value.as_str()) {
             if (*input == "world"_str) return {};
-            if (*input == "view"_str) return { SettingsSpace::View };
-            if (*input == "scene-root"_str) return { SettingsSpace::SceneRoot };
+            if (*input == "view"_str) return { PresentationSpace::View };
+            if (*input == "scene-root"_str) return { PresentationSpace::SceneRoot };
         } else if (auto input = value.as_f64()) {
             auto number = input->to_primitive();
             if (input->is_finite() && number >= 0 && number < gltf::invalid_index &&
                 number == input->floor().to_primitive())
-                return { SettingsSpace::Node, unsigned(number) };
+                return { PresentationSpace::Node, unsigned(number) };
         }
         fail(location, "expected world, view, scene-root or a node index"_str);
         return {};
+    }
+    void camera(const Json& input, PresentationSpec& settings) {
+        if (! object(input, "camera"_str)) return;
+        PresentationCamera result;
+        auto               required_vector = [&](ref<str> key, Vec3& output) {
+            auto path = rstd::format("camera.{}", key);
+            if (auto value = field(input, key))
+                output = vector3(*value, path.as_str());
+            else
+                fail(path.as_str(), "required camera vector is missing"_str);
+        };
+        required_vector("position"_str, result.look_at.position);
+        required_vector("target"_str, result.look_at.target);
+        if (auto up = field(input, "up"_str)) result.up = vector3(*up, "camera.up"_str);
+        number(input, "yfov"_str, result.projection.yfov, "camera"_str);
+        if (auto value = field(input, "reference"_str))
+            result.reference = reference(*value, "camera.reference"_str);
+        if (result.reference.space == PresentationSpace::View)
+            fail("camera.reference"_str, "camera cannot reference view space"_str);
+        if (auto value = field(input, "clip_units"_str)) {
+            auto units            = text(*value, "camera.clip_units"_str);
+            result.reference_clip = units == "reference"_str;
+            if (! result.reference_clip && units != "world"_str)
+                fail("camera.clip_units"_str, "clip units must be world or reference"_str);
+        }
+        result.explicit_near = field(input, "near"_str) != nullptr;
+        result.explicit_far  = field(input, "far"_str) != nullptr;
+        number(input, "near"_str, result.projection.near, "camera"_str);
+        number(input, "far"_str, result.projection.far, "camera"_str);
+        auto checked = result.projection;
+        checked.near = 0.01f;
+        checked.far  = 0;
+        if (! camera_frame(result.look_at, checked, result.up) ||
+            (result.explicit_near && result.projection.near <= 0) ||
+            (result.explicit_far && result.projection.far < 0) ||
+            (result.explicit_near && result.explicit_far && result.projection.far != 0 &&
+             result.projection.far <= result.projection.near))
+            fail("camera"_str, "camera vectors or perspective projection are invalid"_str);
+        settings.camera = Some(result);
     }
     auto shadow(const Json& input, ref<str> path) -> gltf::DirectionalShadow {
         gltf::DirectionalShadow result;
@@ -307,7 +414,7 @@ public:
             fail(rstd::format("{}.max_bias", path).as_str(), "max bias must be at least bias"_str);
         return result;
     }
-    void lights(const Json& input, ViewSettings& settings) {
+    void lights(const Json& input, PresentationSpec& settings) {
         auto values = input.as_array();
         if (! values || values.unwrap().get().len() > usize(gltf::max_directional_lights)) {
             fail("directional_lights"_str, "expected at most eight directional lights"_str);
@@ -317,7 +424,7 @@ public:
         for (const auto& value : values.unwrap().get()) {
             auto path = rstd::format("directional_lights[{}]", settings.lights.len());
             if (! object(value, path.as_str())) return;
-            SettingsLight entry;
+            PresentationLight entry;
             entry.light.intensity = 1;
             if (auto direction = field(value, "direction"_str))
                 entry.light.direction =
@@ -335,7 +442,7 @@ public:
                 entry.reference = reference(*input, rstd::format("{}.reference", path).as_str());
             if (auto input = field(value, "shadow"_str))
                 entry.light.shadow = Some(shadow(*input, rstd::format("{}.shadow", path).as_str()));
-            entry.light.space = entry.reference.space == SettingsSpace::View
+            entry.light.space = entry.reference.space == PresentationSpace::View
                                     ? gltf::LightSpace::View
                                     : gltf::LightSpace::World;
             initial.push(gltf::DirectionalLight(entry.light));
@@ -344,7 +451,7 @@ public:
         settings.scene.direct_light       = None();
         settings.scene.directional_lights = gltf::DirectionalLights(rstd::move(initial));
     }
-    void point_lights(const Json& input, ViewSettings& settings) {
+    void point_lights(const Json& input, PresentationSpec& settings) {
         auto values = input.as_array();
         if (! values || values.unwrap().get().len() > usize(gltf::max_point_lights)) {
             fail("point_lights"_str, "expected at most eight point lights"_str);
@@ -354,7 +461,7 @@ public:
         for (const auto& value : values.unwrap().get()) {
             auto path = rstd::format("point_lights[{}]", settings.point_lights.len());
             if (! object(value, path.as_str())) return;
-            SettingsPointLight entry;
+            PresentationPointLight entry;
             entry.light.intensity = 1;
             if (auto position = field(value, "position"_str))
                 entry.light.position =
@@ -378,7 +485,14 @@ public:
             if (auto reference_value = field(value, "reference"_str))
                 entry.reference =
                     reference(*reference_value, rstd::format("{}.reference", path).as_str());
-            entry.light.space = entry.reference.space == SettingsSpace::View
+            if (auto units_value = field(value, "attenuation_units"_str)) {
+                auto units =
+                    text(*units_value, rstd::format("{}.attenuation_units", path).as_str());
+                entry.reference_attenuation = units == "reference"_str;
+                if (! entry.reference_attenuation && units != "world"_str)
+                    fail(path.as_str(), "attenuation units must be world or reference"_str);
+            }
+            entry.light.space = entry.reference.space == PresentationSpace::View
                                     ? gltf::LightSpace::View
                                     : gltf::LightSpace::World;
             initial.push(gltf::PointLight(entry.light));
@@ -386,15 +500,11 @@ public:
         }
         settings.scene.point_lights = gltf::PointLights(rstd::move(initial));
     }
-    auto environment(const Json& input, ViewSettings& settings) -> Option<EnvironmentFiles> {
+    auto environment(const Json& input, PresentationSpec& settings) -> Option<EnvironmentFiles> {
         if (! object(input, "environment"_str)) return None();
         settings.environment_transform = true;
         if (auto value = field(input, "reference"_str))
             settings.environment_reference = reference(*value, "environment.reference"_str);
-        if (settings.environment_reference.space == SettingsSpace::View)
-            fail("environment.reference"_str,
-                 "view-space environment references are unsupported"_str,
-                 gltf::ErrorKind::Unsupported);
         if (auto basis = field(input, "basis"_str)) {
             if (auto values = array(*basis, 16, "environment.basis"_str))
                 for (unsigned i = 0; i < 16; ++i)
@@ -449,7 +559,7 @@ public:
         }
         return Some(rstd::move(result));
     }
-    void display(const Json& input, ViewSettings& settings) {
+    void display(const Json& input, PresentationSpec& settings) {
         if (! object(input, "display"_str)) return;
         auto& output = settings.display;
         nonnegative(input, "exposure"_str, output.exposure, "display"_str);
@@ -539,9 +649,9 @@ auto read_document(ref<str> source) -> Result<Vec<u8>, gltf::Error> {
         return Err(error(
             source, "settings"_str, "settings must be a regular file"_str, gltf::ErrorKind::Io));
     auto size = info->len().to_primitive();
-    if (size > 1024 * 1024)
-        return Err(
-            error(source, "settings"_str, "settings exceeds one MiB"_str, gltf::ErrorKind::Limit));
+    if (size > 64 * 1024)
+        return Err(error(
+            source, "settings"_str, "presentation exceeds 64 KiB"_str, gltf::ErrorKind::Limit));
     Vec<u8> bytes;
     bytes.resize(usize(size), u8());
     if (file.read_exact_at(bytes.as_mut_slice().as_mut_ref(), u64()).is_err())
@@ -549,21 +659,21 @@ auto read_document(ref<str> source) -> Result<Vec<u8>, gltf::Error> {
             error(source, "settings"_str, "cannot read settings file"_str, gltf::ErrorKind::Io));
     return Ok(rstd::move(bytes));
 }
-auto reference_transform(SettingsReference          reference,
+auto reference_transform(PresentationReference      reference,
                          const gltf::SceneInstance& instance,
                          ref<str>                   source,
                          ref<str>                   location) -> Result<gltf::Mat4, gltf::Error> {
-    if (reference.space == SettingsSpace::World) return Ok(gltf::Mat4::Identity());
+    if (reference.space == PresentationSpace::World) return Ok(gltf::Mat4::Identity());
     auto index = reference.node;
-    if (reference.space == SettingsSpace::SceneRoot) {
+    if (reference.space == PresentationSpace::SceneRoot) {
         auto root = instance.scene_root();
         if (! root)
             return Err(
                 error(source, location, "reference needs exactly one visible scene root"_str));
         index = root->index;
     }
-    if (reference.space == SettingsSpace::View || index >= gltf::count(instance.asset().nodes) ||
-        ! instance.visible(index))
+    if (reference.space == PresentationSpace::View ||
+        index >= gltf::count(instance.asset().nodes) || ! instance.visible(index))
         return Err(error(source, location, "reference node is not valid in this scene"_str));
     const auto& matrix = instance.pose(index).world;
     for (auto value : matrix.m)
@@ -574,7 +684,7 @@ auto reference_transform(SettingsReference          reference,
         return Err(error(source, location, "reference must have a finite affine transform"_str));
     return Ok(matrix);
 }
-auto reference_rotation(SettingsReference          reference,
+auto reference_rotation(PresentationReference      reference,
                         const gltf::SceneInstance& instance,
                         ref<str>                   source,
                         ref<str>                   location) -> Result<gltf::Mat4, gltf::Error> {
@@ -582,29 +692,83 @@ auto reference_rotation(SettingsReference          reference,
     if (matrix.is_err()) return Err(matrix.unwrap_err());
     return rotation(matrix.unwrap(), source, location, true);
 }
-} // namespace viewer::settings
+auto uniform_scale(const Mat4& matrix, ref<str> source, ref<str> location) -> Result<float, Error> {
+    auto checked = rotation(matrix, source, location, true);
+    if (checked.is_err()) return Err(checked.unwrap_err());
+    double squared[3] {};
+    for (unsigned col = 0; col < 3; ++col)
+        for (unsigned row = 0; row < 3; ++row)
+            squared[col] += double(matrix.m[col * 4 + row]) * matrix.m[col * 4 + row];
+    for (unsigned col = 1; col < 3; ++col)
+        if (squared[col] < squared[0] * 0.9999 || squared[col] > squared[0] * 1.0001)
+            return Err(error(source,
+                             location,
+                             "reference requires a positive uniform scale"_str,
+                             ErrorKind::Unsupported));
+    auto scale = float(rstd::f64(squared[0]).sqrt().to_primitive());
+    if (! rstd::f32(scale).is_finite() || scale <= 0)
+        return Err(error(source, location, "reference scale must be finite and positive"_str));
+    return Ok(scale);
+}
+auto resolve_camera(const PresentationSpec& spec, const SceneInstance& instance)
+    -> Result<CameraFrame, Error> {
+    OrbitCamera fit;
+    fit.fit(instance.bounds());
+    if (! spec.camera) {
+        auto frame = fit.frame();
+        if (! frame.valid())
+            return Err(error(spec.source.as_str(), "camera"_str, "fitted camera is invalid"_str));
+        return Ok(frame);
+    }
+    const auto& input  = *spec.camera;
+    auto        matrix = reference_transform(
+        input.reference, instance, spec.source.as_str(), "camera.reference"_str);
+    if (matrix.is_err()) return Err(matrix.unwrap_err());
+    auto scale = uniform_scale(matrix.unwrap(), spec.source.as_str(), "camera.reference"_str);
+    if (scale.is_err()) return Err(scale.unwrap_err());
+    auto rotation_ = rotation(matrix.unwrap(), spec.source.as_str(), "camera.reference"_str, true);
+    if (rotation_.is_err()) return Err(rotation_.unwrap_err());
+    auto projection = input.projection;
+    if (! input.explicit_near)
+        projection.near = fit.frame().projection.near;
+    else if (input.reference_clip)
+        projection.near *= scale.unwrap();
+    if (! input.explicit_far)
+        projection.far = 0;
+    else if (input.reference_clip)
+        projection.far *= scale.unwrap();
+    auto frame = camera_frame(
+        CameraLookAt { matrix->point(input.look_at.position), matrix->point(input.look_at.target) },
+        projection,
+        rotation_->vector(input.up));
+    if (! frame)
+        return Err(error(
+            spec.source.as_str(), "camera"_str, "resolved camera or clip lengths are invalid"_str));
+    return Ok(*frame);
+}
+} // namespace vecgltf::presentation_detail
 
-export namespace viewer
+export namespace vecgltf
 {
-auto LoadViewSettings(ref<str> source) -> Result<ViewSettings, gltf::Error> {
-    if (source.is_empty() || settings::contains_nul(source))
-        return Err(settings::error(source, "settings"_str, "invalid settings path"_str));
-    auto bytes = settings::read_document(source);
-    if (bytes.is_err()) return Err(bytes.unwrap_err());
-    auto parsed = rstd::json::from_slice(bytes->as_slice(), { .max_depth = usize(32) });
+auto ParsePresentation(slice<u8> bytes, ref<str> source) -> Result<PresentationSpec, gltf::Error> {
+    if (bytes.len() > usize(64 * 1024))
+        return Err(presentation_detail::error(
+            source, "presentation"_str, "presentation exceeds 64 KiB"_str, ErrorKind::Limit));
+    auto parsed = rstd::json::from_slice(bytes, { .max_depth = usize(32) });
     if (parsed.is_err())
-        return Err(settings::error(source,
-                                   "settings"_str,
-                                   rstd::format("{}", parsed.unwrap_err()).as_str(),
-                                   gltf::ErrorKind::Parse));
-    auto             data = parsed.unwrap();
-    settings::Reader reader(source);
-    ViewSettings     output;
+        return Err(presentation_detail::error(source,
+                                              "settings"_str,
+                                              rstd::format("{}", parsed.unwrap_err()).as_str(),
+                                              gltf::ErrorKind::Parse));
+    auto                        data = parsed.unwrap();
+    presentation_detail::Reader reader(source);
+    PresentationSpec            output;
     output.source = String::make(source);
     if (! reader.object(data, "settings"_str)) return Err(reader.failure().unwrap());
     auto version = reader.field(data, "version"_str);
-    if (! version || reader.number(*version, "version"_str) != 1)
-        reader.fail("version"_str, "settings version must be one"_str);
+    if (! version || reader.number(*version, "version"_str) != 2)
+        reader.fail("version"_str, "presentation version must be two"_str);
+    if (auto input = reader.field(data, "camera"_str)) reader.camera(*input, output);
     if (auto lights = reader.field(data, "directional_lights"_str)) reader.lights(*lights, output);
     if (auto lights = reader.field(data, "point_lights"_str)) reader.point_lights(*lights, output);
     if (auto values = reader.field(data, "material_overrides"_str))
@@ -613,15 +777,55 @@ auto LoadViewSettings(ref<str> source) -> Result<ViewSettings, gltf::Error> {
         reader.shadow_catcher(*value, output);
     if (auto seed = reader.field(data, "alpha_dither_seed"_str))
         output.scene.alpha_dither_seed = reader.unsigned_integer(*seed, "alpha_dither_seed"_str);
-    Option<settings::EnvironmentFiles> files;
     if (auto input = reader.field(data, "environment"_str))
-        files = reader.environment(*input, output);
+        output.environment = reader.environment(*input, output);
     if (auto input = reader.field(data, "display"_str)) reader.display(*input, output);
     if (auto failed = reader.failure()) return Err(rstd::move(failed).unwrap());
-    if (! files) return Ok(rstd::move(output));
-    auto location = rstd::path::PathBuf::from(source);
-    auto parent   = location.as_path().parent();
-    auto base = parent ? rstd::path::PathBuf::from(*parent) : rstd::path::PathBuf::from("."_str);
+    auto display = ValidateDisplayOptions(output.display);
+    if (display.is_err()) return Err(display.unwrap_err());
+    return Ok(rstd::move(output));
+}
+auto LoadPresentation(ref<str> source) -> Result<PresentationSpec, Error> {
+    if (source.is_empty() || presentation_detail::contains_nul(source))
+        return Err(presentation_detail::error(
+            source, "presentation"_str, "invalid presentation path"_str));
+    auto bytes = presentation_detail::read_document(source);
+    if (bytes.is_err()) return Err(bytes.unwrap_err());
+    auto parsed = ParsePresentation(bytes->as_slice(), source);
+    if (parsed.is_err()) return Err(parsed.unwrap_err());
+    auto output = parsed.unwrap();
+    auto path   = rstd::path::PathBuf::from(source);
+    auto parent = path.as_path().parent();
+    output.resource_base_directory =
+        Some(parent ? rstd::path::PathBuf::from(*parent) : rstd::path::PathBuf::from("."_str));
+    return Ok(rstd::move(output));
+}
+} // namespace vecgltf
+
+namespace vecgltf::presentation_detail
+{
+auto load_environment(const PresentationSpec& configured, PresentationResources resources)
+    -> Result<Option<EnvironmentImages>, Error> {
+    if (! configured.environment) return Ok(None<EnvironmentImages>());
+    const auto& files = configured.environment;
+    auto        base  = rstd::move(resources.base_directory);
+    if (base.as_path().as_os_str().is_empty() && configured.resource_base_directory)
+        base = rstd::path::PathBuf::from(configured.resource_base_directory->as_path());
+    if (base.as_path().as_os_str().is_empty())
+        return Err(error(configured.source.as_str(),
+                         "environment"_str,
+                         "environment resources require a base directory"_str));
+    if (! resources.resolver.present()) {
+        auto root =
+            rstd::fs::canonicalize(resources.root ? resources.root->as_path() : base.as_path());
+        if (root.is_err())
+            return Err(error(configured.source.as_str(),
+                             "environment"_str,
+                             "cannot resolve resource root"_str,
+                             ErrorKind::Io));
+        resources.root     = Some(root.unwrap());
+        resources.resolver = FileResources();
+    }
     struct ImageEntry {
         String                 path;
         unsigned               remaining {};
@@ -647,8 +851,24 @@ auto LoadViewSettings(ref<str> source) -> Result<ViewSettings, gltf::Error> {
     for (const auto& file : files->specular) {
         specular.push(register_image(file));
     }
+    usize remaining = resources.max_bytes;
     for (auto& image : images) {
-        auto loaded = gltf::LoadEnvironment(image.path.as_str());
+        auto path = rstd::path::PathBuf::from(image.path.as_str());
+        auto bytes =
+            resources.resolver.Read({ ResourceKind::Image,
+                                      configured.source.as_str(),
+                                      image.path.as_str(),
+                                      path.as_path(),
+                                      resources.root ? Some(resources.root->as_path()) : None(),
+                                      remaining });
+        if (bytes.is_err()) return Err(bytes.unwrap_err());
+        if (bytes->bytes().len() > remaining)
+            return Err(error(configured.source.as_str(),
+                             "environment"_str,
+                             "environment resources exceed byte limit"_str,
+                             ErrorKind::Limit));
+        remaining -= bytes->bytes().len();
+        auto loaded = gltf::LoadEnvironment(bytes.unwrap(), image.path.as_str());
         if (loaded.is_err()) return Err(loaded.unwrap_err());
         image.image = Some(loaded.unwrap());
     }
@@ -665,44 +885,37 @@ auto LoadViewSettings(ref<str> source) -> Result<ViewSettings, gltf::Error> {
     environment.specular_lod_scale    = files->lod_scale;
     environment.specular_lod_exponent = files->lod_exponent;
     environment.brdf_filter           = files->brdf_filter;
-    output.environment_images         = Some(rstd::move(environment));
-    return Ok(rstd::move(output));
+    return Ok(Some(rstd::move(environment)));
 }
-auto ResolveSceneOptions(const ViewSettings&        configured,
-                         const gltf::SceneInstance& instance,
-                         gltf::RenderOptions current) -> Result<gltf::SceneOptions, gltf::Error> {
-    gltf::SceneOptions result;
-    result.debug                = current.debug;
-    result.background           = current.background;
-    result.direct_light         = current.direct_light;
-    result.ibl_intensity        = current.ibl_intensity;
-    result.background_intensity = current.background_intensity;
-    result.background_color     = current.background_color;
-    result.world_to_environment = current.world_to_environment;
-    result.alpha_dither_seed    = current.alpha_dither_seed;
-    result.shadow_catcher       = current.shadow_catcher;
+auto resolve_scene(const PresentationSpec&    configured,
+                   const gltf::SceneInstance& instance,
+                   gltf::SceneOptions         current,
+                   const CameraFrame&         camera) -> Result<gltf::SceneOptions, gltf::Error> {
+    auto result = current;
     if (result.shadow_catcher) {
-        auto transform = settings::reference_transform(configured.shadow_catcher_reference,
-                                                       instance,
-                                                       configured.source.as_str(),
-                                                       "shadow_catcher.reference"_str);
+        auto transform =
+            presentation_detail::reference_transform(configured.shadow_catcher_reference,
+                                                     instance,
+                                                     configured.source.as_str(),
+                                                     "shadow_catcher.reference"_str);
         if (transform.is_err()) return Err(transform.unwrap_err());
         result.shadow_catcher->transform = transform.unwrap() * result.shadow_catcher->transform;
     }
     if (current.directional_lights) {
         const auto& inputs = current.directional_lights.values();
         if (! inputs.is_empty() && inputs.len() != configured.lights.len())
-            return Err(settings::error(configured.source.as_str(),
-                                       "directional_lights"_str,
-                                       "light count differs from reference settings"_str));
+            return Err(
+                presentation_detail::error(configured.source.as_str(),
+                                           "directional_lights"_str,
+                                           "light count differs from reference settings"_str));
         Vec<gltf::DirectionalLight> lights;
         for (unsigned i = 0; i < gltf::count(inputs); ++i) {
             auto light     = gltf::at(inputs, i);
             auto reference = gltf::at(configured.lights, i).reference;
-            if (reference.space == SettingsSpace::View)
+            if (reference.space == PresentationSpace::View)
                 light.space = gltf::LightSpace::View;
             else {
-                auto rotation = settings::reference_rotation(
+                auto rotation = presentation_detail::reference_rotation(
                     reference,
                     instance,
                     configured.source.as_str(),
@@ -718,38 +931,111 @@ auto ResolveSceneOptions(const ViewSettings&        configured,
     if (current.point_lights) {
         const auto& inputs = current.point_lights.values();
         if (! inputs.is_empty() && inputs.len() != configured.point_lights.len())
-            return Err(settings::error(configured.source.as_str(),
-                                       "point_lights"_str,
-                                       "light count differs from reference settings"_str));
+            return Err(
+                presentation_detail::error(configured.source.as_str(),
+                                           "point_lights"_str,
+                                           "light count differs from reference settings"_str));
         Vec<gltf::PointLight> lights;
         for (unsigned i = 0; i < gltf::count(inputs); ++i) {
             auto light     = gltf::at(inputs, i);
             auto reference = gltf::at(configured.point_lights, i).reference;
-            if (reference.space == SettingsSpace::View)
+            if (reference.space == PresentationSpace::View)
                 light.space = gltf::LightSpace::View;
             else {
-                auto transform = settings::reference_transform(
+                auto transform = presentation_detail::reference_transform(
                     reference,
                     instance,
                     configured.source.as_str(),
                     rstd::format("point_lights[{}].reference", i).as_str());
                 if (transform.is_err()) return Err(transform.unwrap_err());
                 light.position = transform.unwrap().point(light.position);
-                light.space    = gltf::LightSpace::World;
+                if (gltf::at(configured.point_lights, i).reference_attenuation) {
+                    auto scale = uniform_scale(transform.unwrap(),
+                                               configured.source.as_str(),
+                                               "point_lights.attenuation_units"_str);
+                    if (scale.is_err()) return Err(scale.unwrap_err());
+                    light.attenuation.y /= scale.unwrap();
+                    light.attenuation.z /= scale.unwrap() * scale.unwrap();
+                    if (! rstd::f32(light.attenuation.y).is_finite() ||
+                        ! rstd::f32(light.attenuation.z).is_finite())
+                        return Err(error(configured.source.as_str(),
+                                         "point_lights.attenuation"_str,
+                                         "attenuation conversion is not finite"_str));
+                }
+                light.space = gltf::LightSpace::World;
             }
             lights.push(rstd::move(light));
         }
         result.point_lights = gltf::PointLights(rstd::move(lights));
     }
     if (configured.environment_transform) {
-        auto rotation = settings::reference_rotation(configured.environment_reference,
-                                                     instance,
-                                                     configured.source.as_str(),
-                                                     "environment.reference"_str);
+        Result<Mat4, Error> rotation =
+            configured.environment_reference.space == PresentationSpace::View
+                ? Result<Mat4, Error>(Ok(compose({}, camera.orientation, { 1, 1, 1 })))
+                : presentation_detail::reference_rotation(configured.environment_reference,
+                                                          instance,
+                                                          configured.source.as_str(),
+                                                          "environment.reference"_str);
         if (rotation.is_err()) return Err(rotation.unwrap_err());
         result.world_to_environment =
-            settings::transpose(rotation.unwrap() * configured.environment_to_reference);
+            presentation_detail::transpose(rotation.unwrap() * configured.environment_to_reference);
     }
     return Ok(rstd::move(result));
 }
-} // namespace viewer
+} // namespace vecgltf::presentation_detail
+
+export namespace vecgltf
+{
+auto BindPresentation(PresentationSpec spec, Arc<Asset> asset, PresentationResources resources)
+    -> Result<BoundPresentation, Error> {
+    auto valid = ValidatePrepareOptions(*asset, { .material_overrides = spec.material_overrides });
+    if (valid.is_err()) return Err(valid.unwrap_err());
+    BoundPresentation bound(rstd::move(spec), rstd::move(asset), {});
+    SceneInstance     instance(bound.asset());
+    auto              resolved = ResolvePresentation(bound, instance);
+    if (resolved.is_err()) return Err(resolved.unwrap_err());
+    auto environment = presentation_detail::load_environment(bound.spec(), rstd::move(resources));
+    if (environment.is_err()) return Err(environment.unwrap_err());
+    bound.environment_ = environment.unwrap();
+    return Ok(rstd::move(bound));
+}
+auto ResolvePresentation(const BoundPresentation&     bound,
+                         const SceneInstance&         instance,
+                         const PresentationOverrides& overrides)
+    -> Result<ResolvedPresentation, Error> {
+    const auto& spec = bound.spec();
+    if (&instance.asset() != &*bound.asset_ || instance.asset().generation != bound.generation_)
+        return Err(
+            presentation_detail::error(spec.source.as_str(),
+                                       "asset"_str,
+                                       "presentation belongs to a different asset generation"_str));
+    ResolvedPresentation output;
+    if (overrides.camera) {
+        if (! overrides.camera->valid())
+            return Err(presentation_detail::error(
+                spec.source.as_str(), "camera"_str, "camera override is invalid"_str));
+        output.camera = overrides.camera;
+    } else {
+        auto camera = presentation_detail::resolve_camera(spec, instance);
+        if (camera.is_err()) return Err(camera.unwrap_err());
+        output.camera = Some(camera.unwrap());
+    }
+    auto scene = presentation_detail::resolve_scene(
+        spec, instance, overrides.scene ? *overrides.scene : spec.scene, *output.camera);
+    if (scene.is_err()) return Err(scene.unwrap_err());
+    output.scene   = scene.unwrap();
+    output.display = overrides.display ? *overrides.display : spec.display;
+    output.display.exposure *= overrides.exposure_multiplier;
+    if (! rstd::f32(overrides.exposure_multiplier).is_finite() ||
+        overrides.exposure_multiplier < 0 || ! rstd::f32(output.display.exposure).is_finite())
+        return Err(
+            presentation_detail::error(spec.source.as_str(),
+                                       "display.exposure"_str,
+                                       "exposure multiplier must be finite and nonnegative"_str));
+    auto display = ValidateDisplayOptions(output.display);
+    if (display.is_err()) return Err(display.unwrap_err());
+    auto scene_options = ValidateSceneOptions(output.scene, output.camera->view(1).unwrap());
+    if (scene_options.is_err()) return Err(scene_options.unwrap_err());
+    return Ok(rstd::move(output));
+}
+} // namespace vecgltf

@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "camera": {
+    "position": [0, 0, 5],
+    "target": [0, 0, 0],
+    "up": [0, 1, 0],
+    "yfov": 0.7853981633974483,
+    "reference": "scene-root",
+    "clip_units": "world"
+  },
+  "directional_lights": [
+    {
+      "direction": [0.3, 0.7, 1],
+      "color": [1, 0.9, 0.8],
+      "intensity": 2,
+      "reference": "world"
+    }
+  ],
+  "point_lights": [],
+  "material_overrides": [],
+  "environment": {
+    "ibl_intensity": 0,
+    "background": false,
+    "background_color": [0.18, 0.18, 0.18]
+  },
+  "display": {
+    "exposure": 1,
+    "tone_mapping": "linear",
+    "color_balance": {
+      "shadows": [0, 0, 0],
+      "midtones": [0, 0, 0],
+      "highlights": [0, 0, 0]
+    },
+    "fxaa": false
+  },
+  "alpha_dither_seed": 0
+}

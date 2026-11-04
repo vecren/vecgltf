@@ -50,9 +50,16 @@ struct DisplayInput {
     // Geometry coverage is independent of an opaque environment background.
     Option<vrento::texture::TextureViewRef> coverage;
 };
+enum class DisplayEncoding
+{
+    Attachment,
+    // Encoded premultiplied bytes for external UNORM consumers, without attachment conversion.
+    Srgb
+};
 struct DisplayTarget {
     vrento::texture::TextureViewRef color;
     vrento::vulkan::AttachmentLoad  load { vrento::vulkan::AttachmentLoad::Clear };
+    DisplayEncoding                encoding { DisplayEncoding::Attachment };
 };
 struct DisplayStatistics {
     rstd::uint64_t recorded_frames {};
@@ -459,6 +466,7 @@ auto populate(Frame&                frame,
               const DisplayTarget&  target,
               const DisplayOptions& options) -> Result<empty, Error> {
     auto                values = parameters(options);
+    values.vignette.w = target.encoding == DisplayEncoding::Srgb ? 1 : 0;
     tex::TextureViewRef levels[5];
     auto                coverage = input.coverage ? *input.coverage : input.color;
     if (bloom_enabled(options)) {
@@ -528,6 +536,9 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::display::Scopes>
 
 export namespace vecgltf
 {
+auto ValidateDisplayOptions(const DisplayOptions& options) -> Result<empty, Error> {
+    return display::options_valid(options);
+}
 class DisplayRenderer {
     Arc<display::Core>               core_;
     Option<vrento::vulkan::Renderer> compiler_;
@@ -542,6 +553,13 @@ class DisplayRenderer {
             return Err(error("display target"_str, "invalid target"_str, ErrorKind::InvalidAsset));
         const auto& desc  = target.color.texture().description();
         const auto& range = target.color.description().range;
+        if (target.encoding != DisplayEncoding::Attachment &&
+            (target.encoding != DisplayEncoding::Srgb ||
+             desc.format != vrento::TextureFormat::RGBA8 ||
+             target.load != vk::AttachmentLoad::Clear))
+            return Err(error("display target"_str,
+                             "sRGB export requires a cleared RGBA8 UNORM target"_str,
+                             ErrorKind::InvalidAsset));
         if ((desc.format != vrento::TextureFormat::RGBA8 &&
              desc.format != vrento::TextureFormat::RGBA8_SRGB) ||
             desc.samples != 1 || range.mip_count != 1 || range.layer_count != 1 ||
@@ -650,7 +668,7 @@ public:
                           : registry::PipelineReadiness::Ready);
     }
     // Linear HDR and final output are premultiplied; postprocessing preserves center alpha.
-    // RGBA8 retains linear display values; RGBA8_SRGB uses attachment encoding.
+    // Attachment encoding retains linear RGBA8 values or uses the RGBA8_SRGB attachment.
     auto record(vrento::texture::Submission&    work,
                 vrento::texture::TextureViewRef source,
                 DisplayTarget                   target,

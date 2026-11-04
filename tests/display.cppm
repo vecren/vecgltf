@@ -194,6 +194,36 @@ TEST(Display, LinearComposition) {
     near(channel(image, 3), 191);
     rstd_assert(session.validation_errors() == 0);
 }
+TEST(Display, SrgbExportToUnorm) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto queue   = vk::TextureContext::create(session).unwrap();
+    auto display = DisplayRenderer::create(session).unwrap();
+    auto hdr     = texture(queue, vrento::TextureFormat::RGBA16F);
+    auto output  = texture(queue, vrento::TextureFormat::RGBA8);
+    const bool post_modes[] { false, true };
+    const float alphas[] { 0.0f, 0.5f, 1.0f };
+    for (bool post : post_modes) {
+        DisplayOptions options;
+        options.tone_mapping = ToneMapping::Linear;
+        options.fxaa = post;
+        for (float alpha : alphas) {
+            auto work = queue.Begin().unwrap();
+            clear(session, work, hdr, { 0.25f * alpha, 0.5f * alpha, 0.75f * alpha, alpha });
+            display.record(work, hdr, { output, vk::AttachmentLoad::Clear, DisplayEncoding::Srgb }, options)
+                .unwrap();
+            queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+            auto image = pixels(session, queue, output);
+            near(channel(image, 0), unsigned(137 * alpha));
+            near(channel(image, 1), unsigned(188 * alpha));
+            near(channel(image, 2), unsigned(225 * alpha));
+            near(channel(image, 3), unsigned(255 * alpha));
+        }
+    }
+    auto srgb = texture(queue, vrento::TextureFormat::RGBA8_SRGB);
+    rstd_assert(display.prepare_target({ srgb, vk::AttachmentLoad::Clear, DisplayEncoding::Srgb }).is_err());
+    rstd_assert(display.prepare_target({ output, vk::AttachmentLoad::Load, DisplayEncoding::Srgb }).is_err());
+    rstd_assert(session.validation_errors() == 0);
+}
 TEST(Display, GradingAndAlpha) {
     auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto queue   = vk::TextureContext::create(session).unwrap();

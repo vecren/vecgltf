@@ -779,12 +779,33 @@ auto LoadAsset(ref<str> path, LoadOptions options) -> Result<Arc<Asset>, Error> 
     return BuildAsset(resolved.unwrap());
 }
 auto LoadEnvironment(ref<str> path) -> Result<HdrImage, Error> {
-    auto filename = rstd::ffi::CString::make(Vec<u8>::from(path.as_bytes()));
-    if (filename.is_err())
-        return Err(Error {
-            ErrorKind::Io, String::make(path), "environment"_Str, "invalid environment path"_Str });
-    int           width {}, height {}, channels {};
-    DecodedPixels pixels { stbi_loadf(filename->as_ptr(), &width, &height, &channels, 4) };
+    auto file  = rstd::path::PathBuf::from(path);
+    auto bytes = FileResources().Read(
+        { ResourceKind::Image, path, path, file.as_path(), None(), usize(64 * 1024 * 1024) });
+    if (bytes.is_err()) return Err(bytes.unwrap_err());
+    return LoadEnvironment(bytes.unwrap(), path);
+}
+auto LoadEnvironment(ResourceBytes input, ref<str> path) -> Result<HdrImage, Error> {
+    auto bytes = input.bytes();
+    if (bytes.is_empty() || bytes.len() > usize(2147483647))
+        return Err(Error { ErrorKind::Limit,
+                           String::make(path),
+                           "environment"_Str,
+                           "invalid environment byte count"_Str });
+    auto data = reinterpret_cast<const stbi_uc*>(bytes.as_raw_ptr());
+    int  width {}, height {}, channels {};
+    if (! stbi_info_from_memory(data, int(bytes.len().to_primitive()), &width, &height, &channels))
+        return Err(Error { ErrorKind::Decode,
+                           String::make(path),
+                           "environment"_Str,
+                           load_text(stbi_failure_reason()) });
+    if (width <= 0 || height <= 0 || rstd::size_t(width) > 67108864u / rstd::size_t(height))
+        return Err(Error { ErrorKind::Limit,
+                           String::make(path),
+                           "environment"_Str,
+                           "environment exceeds pixel limit"_Str });
+    DecodedPixels pixels { stbi_loadf_from_memory(
+        data, int(bytes.len().to_primitive()), &width, &height, &channels, 4) };
     if (! pixels.data)
         return Err(Error { ErrorKind::Decode,
                            String::make(path),

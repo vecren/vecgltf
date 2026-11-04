@@ -67,5 +67,6 @@ void main() {
         float attenuation=1-display.grading.y*smoothstep(display.grading.z,display.grading.w,radius);
         color*=attenuation;
     }
-    result=display.bloom.w>0 ? vec4(encoded(color),alpha) : vec4(color*alpha,alpha);
+    result=display.bloom.w>0 ? vec4(encoded(color),alpha) :
+        vec4((display.vignette.w>0 ? encoded(color) : color)*alpha,alpha);
 }
