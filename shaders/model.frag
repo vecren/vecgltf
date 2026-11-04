@@ -6,7 +6,17 @@ layout(location=3) in vec4 world_tangent;
 layout(location=4) in vec2 texcoords[5];
 layout(location=9) flat in float winding;
 layout(location=0) out vec4 result;
-layout(set=0,binding=0) uniform Frame {vec4 eye;vec4 options;mat4 inverse_view_projection;mat4 projection;vec4 light_direction;vec4 light_radiance;vec4 lighting;} frame;
+layout(set=0,binding=0) uniform Frame {
+    vec4 eye;
+    vec4 options;
+    mat4 inverse_view_projection;
+    mat4 projection;
+    vec4 lighting;
+    mat4 world_to_environment;
+    vec4 light_directions[8];
+    vec4 light_radiances[8];
+    vec4 environment_lod;
+} frame;
 layout(set=0,binding=1) uniform sampler2D specular_environment;
 layout(set=0,binding=2) uniform sampler2D diffuse_environment;
 layout(set=0,binding=3) uniform sampler2D brdf_lut;
@@ -52,6 +62,7 @@ vec3 mapped_normal(vec3 normal) {
     return normalize(mat3(tangent,bitangent,normal)*map);
 }
 vec2 environment_uv(vec3 direction) {
+    direction=mat3(frame.world_to_environment)*direction;
     return vec2(atan(direction.z,direction.x)/(2*pi)+0.5,acos(clamp(direction.y,-1,1))/pi);
 }
 vec3 tone_map(vec3 color) {
@@ -80,28 +91,34 @@ void main() {
     vec3 n=mapped_normal(normalize(world_normal));
     if(!front) n=-n;
     vec3 v=normalize(frame.eye.xyz-relative_position);
-    vec3 l=frame.light_direction.xyz;
-    vec3 h=v+l;
-    h=dot(h,h)>0 ? normalize(h):n;
     vec4 physical=texture(physical_texture,uv(1));
     bool specular_glossiness=(shading&2)!=0;
     float metallic=specular_glossiness ? 0:clamp(material.factors.x*physical.b,0,1);
     float roughness=clamp(specular_glossiness ? 1-material.specular.w*physical.a:material.factors.y*physical.g,0.04,1);
-    float nl=max(dot(n,l),0),nv=max(dot(n,v),0.001),nh=max(dot(n,h),0),vh=max(dot(v,h),0);
+    float nv=max(dot(n,v),0.001);
     vec3 f0=specular_glossiness ? material.specular.rgb*physical.rgb:mix(vec3(0.04),base.rgb,metallic);
     vec3 diffuse_color=base.rgb*(specular_glossiness ? 1-max(max(f0.r,f0.g),f0.b):1-metallic);
-    vec3 fresnel=f0+(1-f0)*pow(1-vh,5);
     float a=roughness*roughness,a2=a*a;
-    float denom=nh*nh*(a2-1)+1;
-    float distribution=a2/(pi*denom*denom);
-    float visibility=0.5/max(nl*sqrt(nv*nv*(1-a2)+a2)+nv*sqrt(nl*nl*(1-a2)+a2),0.0001);
-    vec3 diffuse_fresnel=specular_glossiness ? fresnel:vec3(0.04+0.96*pow(1-vh,5));
-    vec3 diffuse=(1-diffuse_fresnel)*diffuse_color/pi;
-    vec3 color=(diffuse+distribution*visibility*fresnel)*nl*frame.light_radiance.rgb;
+    vec3 color=vec3(0);
+    for(int index=0;index<int(frame.lighting.z);++index) {
+        vec3 l=frame.light_directions[index].xyz;
+        vec3 h=v+l;
+        h=dot(h,h)>0 ? normalize(h):n;
+        float nl=max(dot(n,l),0),nh=max(dot(n,h),0),vh=max(dot(v,h),0);
+        vec3 fresnel=f0+(1-f0)*pow(1-vh,5);
+        float denom=nh*nh*(a2-1)+1;
+        float distribution=a2/(pi*denom*denom);
+        float visibility=0.5/max(nl*sqrt(nv*nv*(1-a2)+a2)+nv*sqrt(nl*nl*(1-a2)+a2),0.0001);
+        vec3 diffuse_fresnel=specular_glossiness ? fresnel:vec3(0.04+0.96*pow(1-vh,5));
+        vec3 diffuse=(1-diffuse_fresnel)*diffuse_color/pi;
+        color+=(diffuse+distribution*visibility*fresnel)*nl*frame.light_radiances[index].rgb;
+    }
     float occlusion=mix(1,texture(occlusion_texture,uv(3)).r,material.factors.w);
     vec3 reflected=reflect(-v,n);
     vec3 irradiance=texture(diffuse_environment,environment_uv(n)).rgb;
-    vec3 prefiltered=textureLod(specular_environment,environment_uv(reflected),roughness*frame.options.w).rgb;
+    float lod_roughness=frame.environment_lod.y==1 ? roughness:pow(roughness,frame.environment_lod.y);
+    float environment_level=clamp(lod_roughness*frame.environment_lod.x,0,frame.options.w);
+    vec3 prefiltered=textureLod(specular_environment,environment_uv(reflected),environment_level).rgb;
     vec2 integrated=texture(brdf_lut,vec2(nv,roughness)).rg;
     vec3 diffuse_f0=specular_glossiness ? f0:vec3(0.04);
     vec3 ambient_fresnel=diffuse_f0+(max(vec3(1-roughness),diffuse_f0)-diffuse_f0)*pow(1-nv,5);

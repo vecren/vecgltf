@@ -5,6 +5,8 @@ local content = { 'export module vecgltf.shaders;', 'import vecgltf.spirv;', 'ex
 for _, shader in ipairs({
   { name = "background_vertex", source = "background.vert", stage = "vertex" },
   { name = "background_fragment", source = "background.frag", stage = "fragment" },
+  { name = "display_vertex", source = "display.vert", stage = "vertex" },
+  { name = "display_fragment", source = "display.frag", stage = "fragment" },
   { name = "model_vertex", source = "model.vert", stage = "vertex" },
   { name = "model_fragment", source = "model.frag", stage = "fragment" },
   { name = "model_opaque_fragment", source = "model.frag", stage = "fragment",

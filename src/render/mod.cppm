@@ -4,10 +4,11 @@ module;
 export module vecgltf.render;
 export import vecgltf.scene;
 export import vecgltf.load;
+export import vecgltf.render.options;
+export import vecgltf.environment;
 export import vrento;
 import vecgltf.shaders;
 import vecgltf.textures;
-import vecgltf.environment;
 
 using namespace rstd::literals;
 
@@ -46,6 +47,98 @@ auto graph_error(vrento::fg::Error error) -> Error {
                                                  error.pass,
                                                  error.resource,
                                                  vk::GraphExecutionCause::Graph(error) });
+}
+bool valid_environment_image(const HdrImage& image) {
+    auto pixels = rstd::uint64_t(image.width) * image.height;
+    if (! image.width || ! image.height || pixels > (~rstd::size_t(0)) / 4 ||
+        count(image.rgba) != pixels * 4)
+        return false;
+    for (auto value : image.rgba)
+        if (! rstd::f32(value).is_finite() || value < 0) return false;
+    return true;
+}
+struct LightingParameters {
+    Vec4     directions[max_directional_lights], radiances[max_directional_lights];
+    unsigned count {};
+};
+auto lower_lighting(const RenderOptions& options, const View& view)
+    -> Result<LightingParameters, Error> {
+    auto invalid = []() {
+        return render_error("render options"_str,
+                            "invalid lighting or environment rotation"_str,
+                            ErrorKind::InvalidAsset);
+    };
+    auto non_negative = [](float value) {
+        return rstd::f32(value).is_finite() && value >= 0;
+    };
+    if (! non_negative(options.ibl_intensity) || ! non_negative(options.background_intensity) ||
+        unsigned(options.debug) > unsigned(DebugView::Emissive))
+        return Err(invalid());
+    const auto& matrix = options.world_to_environment;
+    for (auto value : matrix.m)
+        if (! rstd::f32(value).is_finite()) return Err(invalid());
+    if (matrix.m[3] != 0 || matrix.m[7] != 0 || matrix.m[11] != 0 || matrix.m[12] != 0 ||
+        matrix.m[13] != 0 || matrix.m[14] != 0 || matrix.m[15] != 1)
+        return Err(invalid());
+    Vec3 columns[] { { matrix.m[0], matrix.m[1], matrix.m[2] },
+                     { matrix.m[4], matrix.m[5], matrix.m[6] },
+                     { matrix.m[8], matrix.m[9], matrix.m[10] } };
+    for (unsigned i = 0; i < 3; ++i) {
+        if (absolute(dot(columns[i], columns[i]) - 1) > 0.0001f) return Err(invalid());
+        for (unsigned j = 0; j < i; ++j)
+            if (absolute(dot(columns[i], columns[j])) > 0.0001f) return Err(invalid());
+    }
+    if (absolute(matrix.determinant3() - 1) > 0.0001f) return Err(invalid());
+    LightingParameters result {};
+    Option<Mat4>       inverse_view;
+    auto               append = [&](const DirectionalLight& light) -> Result<empty, Error> {
+        if (! rstd::f32(light.direction.x).is_finite() ||
+            ! rstd::f32(light.direction.y).is_finite() ||
+            ! rstd::f32(light.direction.z).is_finite() || ! non_negative(light.color.x) ||
+            ! non_negative(light.color.y) || ! non_negative(light.color.z) ||
+            ! non_negative(light.intensity) || ! non_negative(light.color.x * light.intensity) ||
+            ! non_negative(light.color.y * light.intensity) ||
+            ! non_negative(light.color.z * light.intensity) ||
+            (light.space != LightSpace::World && light.space != LightSpace::View))
+            return Err(invalid());
+        auto normalize = [](Vec3 value) -> Option<Vec3> {
+            if (! rstd::f32(value.x).is_finite() || ! rstd::f32(value.y).is_finite() ||
+                ! rstd::f32(value.z).is_finite())
+                return None();
+            float scale = maximum(absolute(value.x), maximum(absolute(value.y), absolute(value.z)));
+            if (scale == 0) return None();
+            return Some(normalized(Vec3 { value.x / scale, value.y / scale, value.z / scale }));
+        };
+        auto direction = normalize(light.direction);
+        if (! direction) return Err(invalid());
+        if (light.space == LightSpace::View) {
+            if (! inverse_view) inverse_view = view.view.inverse();
+            if (! inverse_view) return Err(invalid());
+            direction = normalize(inverse_view->vector(direction.unwrap()));
+            if (! direction) return Err(invalid());
+        }
+        auto value                       = direction.unwrap();
+        result.directions[result.count]  = { value.x, value.y, value.z, 0 };
+        result.radiances[result.count++] = { light.color.x * light.intensity,
+                                             light.color.y * light.intensity,
+                                             light.color.z * light.intensity,
+                                             0 };
+        return Ok(empty {});
+    };
+    if (options.directional_lights) {
+        const auto& lights = options.directional_lights.values();
+        if (count(lights) > max_directional_lights)
+            return Err(render_error(
+                "render options"_str, "too many directional lights"_str, ErrorKind::Limit));
+        for (const auto& light : lights) {
+            auto added = append(light);
+            if (added.is_err()) return Err(added.unwrap_err());
+        }
+    } else if (options.direct_light) {
+        auto added = append(*options.direct_light);
+        if (added.is_err()) return Err(added.unwrap_err());
+    }
+    return Ok(result);
 }
 auto camera_relative_model(const Mat4& model, Vec3 origin) -> Mat4 {
     auto         result = model;
@@ -156,12 +249,16 @@ struct MaterialParameters {
 struct FrameParameters {
     Vec4 eye, options;
     Mat4 inverse_view_projection, projection;
-    Vec4 light_direction, light_radiance, lighting;
+    Vec4 lighting;
+    Mat4 world_to_environment;
+    Vec4 light_directions[max_directional_lights], light_radiances[max_directional_lights];
+    Vec4 environment_lod;
 };
-static_assert(sizeof(FrameParameters) == 208);
+static_assert(sizeof(FrameParameters) == 512);
 struct PreparedEnvironment {
     Arc<RenderCore>                          core;
     Vec<Arc<vrento::texture::PreparedImage>> textures;
+    float                                    max_lod {}, lod_scale {}, lod_exponent { 1 };
     explicit PreparedEnvironment(Arc<RenderCore> owner): core(rstd::move(owner)) {}
 };
 struct PreparedData {
@@ -569,36 +666,6 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vecgltf::ModelScopes>
 } // namespace rstd
 export namespace vecgltf
 {
-enum class DebugView
-{
-    None,
-    BaseColor,
-    Normal,
-    Metallic,
-    Roughness,
-    Emissive
-};
-struct DirectionalLight {
-    // World-space direction toward the light; magnitude does not affect intensity.
-    Vec3  direction { 0.3f, 0.7f, 1 };
-    Vec3  color { 1, 1, 1 };
-    float intensity { 3 };
-};
-enum class ToneMapping
-{
-    ACES,
-    ReinhardMax,
-    Linear
-};
-struct RenderOptions {
-    float                    exposure { 1 };
-    DebugView                debug {};
-    bool                     background {};
-    Option<DirectionalLight> direct_light { Some(DirectionalLight {}) };
-    // Scales indirect illumination; the visible background retains its source radiance.
-    float       ibl_intensity { 1 };
-    ToneMapping tone_mapping { ToneMapping::ACES };
-};
 enum class DepthEncoding
 {
     Forward,
@@ -657,6 +724,69 @@ class Renderer {
     Option<GraphShape> graph_shape_;
     explicit Renderer(Arc<RenderCore> core): core_(rstd::move(core)) {}
 
+    auto upload_environment(EnvironmentImages source) -> Result<empty, Error> {
+        if (! valid_environment_image(source.background) ||
+            ! valid_environment_image(source.diffuse) || ! valid_environment_image(source.brdf) ||
+            source.specular.is_empty() || ! rstd::f32(source.specular_lod_scale).is_finite() ||
+            (source.specular_lod_scale < 0 && source.specular_lod_scale != -1) ||
+            ! rstd::f32(source.specular_lod_exponent).is_finite() ||
+            source.specular_lod_exponent <= 0 ||
+            (source.brdf_filter != vrento::TextureFilter::LINEAR &&
+             source.brdf_filter != vrento::TextureFilter::NEAREST))
+            return Err(render_error("environment"_str,
+                                    "invalid environment images or sampling"_str,
+                                    ErrorKind::InvalidAsset));
+        unsigned width = at(source.specular, 0).width, height = at(source.specular, 0).height;
+        unsigned levels = 1, dimension = width > height ? width : height;
+        for (; dimension > 1; dimension /= 2) ++levels;
+        if (count(source.specular) > levels)
+            return Err(render_error(
+                "environment"_str, "too many specular mip levels"_str, ErrorKind::InvalidAsset));
+        for (const auto& mip : source.specular) {
+            if (! valid_environment_image(mip) || mip.width != width || mip.height != height)
+                return Err(render_error(
+                    "environment"_str, "invalid specular mip chain"_str, ErrorKind::InvalidAsset));
+            width  = width > 1 ? width / 2 : 1;
+            height = height > 1 ? height / 2 : 1;
+        }
+        auto environment     = Arc<PreparedEnvironment>::make(core_.clone());
+        environment->max_lod = float(count(source.specular) - 1);
+        environment->lod_scale =
+            source.specular_lod_scale == -1 ? environment->max_lod : source.specular_lod_scale;
+        environment->lod_exponent = source.specular_lod_exponent;
+        auto add                  = [&](Vec<HdrImage>         images,
+                                        bool                  wrap = true,
+                                        vrento::TextureFilter filter =
+                                            vrento::TextureFilter::LINEAR) -> Result<empty, Error> {
+            auto result = upload_environment_image(
+                dyn<vrento::texture::TextureDevice>::from_ref(*core_->image_device).as_mut_ref(),
+                rstd::move(images),
+                wrap,
+                core_->trace,
+                filter);
+            if (result.is_err()) return Err(texture_error(result.unwrap_err()));
+            environment->textures.push(Arc<vrento::texture::PreparedImage>::make(result.unwrap()));
+            return Ok(empty {});
+        };
+        auto specular = add(rstd::move(source.specular));
+        if (specular.is_err()) return specular;
+        Vec<HdrImage> diffuse;
+        diffuse.push(rstd::move(source.diffuse));
+        Vec<HdrImage> brdf;
+        brdf.push(rstd::move(source.brdf));
+        Vec<HdrImage> background;
+        background.push(rstd::move(source.background));
+        auto diffuse_ready = add(rstd::move(diffuse));
+        if (diffuse_ready.is_err()) return diffuse_ready;
+        auto brdf_ready = add(rstd::move(brdf), false, source.brdf_filter);
+        if (brdf_ready.is_err()) return brdf_ready;
+        auto background_ready = add(rstd::move(background));
+        if (background_ready.is_err()) return background_ready;
+        environment_ = Some(rstd::move(environment));
+        ++statistics_.environment_preparations;
+        return Ok(empty {});
+    }
+
 public:
     Renderer(const Renderer&)               = delete;
     Renderer(Renderer&&)                    = default;
@@ -687,44 +817,14 @@ public:
     }
     auto set_environment(HdrImage source) -> Result<empty, Error> {
         LoadScope scope(core_->trace, LoadEvent::Environment);
-        if (! source.width || ! source.height ||
-            count(source.rgba) != rstd::size_t(source.width) * source.height * 4)
-            return Err(render_error(
-                "environment"_str, "invalid HDR image dimensions"_str, ErrorKind::InvalidAsset));
-        for (auto value : source.rgba)
-            if (! rstd::f32(value).is_finite() || value < 0)
-                return Err(render_error(
-                    "environment"_str, "invalid HDR radiance"_str, ErrorKind::InvalidAsset));
-        auto processed   = preprocess_environment(rstd::move(source), core_->trace);
-        auto environment = Arc<PreparedEnvironment>::make(core_.clone());
-        auto add         = [&](Vec<HdrImage> images, bool wrap = true) -> Result<empty, Error> {
-            auto result = upload_environment_image(
-                dyn<vrento::texture::TextureDevice>::from_ref(*core_->image_device).as_mut_ref(),
-                rstd::move(images),
-                wrap,
-                core_->trace);
-            if (result.is_err()) return Err(texture_error(result.unwrap_err()));
-            environment->textures.push(
-                Arc<vrento::texture::PreparedImage>::make(rstd::move(result).unwrap()));
-            return Ok(empty {});
-        };
-        auto specular = add(rstd::move(processed.specular));
-        if (specular.is_err()) return specular;
-        Vec<HdrImage> diffuse;
-        diffuse.push(rstd::move(processed.diffuse));
-        Vec<HdrImage> brdf;
-        brdf.push(rstd::move(processed.brdf));
-        Vec<HdrImage> background;
-        background.push(rstd::move(processed.background));
-        auto diffuse_ready = add(rstd::move(diffuse));
-        if (diffuse_ready.is_err()) return diffuse_ready;
-        auto brdf_ready = add(rstd::move(brdf), false);
-        if (brdf_ready.is_err()) return brdf_ready;
-        auto background_ready = add(rstd::move(background));
-        if (background_ready.is_err()) return background_ready;
-        environment_ = Some(rstd::move(environment));
-        ++statistics_.environment_preparations;
-        return Ok(empty {});
+        if (! valid_environment_image(source))
+            return Err(
+                render_error("environment"_str, "invalid HDR image"_str, ErrorKind::InvalidAsset));
+        return upload_environment(preprocess_environment(rstd::move(source), core_->trace));
+    }
+    auto set_environment(EnvironmentImages source) -> Result<empty, Error> {
+        LoadScope scope(core_->trace, LoadEvent::Environment);
+        return upload_environment(rstd::move(source));
     }
     auto prepare(Arc<Asset> asset, PrepareOptions options = {}) -> Result<PreparedAsset, Error> {
         if (! rstd::f32(options.max_anisotropy).is_finite() || options.max_anisotropy < 1)
@@ -947,14 +1047,17 @@ public:
         ++statistics_.target_rebuilds;
         return Ok(empty {});
     }
-    auto prepare_target(const RenderTarget& destination, bool retry = false)
+
+private:
+    auto prepare_target_impl(const RenderTarget& destination, bool retry, bool linear_scene)
         -> Result<registry::PipelineReadiness, Error> {
         auto target = destination.color;
         if (! target.valid() || target.texture().identity().epoch != core_->session.epoch())
             return Err(render_error("prepare target"_str, "invalid target"_str));
         const auto& desc = target.texture().description();
-        if ((desc.format != vrento::TextureFormat::RGBA8 &&
-             desc.format != vrento::TextureFormat::RGBA8_SRGB) ||
+        if ((linear_scene ? desc.format != vrento::TextureFormat::RGBA16F
+                          : (desc.format != vrento::TextureFormat::RGBA8 &&
+                             desc.format != vrento::TextureFormat::RGBA8_SRGB)) ||
             desc.samples != 1)
             return Err(render_error("prepare target"_str, "unsupported target"_str));
         vk::RenderPassResourceDesc signature;
@@ -983,6 +1086,20 @@ public:
         }
         return Ok(status);
     }
+
+public:
+    auto prepare_target(const RenderTarget& destination, bool retry = false)
+        -> Result<registry::PipelineReadiness, Error> {
+        return prepare_target_impl(destination, retry, false);
+    }
+    auto prepare_scene_target(const RenderTarget& destination, bool retry = false)
+        -> Result<registry::PipelineReadiness, Error> {
+        return prepare_target_impl(destination, retry, true);
+    }
+    auto prepare_scene_target(vrento::texture::TextureViewRef target, bool retry = false)
+        -> Result<registry::PipelineReadiness, Error> {
+        return prepare_scene_target(RenderTarget { rstd::move(target) }, retry);
+    }
     auto prepare_target(vrento::texture::TextureViewRef target, bool retry = false)
         -> Result<registry::PipelineReadiness, Error> {
         return prepare_target(RenderTarget { rstd::move(target) }, retry);
@@ -1001,6 +1118,43 @@ public:
                 const SceneInstance&         instance,
                 const View&                  view,
                 RenderOptions                options = {}) -> Result<empty, Error> {
+        return record_impl(work, rstd::move(destination), prepared, instance, view, options, false);
+    }
+    auto record_scene(vrento::texture::Submission& work,
+                      RenderTarget                 destination,
+                      const PreparedAsset&         prepared,
+                      const SceneInstance&         instance,
+                      const View&                  view,
+                      SceneOptions                 options = {}) -> Result<empty, Error> {
+        RenderOptions values { 1,
+                               options.debug,
+                               options.background,
+                               options.direct_light,
+                               options.ibl_intensity,
+                               ToneMapping::Linear,
+                               options.directional_lights,
+                               options.world_to_environment,
+                               options.background_intensity };
+        return record_impl(work, rstd::move(destination), prepared, instance, view, values, true);
+    }
+    auto record_scene(vrento::texture::Submission&    work,
+                      vrento::texture::TextureViewRef target,
+                      const PreparedAsset&            prepared,
+                      const SceneInstance&            instance,
+                      const View&                     view,
+                      SceneOptions                    options = {}) -> Result<empty, Error> {
+        return record_scene(
+            work, RenderTarget { rstd::move(target) }, prepared, instance, view, options);
+    }
+
+private:
+    auto record_impl(vrento::texture::Submission& work,
+                     RenderTarget                 destination,
+                     const PreparedAsset&         prepared,
+                     const SceneInstance&         instance,
+                     const View&                  view,
+                     RenderOptions                options,
+                     bool                         linear_scene) -> Result<empty, Error> {
         auto target = destination.color;
         if (! target.valid() || &*prepared.data_->core != &*core_ ||
             prepared.generation() != instance.asset().generation)
@@ -1021,42 +1175,17 @@ public:
             return Err(render_error("render options"_str,
                                     "invalid exposure, IBL intensity or tone mapping"_str,
                                     ErrorKind::InvalidAsset));
-        Vec3 light_direction { 0, 0, 1 };
-        Vec4 light_radiance {};
-        if (options.direct_light) {
-            const auto& light = *options.direct_light;
-            if (! rstd::f32(light.direction.x).is_finite() ||
-                ! rstd::f32(light.direction.y).is_finite() ||
-                ! rstd::f32(light.direction.z).is_finite() || ! non_negative(light.color.x) ||
-                ! non_negative(light.color.y) || ! non_negative(light.color.z) ||
-                ! non_negative(light.intensity) ||
-                ! non_negative(light.color.x * light.intensity) ||
-                ! non_negative(light.color.y * light.intensity) ||
-                ! non_negative(light.color.z * light.intensity))
-                return Err(render_error("render options"_str,
-                                        "invalid directional light"_str,
-                                        ErrorKind::InvalidAsset));
-            float scale =
-                maximum(absolute(light.direction.x),
-                        maximum(absolute(light.direction.y), absolute(light.direction.z)));
-            if (scale == 0)
-                return Err(render_error("render options"_str,
-                                        "directional light direction must be nonzero"_str,
-                                        ErrorKind::InvalidAsset));
-            light_direction = normalized(Vec3 {
-                light.direction.x / scale, light.direction.y / scale, light.direction.z / scale });
-            light_radiance  = { light.color.x * light.intensity,
-                                light.color.y * light.intensity,
-                                light.color.z * light.intensity,
-                                0 };
-        }
+        auto lowered = lower_lighting(options, view);
+        if (lowered.is_err()) return Err(lowered.unwrap_err());
+        auto        lights      = lowered.unwrap();
         const auto& target_desc = target.texture().description();
         auto        range       = target.description().range;
-        if ((target_desc.format != vrento::TextureFormat::RGBA8 &&
-             target_desc.format != vrento::TextureFormat::RGBA8_SRGB) ||
+        if ((linear_scene ? target_desc.format != vrento::TextureFormat::RGBA16F
+                          : (target_desc.format != vrento::TextureFormat::RGBA8 &&
+                             target_desc.format != vrento::TextureFormat::RGBA8_SRGB)) ||
             target_desc.samples != 1 || range.mip_count != 1 || range.layer_count != 1)
             return Err(render_error("record"_str, "unsupported target view"_str));
-        auto readiness = prepare_target(destination);
+        auto readiness = prepare_target_impl(destination, false, linear_scene);
         if (readiness.is_err()) return Err(readiness.unwrap_err());
         auto status = readiness.unwrap();
         if (status != registry::PipelineReadiness::Ready)
@@ -1142,17 +1271,27 @@ public:
         resources->pose_binding = Some(pose_binding.unwrap());
         const auto&        d    = core_->session.device().handle().Dispatch();
         vvk::CommandBuffer command(command_buffer, d);
-        FrameParameters    frame_parameters {
-            { 0, 0, 0, 1 },
-            { options.exposure,
-              float(unsigned(options.debug)),
-              options.background ? 1.0f : 0.0f,
-              7 },
-            (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity()),
-            reversed_depth ? reversed_projection(view.projection) : view.projection,
-            { light_direction.x, light_direction.y, light_direction.z, 0 },
-            light_radiance,
-            { options.ibl_intensity, float(unsigned(options.tone_mapping)), 0, 0 }
+        FrameParameters    frame_parameters {};
+        frame_parameters.eye     = { 0, 0, 0, 1 };
+        frame_parameters.options = { options.exposure,
+                                     float(unsigned(options.debug)),
+                                     options.background ? 1.0f : 0.0f,
+                                     (*environment_)->max_lod };
+        frame_parameters.inverse_view_projection =
+            (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity());
+        frame_parameters.projection =
+            reversed_depth ? reversed_projection(view.projection) : view.projection;
+        frame_parameters.lighting             = { options.ibl_intensity,
+                                                  float(unsigned(options.tone_mapping)),
+                                                  float(lights.count),
+                                                  options.background_intensity };
+        frame_parameters.world_to_environment = options.world_to_environment;
+        for (unsigned i = 0; i < lights.count; ++i) {
+            frame_parameters.light_directions[i] = lights.directions[i];
+            frame_parameters.light_radiances[i]  = lights.radiances[i];
+        }
+        frame_parameters.environment_lod = {
+            (*environment_)->lod_scale, (*environment_)->lod_exponent, 0, 0
         };
         resources->frame_buffer = core_->buffers.Allocate(
             { sizeof(FrameParameters),
@@ -1480,6 +1619,8 @@ public:
         ++statistics_.recorded_frames;
         return Ok(empty {});
     }
+
+public:
     void close() {
         compiler_    = None();
         graph_shape_ = None();

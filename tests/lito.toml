@@ -30,6 +30,8 @@ sources = [
   "tests/resources.cppm",
   "tests/scene.cppm",
   "tests/render.cppm",
+  "tests/lighting.cppm",
+  "tests/display.cppm",
   "tests/mipmaps.cppm",
   "tests/controls.cppm",
   "tests/camera.cppm",

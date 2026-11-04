@@ -1,7 +1,9 @@
 export module vecgltf.viewer;
 import :options;
+import :settings;
 import vecgltf;
 import vecgltf.render;
+import vecgltf.display;
 import vui.sdl;
 import vecgltf.viewer.panel;
 import vecgltf.viewer.model;
@@ -49,8 +51,31 @@ int main(int argc, char** argv) {
     }
     auto selected = parsed.unwrap();
     if (selected.is_none()) return 0;
-    auto options = rstd::move(selected).unwrap();
-    auto loaded  = gltf::LoadAsset(options.path.as_str());
+    auto                         options = rstd::move(selected).unwrap();
+    Option<viewer::ViewSettings> settings;
+    if (! options.settings_file.is_empty()) {
+        auto loaded_settings = viewer::LoadViewSettings(options.settings_file.as_str());
+        if (loaded_settings.is_err()) {
+            report(loaded_settings.unwrap_err());
+            return 1;
+        }
+        settings          = Some(loaded_settings.unwrap());
+        const auto& scene = settings->scene;
+        if (! options.render_overrides.exposure)
+            options.render.exposure = settings->display.exposure;
+        if (! options.render_overrides.tone_mapping)
+            options.render.tone_mapping = settings->display.tone_mapping;
+        if (! options.render_overrides.background) options.render.background = scene.background;
+        if (! options.render_overrides.ibl_intensity)
+            options.render.ibl_intensity = scene.ibl_intensity;
+        options.render.background_intensity = scene.background_intensity;
+        options.render.world_to_environment = scene.world_to_environment;
+        options.render.directional_lights   = scene.directional_lights;
+        if (options.render_overrides.direct_light)
+            options.render.directional_lights =
+                gltf::DirectionalLights(Vec<gltf::DirectionalLight> {});
+    }
+    auto loaded = gltf::LoadAsset(options.path.as_str());
     if (loaded.is_err()) {
         report(loaded.unwrap_err());
         return 1;
@@ -151,10 +176,20 @@ int main(int argc, char** argv) {
         report(created.unwrap_err());
         return 1;
     }
-    auto renderer      = created.unwrap();
+    auto                          renderer = created.unwrap();
+    Option<gltf::DisplayRenderer> display;
+    if (settings) {
+        auto next = gltf::DisplayRenderer::create(device);
+        if (next.is_err()) {
+            report(next.unwrap_err());
+            return 1;
+        }
+        display = Some(next.unwrap());
+    }
     auto output_queue  = vrento::vulkan::TextureContext::create(device).unwrap();
     auto output_device = dyn<vrento::texture::TextureDevice>::from_ref(output_queue);
     Option<vrento::texture::TexturePool> output_pool;
+    Option<vrento::texture::TexturePool> radiance_pool;
     VkExtent2D                           output_extent {};
     rstd::uint64_t                       output_version {};
     if (! options.environment.is_empty()) {
@@ -164,6 +199,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto prepared_environment = renderer.set_environment(environment.unwrap());
+        if (prepared_environment.is_err()) {
+            report(prepared_environment.unwrap_err());
+            return 1;
+        }
+    } else if (settings && settings->environment_images) {
+        auto prepared_environment =
+            renderer.set_environment(settings->environment_images.take().unwrap());
         if (prepared_environment.is_err()) {
             report(prepared_environment.unwrap_err());
             return 1;
@@ -503,6 +545,7 @@ int main(int argc, char** argv) {
             output_extent.height != model_extent.height) {
             vrento::texture::TextureDesc description;
             description.extent = { model_extent.width, model_extent.height };
+            if (display) description.format = vrento::TextureFormat::RGBA8_SRGB;
             description.usage =
                 vrento::texture::Usage::Sampled | vrento::texture::Usage::ColorAttachment;
             auto next =
@@ -511,25 +554,88 @@ int main(int argc, char** argv) {
                 rstd::io::eprintln("output allocation kind={}", unsigned(next.unwrap_err().kind));
                 return 1;
             }
-            output_pool   = Some(next.unwrap());
+            output_pool = Some(next.unwrap());
+            if (display) {
+                description.format = vrento::TextureFormat::RGBA16F;
+                auto hdr =
+                    vrento::texture::TexturePool::create(output_device.as_mut_ref(), description);
+                if (hdr.is_err()) {
+                    rstd::io::eprintln("radiance allocation kind={}",
+                                       unsigned(hdr.unwrap_err().kind));
+                    return 1;
+                }
+                radiance_pool = Some(hdr.unwrap());
+            }
             output_extent = model_extent;
         }
-        auto work  = output_queue.Begin().unwrap();
-        auto write = output_pool->acquire().unwrap();
-        auto frame = renderer.record(work, write.view(), prepared, instance, view, options.render);
+        auto                                        write = output_pool->acquire().unwrap();
+        Option<vrento::texture::TexturePool::Write> radiance_write;
+        Option<gltf::SceneOptions>                  scene_options;
+        if (display) {
+            auto resolved = viewer::ResolveSceneOptions(*settings, instance, options.render);
+            if (resolved.is_err()) {
+                report(resolved.unwrap_err());
+                return 1;
+            }
+            scene_options      = Some(resolved.unwrap());
+            radiance_write     = Some(radiance_pool->acquire().unwrap());
+            auto scene_ready   = renderer.prepare_scene_target(radiance_write->view());
+            auto display_ready = display->prepare_target(gltf::DisplayTarget { write.view() });
+            if (scene_ready.is_err()) {
+                report(scene_ready.unwrap_err());
+                return 1;
+            }
+            if (display_ready.is_err()) {
+                report(display_ready.unwrap_err());
+                return 1;
+            }
+            if (scene_ready.unwrap() != vrento::resource_registry::PipelineReadiness::Ready ||
+                display_ready.unwrap() != vrento::resource_registry::PipelineReadiness::Ready) {
+                rstd::io::eprintln("scene or display pipelines are not ready");
+                return 1;
+            }
+        }
+        auto work = output_queue.Begin().unwrap();
+        auto frame =
+            display ? renderer.record_scene(
+                          work, radiance_write->view(), prepared, instance, view, *scene_options)
+                    : renderer.record(work, write.view(), prepared, instance, view, options.render);
         if (frame.is_err()) {
             report(frame.unwrap_err());
             return 1;
+        }
+        if (display) {
+            auto display_options         = settings->display;
+            display_options.exposure     = options.render.exposure;
+            display_options.tone_mapping = options.render.tone_mapping;
+            if (options.render.debug != gltf::DebugView::None) {
+                display_options              = gltf::DisplayOptions {};
+                display_options.tone_mapping = gltf::ToneMapping::Linear;
+            }
+            auto displayed = display->record(work,
+                                             radiance_write->view(),
+                                             gltf::DisplayTarget { write.view() },
+                                             display_options);
+            if (displayed.is_err()) {
+                report(displayed.unwrap_err());
+                return 1;
+            }
         }
         auto submitted = output_queue.Submit(rstd::move(work));
         if (submitted.is_err()) {
             rstd::io::eprintln("model submit kind={}", unsigned(submitted.unwrap_err().kind));
             return 1;
         }
-        auto published = output_pool->publish(rstd::move(write), submitted.unwrap()).unwrap();
+        auto submission = submitted.unwrap();
+        if (radiance_write)
+            radiance_pool->publish(radiance_write.take().unwrap(), submission).unwrap();
+        auto published = output_pool->publish(rstd::move(write), submission).unwrap();
         auto native    = vui::gpu::NativeTextureFrame::wrap(
             rstd::move(published),
-            { .producer_session = producer, .frame_version = ++output_version });
+            { .producer_session = producer,
+              .frame_version    = ++output_version,
+              .color_space =
+                  display ? vui::ContentColorSpace::Srgb : vui::ContentColorSpace::LinearSrgb });
         if (native.is_err() || source.publish(native.unwrap()).is_err()) {
             rstd::io::eprintln("could not publish model frame");
             return 1;
@@ -587,6 +693,7 @@ int main(int argc, char** argv) {
     source.close().unwrap();
     session.close().unwrap();
     renderer.close();
+    if (display) display->close();
     auto shutdown = ui_renderer.shutdown(5'000'000'000ull);
     if (shutdown.is_err()) return gpu_error(shutdown.unwrap_err());
     rstd::io::println(

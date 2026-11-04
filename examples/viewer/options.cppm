@@ -17,7 +17,7 @@ enum class CameraReference
     Node
 };
 struct Options {
-    String   path, capture, environment, camera_path;
+    String   path, capture, environment, camera_path, settings_file;
     unsigned width { 960 }, height { 720 }, frames {}, scene { gltf::invalid_index },
         animation { gltf::invalid_index }, camera { gltf::invalid_index };
     float                time {}, camera_time {}, zoom {}, roll {};
@@ -31,6 +31,9 @@ struct Options {
     gltf::PrepareOptions prepare;
     bool validation {}, headless {}, fixed_time {}, fixed_camera_time {}, camera_play {},
         external_camera {};
+    struct RenderOverrides {
+        bool exposure {}, tone_mapping {}, ibl_intensity {}, background {}, direct_light {};
+    } render_overrides;
 };
 } // namespace viewer
 
@@ -180,6 +183,8 @@ auto ParseOptions(int argc, char** argv) -> Result<Option<Options>, String> {
     auto background  = add_flag(command, "background"_str, "Show the environment"_str);
     auto headless    = add_flag(command, "headless"_str, "Render without a window"_str);
     auto environment = add_value<String>(command, "environment"_str, text_value(), "HDR image"_str);
+    auto settings    = add_value<String>(
+        command, "settings"_str, text_value(), "Lighting and display settings"_str);
     auto capture = add_value<String>(command, "capture"_str, text_value(), "Write a PPM image"_str);
     auto frames  = add_value<u32>(command, "frames"_str, unsigned_value(100000), "Frame count"_str);
     auto scene   = add_value<u32>(command, "scene"_str, unsigned_value(), "Scene index"_str);
@@ -256,6 +261,7 @@ auto ParseOptions(int argc, char** argv) -> Result<Option<Options>, String> {
     Options options;
     options.path = matches.get_one(model).unwrap().unwrap().get().clone();
     copy_text(options.environment, matches, environment);
+    copy_text(options.settings_file, matches, settings);
     copy_text(options.capture, matches, capture);
     copy_text(options.camera_path, matches, camera_path);
     copy_unsigned(options.frames, matches, frames);
@@ -300,6 +306,11 @@ auto ParseOptions(int argc, char** argv) -> Result<Option<Options>, String> {
     if (flag_value(matches, no_direct_light)) options.render.direct_light = None();
     options.fixed_time        = explicitly_set(matches, "time"_str);
     options.fixed_camera_time = explicitly_set(matches, "camera-time"_str);
+    options.render_overrides  = { explicitly_set(matches, "exposure"_str),
+                                  explicitly_set(matches, "tone-map"_str),
+                                  explicitly_set(matches, "ibl-intensity"_str),
+                                  explicitly_set(matches, "background"_str),
+                                  explicitly_set(matches, "no-direct-light"_str) };
     for (auto name : rstd::array<ref<str>, 5> { "camera-position"_str,
                                                 "camera-target"_str,
                                                 "camera-up"_str,

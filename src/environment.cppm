@@ -57,8 +57,10 @@ void append(HdrImage& image, Vec3 color) {
 }
 } // namespace environment_detail
 struct EnvironmentImages {
-    HdrImage      background, diffuse, brdf;
-    Vec<HdrImage> specular;
+    HdrImage              background, diffuse, brdf;
+    Vec<HdrImage>         specular;
+    float                 specular_lod_scale { -1 }, specular_lod_exponent { 1 };
+    vrento::TextureFilter brdf_filter { vrento::TextureFilter::LINEAR };
 };
 auto default_environment() -> HdrImage {
     HdrImage image { 256, 128 };
@@ -150,13 +152,14 @@ auto preprocess_environment(HdrImage source, const LoadTrace& trace = {}) -> Env
 auto upload_environment_image(mut_ref<dyn<vrento::texture::TextureDevice>> device,
                               Vec<HdrImage>                                mips,
                               bool                                         wrap  = true,
-                              const LoadTrace&                             trace = {})
+                              const LoadTrace&                             trace = {},
+                              vrento::TextureFilter filter = vrento::TextureFilter::LINEAR)
     -> Result<vrento::texture::PreparedImage, vrento::texture::Error> {
     LoadScope scope(trace, LoadEvent::EnvironmentImage);
     if (mips.is_empty()) return Err(vrento::texture::Error { vrento::texture::ErrorKind::Invalid });
     auto image                     = Arc<vrento::Image>::make();
     image->header.format           = vrento::TextureFormat::RGBA32F;
-    image->header.sample.minFilter = image->header.sample.magFilter = vrento::TextureFilter::LINEAR;
+    image->header.sample.minFilter = image->header.sample.magFilter = filter;
     image->header.sample.wrapS =
         wrap ? vrento::TextureWrap::REPEAT : vrento::TextureWrap::CLAMP_TO_EDGE;
     image->header.sample.wrapT = vrento::TextureWrap::CLAMP_TO_EDGE;

@@ -10,6 +10,8 @@ import :materials;
 import :resources;
 import :scene;
 import :render;
+import :lighting;
+import :display;
 import :mipmaps;
 import :controls;
 import :camera;

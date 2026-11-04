@@ -12,7 +12,17 @@ layout(location=2) out vec3 relative_position;
 layout(location=3) out vec4 world_tangent;
 layout(location=4) out vec2 texcoords[5];
 layout(location=9) flat out float winding;
-layout(set=0,binding=0) uniform Frame {vec4 eye;vec4 options;mat4 inverse_view_projection;mat4 projection;vec4 light_direction;vec4 light_radiance;vec4 lighting;} frame;
+layout(set=0,binding=0) uniform Frame {
+    vec4 eye;
+    vec4 options;
+    mat4 inverse_view_projection;
+    mat4 projection;
+    vec4 lighting;
+    mat4 world_to_environment;
+    vec4 light_directions[8];
+    vec4 light_radiances[8];
+    vec4 environment_lod;
+} frame;
 layout(set=2,binding=0,std430) readonly buffer Poses {vec4 values[];} pose;
 layout(set=3,binding=0,std430) readonly buffer Morphs {vec4 values[];} morph;
 layout(push_constant) uniform Draw {
