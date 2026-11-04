@@ -15,6 +15,8 @@ rtti = false
 
 [dependencies]
 rstd-std = { version = "0.1.5", pub = true }
+rstd-json = { version = "0.1.5", pub = true }
+licrypto = { version = "0.2.1" }
 vrento = { git = "https://github.com/vecren/vrento.git", pub = true }
 lito-spirv = { version = "0.1.0" }
 
@@ -22,11 +24,12 @@ lito-spirv = { version = "0.1.0" }
 path = "glslangValidator"
 
 [dev-dependencies]
-rstd-bench = { version = "0.1.5" }
+rstd-bench = { version = "0.1.5", features = ["json"] }
+rstd-argparse = { version = "0.1.11" }
 rstd-nostd = { version = "0.1.5", usage = "link" }
 
 [[bench]]
 name = "load"
 module = "vecgltf.bench.load"
-sources = ["benches/load.cppm"]
+sources = ["benches/load.cppm", "benches/options.cppm", "benches/cpu.cppm", "benches/startup.cppm"]
 link-stdlib = false

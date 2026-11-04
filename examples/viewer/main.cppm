@@ -1,4 +1,5 @@
 export module vecgltf.viewer;
+import :options;
 import vecgltf;
 import vecgltf.render;
 import vui.sdl;
@@ -10,161 +11,10 @@ using namespace rstd::prelude;
 using namespace rstd::literals;
 namespace gltf = vecgltf;
 
-enum class CameraReference
-{
-    World,
-    SceneRoot,
-    Node
-};
+using viewer::CameraReference;
 
-struct Options {
-    String   path, capture, environment, camera_path;
-    unsigned width { 960 }, height { 720 }, frames {}, scene { gltf::invalid_index },
-        animation { gltf::invalid_index }, camera { gltf::invalid_index };
-    float                time {}, camera_time {}, zoom {}, roll {};
-    gltf::Vec2           rotate {}, pan {};
-    Option<gltf::Vec3>   camera_position, camera_target;
-    gltf::Vec3           camera_up { 0, 1, 0 };
-    float                camera_fov { 45 };
-    CameraReference      camera_reference { CameraReference::World };
-    unsigned             camera_reference_node {};
-    gltf::RenderOptions  render;
-    gltf::PrepareOptions prepare;
-    bool validation {}, headless {}, fixed_time {}, fixed_camera_time {}, camera_play {},
-        external_camera {};
-};
 auto argument(const char* value) -> ref<str> {
     return rstd::ffi::CStr::from_ptr(value).to_str().unwrap_or(""_str);
-}
-bool parse(int argc, char** argv, Options& options) {
-    for (int i = 1; i < argc; ++i) {
-        auto arg  = argument(argv[i]);
-        auto next = [&]() -> ref<str> {
-            return ++i < argc ? argument(argv[i]) : ""_str;
-        };
-        auto number = [&](unsigned& target) {
-            auto value = rstd::from_str<u32>(next());
-            if (value.is_err()) return false;
-            target = value.unwrap().to_primitive();
-            return true;
-        };
-        auto real = [&](float& target) {
-            auto value = rstd::from_str<f32>(next());
-            if (value.is_err() || ! value.unwrap().is_finite()) return false;
-            target = value.unwrap().to_primitive();
-            return true;
-        };
-        if (arg == "--validation"_str)
-            options.validation = true;
-        else if (arg == "--background"_str)
-            options.render.background = true;
-        else if (arg == "--environment"_str) {
-            options.environment = String::make(next());
-            if (options.environment.is_empty()) return false;
-        } else if (arg == "--headless"_str)
-            options.headless = true;
-        else if (arg == "--capture"_str) {
-            options.capture = String::make(next());
-            if (options.capture.is_empty()) return false;
-        } else if (arg == "--frames"_str) {
-            if (! number(options.frames) || options.frames > 100000) return false;
-        } else if (arg == "--scene"_str) {
-            if (! number(options.scene)) return false;
-        } else if (arg == "--camera"_str) {
-            if (! number(options.camera) || options.camera == gltf::invalid_index) return false;
-        } else if (arg == "--camera-position"_str || arg == "--camera-target"_str ||
-                   arg == "--camera-up"_str) {
-            gltf::Vec3 value;
-            if (! real(value.x) || ! real(value.y) || ! real(value.z)) return false;
-            if (arg == "--camera-position"_str)
-                options.camera_position = Some(value);
-            else if (arg == "--camera-target"_str)
-                options.camera_target = Some(value);
-            else
-                options.camera_up = value;
-            options.external_camera = true;
-        } else if (arg == "--camera-fov"_str) {
-            if (! real(options.camera_fov) || options.camera_fov <= 0 || options.camera_fov >= 180)
-                return false;
-            options.external_camera = true;
-        } else if (arg == "--camera-reference"_str) {
-            auto value = next();
-            if (value == "world"_str)
-                options.camera_reference = CameraReference::World;
-            else if (value == "scene-root"_str)
-                options.camera_reference = CameraReference::SceneRoot;
-            else {
-                auto node = rstd::from_str<u32>(value);
-                if (node.is_err() || node.unwrap() == u32::MAX) return false;
-                options.camera_reference      = CameraReference::Node;
-                options.camera_reference_node = node.unwrap().to_primitive();
-            }
-            options.external_camera = true;
-        } else if (arg == "--camera-path"_str) {
-            options.camera_path = String::make(next());
-            if (options.camera_path.is_empty()) return false;
-        } else if (arg == "--camera-time"_str) {
-            if (! real(options.camera_time) || options.camera_time < 0) return false;
-            options.fixed_camera_time = true;
-        } else if (arg == "--camera-play"_str) {
-            options.camera_play = true;
-        } else if (arg == "--animation"_str) {
-            if (! number(options.animation)) return false;
-        } else if (arg == "--debug"_str) {
-            unsigned value {};
-            if (! number(value) || value > 5) return false;
-            options.render.debug = gltf::DebugView(value);
-        } else if (arg == "--exposure"_str) {
-            auto value = rstd::from_str<f32>(next());
-            if (value.is_err() || ! value.unwrap().is_finite() || value.unwrap() <= f32(0))
-                return false;
-            options.render.exposure = value.unwrap().to_primitive();
-        } else if (arg == "--no-direct-light"_str) {
-            options.render.direct_light = None();
-        } else if (arg == "--anisotropy"_str) {
-            if (! real(options.prepare.max_anisotropy) || options.prepare.max_anisotropy < 1)
-                return false;
-        } else if (arg == "--ibl-intensity"_str) {
-            if (! real(options.render.ibl_intensity) || options.render.ibl_intensity < 0)
-                return false;
-        } else if (arg == "--tone-map"_str) {
-            auto value = next();
-            if (value == "aces"_str)
-                options.render.tone_mapping = gltf::ToneMapping::ACES;
-            else if (value == "reinhard-max"_str)
-                options.render.tone_mapping = gltf::ToneMapping::ReinhardMax;
-            else if (value == "linear"_str)
-                options.render.tone_mapping = gltf::ToneMapping::Linear;
-            else
-                return false;
-        } else if (arg == "--size"_str) {
-            if (! number(options.width) || ! number(options.height)) return false;
-        } else if (arg == "--time"_str) {
-            auto value = rstd::from_str<f32>(next());
-            if (value.is_err() || ! value.unwrap().is_finite()) return false;
-            options.time       = value.unwrap().to_primitive();
-            options.fixed_time = true;
-        } else if (arg == "--zoom"_str) {
-            if (! real(options.zoom)) return false;
-        } else if (arg == "--rotate"_str) {
-            if (! real(options.rotate.x) || ! real(options.rotate.y)) return false;
-        } else if (arg == "--pan"_str) {
-            if (! real(options.pan.x) || ! real(options.pan.y)) return false;
-        } else if (arg == "--roll"_str) {
-            if (! real(options.roll)) return false;
-        } else if (arg.starts_with("-"_str) || ! options.path.is_empty())
-            return false;
-        else
-            options.path = String::make(arg);
-    }
-    if (options.headless && ! options.frames) options.frames = 1;
-    if (options.external_camera &&
-        (options.camera_position.is_none() || options.camera_target.is_none() ||
-         options.camera != gltf::invalid_index || ! options.camera_path.is_empty() ||
-         options.fixed_camera_time || options.camera_play))
-        return false;
-    return ! options.path.is_empty() && options.width && options.height && options.width <= 8192 &&
-           options.height <= 8192 && ! (options.camera_play && options.fixed_camera_time);
 }
 void report(gltf::Error error) {
     rstd::io::eprintln(
@@ -192,24 +42,15 @@ bool capture(vui::gpu::Renderer& renderer, ref<str> path) {
 }
 
 int main(int argc, char** argv) {
-    Options options;
-    if (! parse(argc, argv, options)) {
-        rstd::io::eprintln("usage: vecgltf-viewer model.gltf|model.glb [--headless] [--size W H] "
-                           "[--frames N] [--capture image.ppm] [--scene N] [--camera node] "
-                           "[--camera-position X Y Z --camera-target X Y Z "
-                           "[--camera-up X Y Z] [--camera-fov degrees] "
-                           "[--camera-reference world|scene-root|node]] "
-                           "[--camera-path track.json] [--camera-time seconds | --camera-play] "
-                           "[--animation N] "
-                           "[--time seconds] [--zoom steps] [--rotate yaw pitch] [--pan x y] "
-                           "[--roll radians] "
-                           "[--environment image.hdr] [--background] [--exposure scale] "
-                           "[--no-direct-light] [--ibl-intensity scale] [--anisotropy limit] "
-                           "[--tone-map aces|reinhard-max|linear] "
-                           "[--debug 0..5] [--validation]");
+    auto parsed = viewer::ParseOptions(argc, argv);
+    if (parsed.is_err()) {
+        rstd::io::eprintln("{}", parsed.unwrap_err());
         return 2;
     }
-    auto loaded = gltf::LoadAsset(options.path.as_str());
+    auto selected = parsed.unwrap();
+    if (selected.is_none()) return 0;
+    auto options = rstd::move(selected).unwrap();
+    auto loaded  = gltf::LoadAsset(options.path.as_str());
     if (loaded.is_err()) {
         report(loaded.unwrap_err());
         return 1;

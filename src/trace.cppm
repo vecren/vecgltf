@@ -33,6 +33,9 @@ enum class LoadEvent
     ImagePrepare,
     Uploads,
     GpuMipmaps,
+    ResourceRead,
+    DocumentParse,
+    Accessor,
     Count
 };
 

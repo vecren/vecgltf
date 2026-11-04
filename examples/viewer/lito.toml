@@ -11,6 +11,7 @@ rtti = false
 [dependencies]
 vecgltf = { path = "../.." }
 rstd-json = { version = "0.1.5" }
+rstd-argparse = { version = "0.1.11" }
 rstd-nostd = { version = "0.1.5", usage = "link" }
 vui-render = { version = "0.1.0" }
 vui-sdl = { version = "0.1.0" }

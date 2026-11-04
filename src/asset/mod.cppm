@@ -1,6 +1,7 @@
 export module vecgltf.asset;
 export import vecgltf.math;
 export import rstd;
+export import vecgltf.metadata;
 
 export namespace vecgltf
 {
@@ -53,7 +54,8 @@ struct Vertex {
     Vec4     weights {};
 };
 struct MorphTarget {
-    Vec<Vec3> positions, normals, tangents;
+    Vec<Vec3>      positions, normals, tangents;
+    SourceObjectId source;
 };
 struct TexcoordSet {
     unsigned  index {};
@@ -67,6 +69,7 @@ struct Primitive {
     bool             indexed {}, skin_attributes {};
     Bounds           bounds;
     Vec<TexcoordSet> extra_texcoords;
+    SourceObjectId   source;
     auto             texcoord(unsigned set, unsigned vertex) const -> Option<Vec2> {
         if (vertex >= count(vertices)) return None();
         if (set == 0) return Some(Vec2(at(vertices, vertex).uv0));
@@ -81,11 +84,13 @@ struct Mesh {
     String         name;
     Vec<Primitive> primitives;
     Vec<float>     weights;
+    SourceObjectId source;
 };
 struct Image {
-    String   name;
-    unsigned width {}, height {};
-    Vec<u8>  rgba;
+    String         name;
+    unsigned       width {}, height {};
+    Vec<u8>        rgba;
+    SourceObjectId source;
 };
 enum class Wrap
 {
@@ -105,13 +110,15 @@ enum class MipFilter
     Linear
 };
 struct Sampler {
-    Wrap      s { Wrap::Repeat }, t { Wrap::Repeat };
-    Filter    min { Filter::Linear }, mag { Filter::Linear };
-    MipFilter mip { MipFilter::Linear };
+    Wrap           s { Wrap::Repeat }, t { Wrap::Repeat };
+    Filter         min { Filter::Linear }, mag { Filter::Linear };
+    MipFilter      mip { MipFilter::Linear };
+    SourceObjectId source;
 };
 struct Texture {
-    unsigned image { invalid_index };
-    Sampler  sampler;
+    unsigned       image { invalid_index };
+    Sampler        sampler;
+    SourceObjectId source;
 };
 struct TextureBinding {
     unsigned texture { invalid_index }, uv {};
@@ -138,33 +145,39 @@ struct Material {
     MaterialWorkflow workflow { MaterialWorkflow::MetallicRoughness };
     AlphaMode        alpha { AlphaMode::Opaque };
     bool             double_sided {}, unlit {};
+    SourceObjectId   source;
 };
 struct Node {
     String   name;
     unsigned parent { invalid_index }, mesh { invalid_index }, skin { invalid_index },
         camera { invalid_index };
-    Vec<unsigned> children;
-    Vec3          translation {}, scale { 1, 1, 1 };
-    Vec4          rotation { 0, 0, 0, 1 };
-    Mat4          matrix { Mat4::Identity() };
-    bool          has_matrix {};
-    Vec<float>    weights;
+    Vec<unsigned>  children;
+    Vec3           translation {}, scale { 1, 1, 1 };
+    Vec4           rotation { 0, 0, 0, 1 };
+    Mat4           matrix { Mat4::Identity() };
+    bool           has_matrix {};
+    Vec<float>     weights;
+    SourceObjectId source;
 };
 struct Scene {
-    String        name;
-    Vec<unsigned> roots;
+    String         name;
+    Vec<unsigned>  roots;
+    SourceObjectId source;
 };
 struct Skin {
-    String        name;
-    Vec<unsigned> joints;
-    Vec<Mat4>     inverse_bind;
+    String         name;
+    Vec<unsigned>  joints;
+    Vec<Mat4>      inverse_bind;
+    unsigned       skeleton { invalid_index };
+    SourceObjectId source;
 };
 struct CameraProjection {
     bool  orthographic {};
     float yfov { 0.785398f }, aspect {}, near { 0.01f }, far {}, xmag { 1 }, ymag { 1 };
 };
 struct Camera : CameraProjection {
-    String name;
+    String         name;
+    SourceObjectId source;
 };
 enum class Interpolation
 {
@@ -180,36 +193,46 @@ enum class AnimationPath
     Weights
 };
 struct AnimationSampler {
-    Interpolation interpolation { Interpolation::Linear };
-    Vec<float>    times, values;
-    unsigned      components {};
+    Interpolation  interpolation { Interpolation::Linear };
+    Vec<float>     times, values;
+    unsigned       components {};
+    SourceObjectId source;
 };
 struct AnimationChannel {
-    unsigned      node {}, sampler {};
-    AnimationPath path;
+    unsigned       node {}, sampler {};
+    AnimationPath  path;
+    SourceObjectId source;
 };
 struct Animation {
     String                name;
     Vec<AnimationSampler> samplers;
     Vec<AnimationChannel> channels;
     float                 start {}, end {};
+    SourceObjectId        source;
 };
 struct Asset {
-    u64             generation {};
-    String          source;
-    unsigned        default_scene {};
-    Vec<Mesh>       meshes;
-    Vec<Material>   materials;
-    Vec<Image>      images;
-    Vec<Texture>    textures;
-    Vec<Node>       nodes;
-    Vec<Scene>      scenes;
-    Vec<Skin>       skins;
-    Vec<Camera>     cameras;
-    Vec<Animation>  animations;
-    Vec<Diagnostic> diagnostics;
-    AssetId         node_id(unsigned index) const { return { index, generation }; }
-    auto            node(AssetId id) const -> Option<ref<Node>> {
+    u64                   generation {};
+    String                source;
+    unsigned              default_scene {};
+    Vec<Mesh>             meshes;
+    Vec<Material>         materials;
+    Vec<Image>            images;
+    Vec<Texture>          textures;
+    Vec<Node>             nodes;
+    Vec<Scene>            scenes;
+    Vec<Skin>             skins;
+    Vec<Camera>           cameras;
+    Vec<Animation>        animations;
+    Vec<Diagnostic>       diagnostics;
+    Option<MetadataOwner> source_metadata;
+    auto                  metadata() const -> Option<MetadataOwner> {
+        return source_metadata ? Some(source_metadata->clone()) : None();
+    }
+    auto metadata(SourceObjectId id) const -> Option<MetadataView> {
+        return source_metadata ? source_metadata->view(id) : None();
+    }
+    AssetId node_id(unsigned index) const { return { index, generation }; }
+    auto    node(AssetId id) const -> Option<ref<Node>> {
         if (id.generation != generation || id.index >= count(nodes)) return None();
         return Some(ref<Node>::from_raw_parts(&at(nodes, id.index)));
     }
