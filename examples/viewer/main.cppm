@@ -77,6 +77,21 @@ bool parse(int argc, char** argv, Options& options) {
             if (value.is_err() || ! value.unwrap().is_finite() || value.unwrap() <= f32(0))
                 return false;
             options.render.exposure = value.unwrap().to_primitive();
+        } else if (arg == "--no-direct-light"_str) {
+            options.render.direct_light = None();
+        } else if (arg == "--ibl-intensity"_str) {
+            if (! real(options.render.ibl_intensity) || options.render.ibl_intensity < 0)
+                return false;
+        } else if (arg == "--tone-map"_str) {
+            auto value = next();
+            if (value == "aces"_str)
+                options.render.tone_mapping = gltf::ToneMapping::ACES;
+            else if (value == "reinhard-max"_str)
+                options.render.tone_mapping = gltf::ToneMapping::ReinhardMax;
+            else if (value == "linear"_str)
+                options.render.tone_mapping = gltf::ToneMapping::Linear;
+            else
+                return false;
         } else if (arg == "--size"_str) {
             if (! number(options.width) || ! number(options.height)) return false;
         } else if (arg == "--time"_str) {
@@ -136,6 +151,8 @@ int main(int argc, char** argv) {
                            "[--time seconds] [--zoom steps] [--rotate yaw pitch] [--pan x y] "
                            "[--roll radians] "
                            "[--environment image.hdr] [--background] [--exposure scale] "
+                           "[--no-direct-light] [--ibl-intensity scale] "
+                           "[--tone-map aces|reinhard-max|linear] "
                            "[--debug 0..5] [--validation]");
         return 2;
     }

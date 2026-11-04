@@ -616,6 +616,152 @@ TEST(Render, MaterialWorkflows) {
     rstd_assert(session.validation_errors() == 0);
 }
 
+TEST(Render, LightingOptions) {
+    namespace vk      = vrento::vulkan;
+    namespace tex     = vrento::texture;
+    auto     session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto     queue    = vk::TextureContext::create(session).unwrap();
+    auto     renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    HdrImage environment { 4, 2 };
+    for (unsigned i = 0; i < 8; ++i) {
+        environment.rgba.push(0.5f);
+        environment.rgba.push(0.5f);
+        environment.rgba.push(0.5f);
+        environment.rgba.push(1.0f);
+    }
+    renderer.set_environment(rstd::move(environment)).unwrap();
+    tex::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.format = vrento::TextureFormat::RGBA8;
+    desc.usage  = tex::Usage::ColorAttachment | tex::Usage::Sampled | tex::Usage::TransferSource;
+    auto target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    View view { look_at({ 0, 0, 2 }, {}), perspective(0.8f, 1, 0.1f, 10), { 0, 0, 2 } };
+    auto draw = [&](Arc<Asset> asset, RenderOptions options = {}) {
+        auto          prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneInstance instance(asset.clone());
+        auto          work = queue.Begin().unwrap();
+        renderer.record(work, target, prepared, instance, view, options).unwrap();
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        return read_pixels(session, queue, target);
+    };
+    auto center = [](const Vec<u8>& pixels, unsigned channel) {
+        return pixels[usize((32 * 64 + 32) * 4 + channel)].to_primitive();
+    };
+    auto  asset          = triangle({ 0.6f, 0.3f, 0.15f, 1 });
+    auto& material       = at(asset->materials, 0);
+    material.unlit       = false;
+    material.metallic    = 0;
+    material.roughness   = 1;
+    auto defaults        = draw(asset.clone());
+    auto legacy          = draw(asset.clone(), { 1, DebugView::None, false });
+    auto explicit_values = draw(asset.clone(),
+                                { 1,
+                                  DebugView::None,
+                                  false,
+                                  Some(DirectionalLight { { 0.3f, 0.7f, 1 }, { 1, 1, 1 }, 3 }),
+                                  1,
+                                  ToneMapping::ACES });
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        near(center(defaults, channel), center(legacy, channel));
+        near(center(defaults, channel), center(explicit_values, channel));
+    }
+    RenderOptions options;
+    options.direct_light  = None();
+    options.tone_mapping  = ToneMapping::Linear;
+    auto indirect         = draw(asset.clone(), options);
+    options.ibl_intensity = 0.5f;
+    auto half_indirect    = draw(asset.clone(), options);
+    options.ibl_intensity = 0;
+    auto dark             = draw(asset.clone(), options);
+    for (unsigned channel = 0; channel < 3; ++channel) {
+        rstd_assert(center(indirect, channel) > 10);
+        near(center(half_indirect, channel) * 2, center(indirect, channel));
+        near(center(dark, channel), 0);
+    }
+    options.direct_light = Some(DirectionalLight { { 0, 0, 100 }, { 1, 0, 0 }, 0.5f });
+    auto red_light       = draw(asset.clone(), options);
+    rstd_assert(center(red_light, 0) > 10);
+    near(center(red_light, 1), 0);
+    near(center(red_light, 2), 0);
+    options.direct_light = Some(DirectionalLight { { 1, 2, 1 }, { 1, 0, 0 }, 0.5f });
+    auto angled_light    = draw(asset.clone(), options);
+    rstd_assert(center(angled_light, 0) > 0 && center(angled_light, 0) < center(red_light, 0));
+    options.direct_light = Some(DirectionalLight { { 1e-40f, 2e-40f, 1e-40f }, { 1, 0, 0 }, 0.5f });
+    auto small_direction = draw(asset.clone(), options);
+    for (unsigned channel = 0; channel < 3; ++channel)
+        near(center(small_direction, channel), center(angled_light, channel));
+    options.direct_light = Some(DirectionalLight { { 0, 0, 1 }, { 3e38f, 3e38f, 3e38f }, 0 });
+    auto zero_intensity  = draw(asset.clone(), options);
+    for (unsigned channel = 0; channel < 3; ++channel) near(center(zero_intensity, channel), 0);
+    options.direct_light = Some(DirectionalLight { { 0, 0, -1 }, { 1, 0, 0 }, 0.5f });
+    auto back_light      = draw(asset.clone(), options);
+    near(center(back_light, 0), 0);
+
+    auto  glossy              = triangle({ 0, 0, 0, 1 });
+    auto& glossy_material     = at(glossy->materials, 0);
+    glossy_material.unlit     = false;
+    glossy_material.metallic  = 0;
+    glossy_material.roughness = 0.04f;
+    options.direct_light      = Some(DirectionalLight { { 0, 0, 1 }, { 1, 0, 0 }, 1 });
+    auto specular_light       = draw(glossy.clone(), options);
+    rstd_assert(center(specular_light, 0) > 200);
+    options.direct_light = Some(DirectionalLight { { 0, 0, 1 }, { 1e38f, 0, 0 }, 1e-38f });
+    auto scaled_radiance = draw(glossy.clone(), options);
+    for (unsigned channel = 0; channel < 3; ++channel)
+        near(center(scaled_radiance, channel), center(specular_light, channel));
+
+    auto  emitter        = triangle({ 0, 0, 0, 1 });
+    auto& emission       = at(emitter->materials, 0);
+    emission.unlit       = false;
+    emission.metallic    = 0;
+    emission.roughness   = 1;
+    emission.emissive    = { 0.8f, 0.4f, 0.2f };
+    options.direct_light = None();
+    options.exposure     = 0.5f;
+    options.background   = true;
+    struct MappingSample {
+        ToneMapping mapping;
+        unsigned    color[3], background;
+    };
+    MappingSample mappings[] { { ToneMapping::ACES, { 138, 76, 32 }, 95 },
+                               { ToneMapping::ReinhardMax, { 73, 36, 18 }, 51 },
+                               { ToneMapping::Linear, { 102, 51, 26 }, 64 } };
+    for (const auto& sample : mappings) {
+        options.tone_mapping = sample.mapping;
+        const auto pixels    = draw(emitter.clone(), options);
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            near(center(pixels, channel), sample.color[channel]);
+            near(pixels[usize(channel)].to_primitive(), sample.background);
+        }
+    }
+    auto          prepared = renderer.prepare(emitter.clone()).unwrap();
+    SceneInstance instance(emitter.clone());
+    auto          rejected = [&](RenderOptions invalid) {
+        auto work   = queue.Begin().unwrap();
+        auto result = renderer.record(work, target, prepared, instance, view, invalid);
+        rstd_assert(result.is_err() && result.unwrap_err().kind == ErrorKind::InvalidAsset);
+    };
+    auto invalid          = options;
+    invalid.ibl_intensity = -1;
+    rejected(invalid);
+    invalid          = options;
+    invalid.exposure = __builtin_inff();
+    rejected(invalid);
+    invalid              = options;
+    invalid.tone_mapping = ToneMapping(99);
+    rejected(invalid);
+    invalid              = options;
+    invalid.direct_light = Some(DirectionalLight { {}, { 1, 1, 1 }, 1 });
+    rejected(invalid);
+    invalid.direct_light = Some(DirectionalLight { { 0, 0, 1 }, { -1, 1, 1 }, 1 });
+    rejected(invalid);
+    invalid.direct_light = Some(DirectionalLight { { 0, 0, 1 }, { 1, 1, 1 }, -1 });
+    rejected(invalid);
+    invalid.direct_light = Some(DirectionalLight { { __builtin_nanf(""), 0, 1 }, { 1, 1, 1 }, 1 });
+    rejected(invalid);
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(Render, BlendOcclusion) {
     namespace vk              = vrento::vulkan;
     namespace tex             = vrento::texture;

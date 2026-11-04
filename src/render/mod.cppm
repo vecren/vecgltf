@@ -156,7 +156,9 @@ struct MaterialParameters {
 struct FrameParameters {
     Vec4 eye, options;
     Mat4 inverse_view_projection, projection;
+    Vec4 light_direction, light_radiance, lighting;
 };
+static_assert(sizeof(FrameParameters) == 208);
 struct PreparedEnvironment {
     Arc<RenderCore>                          core;
     Vec<Arc<vrento::texture::PreparedImage>> textures;
@@ -576,10 +578,26 @@ enum class DebugView
     Roughness,
     Emissive
 };
+struct DirectionalLight {
+    // World-space direction toward the light; magnitude does not affect intensity.
+    Vec3  direction { 0.3f, 0.7f, 1 };
+    Vec3  color { 1, 1, 1 };
+    float intensity { 3 };
+};
+enum class ToneMapping
+{
+    ACES,
+    ReinhardMax,
+    Linear
+};
 struct RenderOptions {
-    float     exposure { 1 };
-    DebugView debug {};
-    bool      background {};
+    float                    exposure { 1 };
+    DebugView                debug {};
+    bool                     background {};
+    Option<DirectionalLight> direct_light { Some(DirectionalLight {}) };
+    // Scales indirect illumination; the visible background retains its source radiance.
+    float       ibl_intensity { 1 };
+    ToneMapping tone_mapping { ToneMapping::ACES };
 };
 enum class DepthEncoding
 {
@@ -978,6 +996,45 @@ public:
             return Err(render_error("record"_str,
                                     "previous model submission has not been accepted"_str,
                                     ErrorKind::Busy));
+        auto non_negative = [](float value) {
+            return rstd::f32(value).is_finite() && value >= 0;
+        };
+        if (! non_negative(options.exposure) || ! non_negative(options.ibl_intensity) ||
+            (options.tone_mapping != ToneMapping::ACES &&
+             options.tone_mapping != ToneMapping::ReinhardMax &&
+             options.tone_mapping != ToneMapping::Linear))
+            return Err(render_error("render options"_str,
+                                    "invalid exposure, IBL intensity or tone mapping"_str,
+                                    ErrorKind::InvalidAsset));
+        Vec3 light_direction { 0, 0, 1 };
+        Vec4 light_radiance {};
+        if (options.direct_light) {
+            const auto& light = *options.direct_light;
+            if (! rstd::f32(light.direction.x).is_finite() ||
+                ! rstd::f32(light.direction.y).is_finite() ||
+                ! rstd::f32(light.direction.z).is_finite() || ! non_negative(light.color.x) ||
+                ! non_negative(light.color.y) || ! non_negative(light.color.z) ||
+                ! non_negative(light.intensity) ||
+                ! non_negative(light.color.x * light.intensity) ||
+                ! non_negative(light.color.y * light.intensity) ||
+                ! non_negative(light.color.z * light.intensity))
+                return Err(render_error("render options"_str,
+                                        "invalid directional light"_str,
+                                        ErrorKind::InvalidAsset));
+            float scale =
+                maximum(absolute(light.direction.x),
+                        maximum(absolute(light.direction.y), absolute(light.direction.z)));
+            if (scale == 0)
+                return Err(render_error("render options"_str,
+                                        "directional light direction must be nonzero"_str,
+                                        ErrorKind::InvalidAsset));
+            light_direction = normalized(Vec3 {
+                light.direction.x / scale, light.direction.y / scale, light.direction.z / scale });
+            light_radiance  = { light.color.x * light.intensity,
+                                light.color.y * light.intensity,
+                                light.color.z * light.intensity,
+                                0 };
+        }
         const auto& target_desc = target.texture().description();
         auto        range       = target.description().range;
         if ((target_desc.format != vrento::TextureFormat::RGBA8 &&
@@ -1077,7 +1134,10 @@ public:
               options.background ? 1.0f : 0.0f,
               7 },
             (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity()),
-            reversed_depth ? reversed_projection(view.projection) : view.projection
+            reversed_depth ? reversed_projection(view.projection) : view.projection,
+            { light_direction.x, light_direction.y, light_direction.z, 0 },
+            light_radiance,
+            { options.ibl_intensity, float(unsigned(options.tone_mapping)), 0, 0 }
         };
         resources->frame_buffer = core_->buffers.Allocate(
             { sizeof(FrameParameters),

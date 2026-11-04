@@ -6,7 +6,7 @@ layout(location=3) in vec4 world_tangent;
 layout(location=4) in vec2 texcoords[5];
 layout(location=9) flat in float winding;
 layout(location=0) out vec4 result;
-layout(set=0,binding=0) uniform Frame {vec4 eye;vec4 options;mat4 inverse_view_projection;mat4 projection;} frame;
+layout(set=0,binding=0) uniform Frame {vec4 eye;vec4 options;mat4 inverse_view_projection;mat4 projection;vec4 light_direction;vec4 light_radiance;vec4 lighting;} frame;
 layout(set=0,binding=1) uniform sampler2D specular_environment;
 layout(set=0,binding=2) uniform sampler2D diffuse_environment;
 layout(set=0,binding=3) uniform sampler2D brdf_lut;
@@ -56,6 +56,8 @@ vec2 environment_uv(vec3 direction) {
 }
 vec3 tone_map(vec3 color) {
     color*=frame.options.x;
+    if(frame.lighting.y==1) return color/(1+max(max(color.r,color.g),color.b));
+    if(frame.lighting.y==2) return color;
     return clamp((color*(2.51*color+0.03))/(color*(2.43*color+0.59)+0.14),0,1);
 }
 void main() {
@@ -78,8 +80,9 @@ void main() {
     vec3 n=mapped_normal(normalize(world_normal));
     if(!front) n=-n;
     vec3 v=normalize(frame.eye.xyz-relative_position);
-    vec3 l=normalize(vec3(0.3,0.7,1));
-    vec3 h=normalize(v+l);
+    vec3 l=frame.light_direction.xyz;
+    vec3 h=v+l;
+    h=dot(h,h)>0 ? normalize(h):n;
     vec4 physical=texture(physical_texture,uv(1));
     bool specular_glossiness=(shading&2)!=0;
     float metallic=specular_glossiness ? 0:clamp(material.factors.x*physical.b,0,1);
@@ -94,7 +97,7 @@ void main() {
     float visibility=0.5/max(nl*sqrt(nv*nv*(1-a2)+a2)+nv*sqrt(nl*nl*(1-a2)+a2),0.0001);
     vec3 diffuse_fresnel=specular_glossiness ? fresnel:vec3(0.04+0.96*pow(1-vh,5));
     vec3 diffuse=(1-diffuse_fresnel)*diffuse_color/pi;
-    vec3 color=(diffuse+distribution*visibility*fresnel)*nl*3;
+    vec3 color=(diffuse+distribution*visibility*fresnel)*nl*frame.light_radiance.rgb;
     float occlusion=mix(1,texture(occlusion_texture,uv(3)).r,material.factors.w);
     vec3 reflected=reflect(-v,n);
     vec3 irradiance=texture(diffuse_environment,environment_uv(n)).rgb;
@@ -102,7 +105,7 @@ void main() {
     vec2 integrated=texture(brdf_lut,vec2(nv,roughness)).rg;
     vec3 diffuse_f0=specular_glossiness ? f0:vec3(0.04);
     vec3 ambient_fresnel=diffuse_f0+(max(vec3(1-roughness),diffuse_f0)-diffuse_f0)*pow(1-nv,5);
-    color+=((1-ambient_fresnel)*diffuse_color*irradiance+prefiltered*(f0*integrated.x+integrated.y))*occlusion;
+    color+=((1-ambient_fresnel)*diffuse_color*irradiance+prefiltered*(f0*integrated.x+integrated.y))*occlusion*frame.lighting.x;
     color+=material.emissive.rgb*texture(emissive_texture,uv(4)).rgb;
     if(debug_view==1) color=base.rgb;
     if(debug_view==2) color=n*0.5+0.5;
