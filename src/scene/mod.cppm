@@ -169,12 +169,18 @@ public:
     const NodePose& pose(unsigned node) const { return at(poses_, node); }
     bool     visible(unsigned node) const { return node < count(visible_) && at(visible_, node); }
     unsigned scene() const { return scene_; }
-    unsigned animation() const { return animation_; }
-    float    time() const { return time_; }
-    bool     playing() const { return playing_; }
-    void     set_playing(bool value) { playing_ = value; }
-    void     set_looping(bool value) { looping_ = value; }
-    u64      revision() const { return revision_; }
+    auto     scene_root() const -> Option<AssetId> {
+        if (scene_ >= count(asset_->scenes)) return None();
+        const auto& roots = at(asset_->scenes, scene_).roots;
+        if (roots.len() != usize(1) || ! visible(at(roots, 0))) return None();
+        return Some(asset_->node_id(at(roots, 0)));
+    }
+    unsigned      animation() const { return animation_; }
+    float         time() const { return time_; }
+    bool          playing() const { return playing_; }
+    void          set_playing(bool value) { playing_ = value; }
+    void          set_looping(bool value) { looping_ = value; }
+    u64           revision() const { return revision_; }
     const Bounds& bounds() const { return bounds_; }
     auto          camera_frame(AssetId id, float focus_distance = 1) const -> Option<CameraFrame> {
         auto node = asset_->node(id);
@@ -183,6 +189,41 @@ public:
             return None();
         const auto& camera = at(asset_->cameras, (**node).camera);
         return vecgltf::camera_frame(pose(id.index).world, camera, focus_distance);
+    }
+    // None uses world space; otherwise positions and projection lengths use the node's local units.
+    auto camera_frame(CameraLookAt     value,
+                      CameraProjection projection = {},
+                      Vec3             up         = { 0, 1, 0 },
+                      Option<AssetId>  reference  = None()) const -> Option<CameraFrame> {
+        auto local = vecgltf::camera_frame(value, projection, up);
+        if (local.is_none() || reference.is_none()) return local;
+        auto id = reference.unwrap();
+        if (asset_->node(id).is_none() || ! visible(id.index)) return None();
+        const auto& world = pose(id.index).world;
+        if (vecgltf::camera_frame(world, projection).is_none()) return None();
+        double squared[3] {};
+        for (unsigned column = 0; column < 3; ++column)
+            for (unsigned row = 0; row < 3; ++row) {
+                double component = world.m[column * 4 + row];
+                squared[column] += component * component;
+            }
+        for (unsigned column = 1; column < 3; ++column)
+            if (squared[column] < squared[0] * 0.9999 || squared[column] > squared[0] * 1.0001)
+                return None();
+        double scale   = rstd::f64(squared[0]).sqrt().to_primitive();
+        auto   convert = [&](float& length) {
+            double converted = double(length) * scale;
+            double limit     = rstd::f32::MAX.to_primitive();
+            if (converted < -limit || converted > limit) return false;
+            length = float(converted);
+            return true;
+        };
+        float focus_distance = local->focus_distance;
+        if (! convert(projection.near) || ! convert(projection.far) || ! convert(focus_distance) ||
+            (projection.orthographic && (! convert(projection.xmag) || ! convert(projection.ymag))))
+            return None();
+        auto camera_world = world * compose(local->position, local->orientation, { 1, 1, 1 });
+        return vecgltf::camera_frame(camera_world, projection, focus_distance);
     }
     auto camera_view(AssetId id, float aspect) const -> Option<View> {
         auto frame = camera_frame(id);

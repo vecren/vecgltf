@@ -102,6 +102,70 @@ auto read_pixels(vrento::vulkan::DeviceSession   session,
         pixels.push(u8(static_cast<unsigned char*>(mapped.data())[i]));
     return pixels;
 }
+TEST(Render, PrepareSampling) {
+    namespace vk   = vrento::vulkan;
+    namespace tex  = vrento::texture;
+    auto  session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto  queue    = vk::TextureContext::create(session).unwrap();
+    auto  renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    auto  asset    = triangle({ 1, 1, 1, 1 });
+    Image image;
+    image.width = image.height = 4;
+    unsigned texel[] { 64, 128, 192, 255 };
+    for (unsigned i = 0; i < 16; ++i)
+        for (unsigned value : texel) image.rgba.push(u8(value));
+    asset->images.push(rstd::move(image));
+    Texture texture;
+    texture.image       = 0;
+    texture.sampler.min = texture.sampler.mag = Filter::Linear;
+    texture.sampler.mip                       = MipFilter::Linear;
+    asset->textures.push(rstd::move(texture));
+    at(asset->materials, 0).base.texture = 0;
+    const auto prepared_assets           = renderer.statistics().prepared_assets;
+    const auto asset_bytes               = renderer.statistics().asset_buffer_bytes;
+    const auto uploads                   = renderer.upload_statistics();
+    float invalid[] { 0, -1, rstd::f32::INFINITY_.to_primitive(), rstd::f32::NAN_.to_primitive() };
+    for (float value : invalid) {
+        auto rejected = renderer.prepare(asset.clone(), PrepareOptions { value });
+        rstd_assert(rejected.is_err() && rejected.unwrap_err().kind == ErrorKind::InvalidAsset);
+        rstd_assert(renderer.statistics().prepared_assets == prepared_assets);
+        rstd_assert(renderer.statistics().asset_buffer_bytes == asset_bytes);
+        const auto unchanged = renderer.upload_statistics();
+        for (unsigned i = 0; i < 5; ++i) {
+            rstd_assert(unchanged.queued_copies[i] == uploads.queued_copies[i]);
+            rstd_assert(unchanged.queued_bytes[i] == uploads.queued_bytes[i]);
+            rstd_assert(unchanged.recorded_copies[i] == uploads.recorded_copies[i]);
+            rstd_assert(unchanged.recorded_bytes[i] == uploads.recorded_bytes[i]);
+        }
+    }
+    tex::TextureDesc desc;
+    desc.extent = { 64, 64 };
+    desc.format = vrento::TextureFormat::RGBA8_SRGB;
+    desc.usage  = tex::Usage::ColorAttachment | tex::Usage::Sampled | tex::Usage::TransferSource;
+    auto          target = queue.CreateView(queue.CreateTexture(desc).unwrap(), {}).unwrap();
+    SceneInstance instance(asset.clone());
+    View          view { look_at({ 0, 0, 2 }, {}), perspective(0.8f, 1, 0.1f, 10), { 0, 0, 2 } };
+    auto          draw = [&](const PreparedAsset& prepared) {
+        auto work = queue.Begin().unwrap();
+        renderer.record(work, target, prepared, instance, view, { 1, DebugView::BaseColor })
+            .unwrap();
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        return read_pixels(session, queue, target);
+    };
+    auto defaults     = draw(renderer.prepare(asset.clone()).unwrap());
+    auto explicit_one = draw(renderer.prepare(asset.clone(), PrepareOptions { 1 }).unwrap());
+    auto limited      = draw(
+        renderer.prepare(asset.clone(), PrepareOptions { rstd::f32::MAX.to_primitive() }).unwrap());
+    unsigned expected[] { 64, 128, 192, 255 };
+    for (unsigned channel = 0; channel < 4; ++channel) {
+        auto index = usize((32 * 64 + 32) * 4 + channel);
+        near(u8(defaults[index]).to_primitive(), expected[channel]);
+        near(u8(explicit_one[index]).to_primitive(), u8(defaults[index]).to_primitive());
+        near(u8(limited[index]).to_primitive(), u8(defaults[index]).to_primitive());
+    }
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(Render, PreparationTimings) {
     namespace vk = vrento::vulkan;
     using vrento::resource_registry::PipelineReadiness;

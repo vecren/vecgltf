@@ -321,4 +321,127 @@ TEST(Scene, CameraFrames) {
     instance.set_time(1);
     rstd_assert(instance.camera_frame(asset->node_id(2)).is_none());
 }
+TEST(Scene, CameraReference) {
+    auto asset        = Arc<Asset>::make();
+    asset->generation = u64(11);
+    Node root;
+    root.translation = { 10, 20, 30 };
+    root.rotation    = { -0.70710678f, 0, 0, 0.70710678f };
+    root.scale       = { 2, 2, 2 };
+    root.children.push(1);
+    asset->nodes.push(rstd::move(root));
+    Node child;
+    child.parent      = 0;
+    child.translation = { 1, 0, 0 };
+    asset->nodes.push(rstd::move(child));
+    asset->nodes.push(Node {});
+    Scene scene;
+    scene.roots.push(0);
+    asset->scenes.push(rstd::move(scene));
+    Scene multiple;
+    multiple.roots.push(0);
+    multiple.roots.push(2);
+    asset->scenes.push(rstd::move(multiple));
+    asset->scenes.push(Scene {});
+    SceneInstance instance(asset.clone());
+    auto          reference = instance.scene_root().unwrap();
+    rstd_assert(reference.index == 0 && reference.generation == asset->generation);
+    CameraLookAt     look { { 1, 2, 3 }, { 1, 4, 3 } };
+    CameraProjection projection;
+    projection.yfov   = 1.1f;
+    projection.aspect = 1.7f;
+    projection.near   = 0.25f;
+    projection.far    = 40;
+    auto world        = instance.camera_frame(look, projection, { 0, 0, 1 }).unwrap();
+    same_view(world.view(1).unwrap(),
+              camera_frame(look, projection, { 0, 0, 1 }).unwrap().view(1).unwrap());
+    auto frame = instance.camera_frame(look, projection, { 0, 0, 1 }, Some(reference)).unwrap();
+    auto expected_projection = projection;
+    expected_projection.near = 0.5f;
+    expected_projection.far  = 80;
+    auto expected            = camera_frame(CameraLookAt { { 12, 26, 26 }, { 12, 26, 22 } },
+                                            expected_projection,
+                                            { 0, 1, 0 })
+                                   .unwrap();
+    same_view(frame.view(1).unwrap(), expected.view(1).unwrap());
+    near(frame.focus_distance, 4);
+    near(frame.projection.yfov, projection.yfov);
+    near(frame.projection.aspect, projection.aspect);
+    auto child_frame =
+        instance.camera_frame(look, projection, { 0, 0, 1 }, Some(asset->node_id(1))).unwrap();
+    near(child_frame.position, { 14, 26, 26 });
+    near(child_frame.focus_distance, 4);
+
+    projection.far = 0;
+    frame          = instance.camera_frame(look, projection, { 0, 0, 1 }, Some(reference)).unwrap();
+    near(frame.projection.far, 0);
+    projection.orthographic = true;
+    projection.near         = 0;
+    projection.far          = 20;
+    projection.xmag         = -3;
+    projection.ymag         = 2;
+    frame = instance.camera_frame(look, projection, { 0, 0, 1 }, Some(reference)).unwrap();
+    near(frame.projection.near, 0);
+    near(frame.projection.far, 40);
+    near(frame.projection.xmag, -6);
+    near(frame.projection.ymag, 4);
+
+    rstd_assert(
+        instance.camera_frame(look, {}, { 0, 0, 1 }, Some(AssetId { 0, u64(12) })).is_none());
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, Some(asset->node_id(3))).is_none());
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, Some(asset->node_id(2))).is_none());
+    rstd_assert(instance.camera_frame(CameraLookAt {}, {}, { 0, 0, 1 }, Some(reference)).is_none());
+    rstd_assert(instance.set_scene(1));
+    rstd_assert(instance.scene_root().is_none());
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, Some(asset->node_id(2))).is_some());
+    rstd_assert(instance.set_scene(2));
+    rstd_assert(instance.scene_root().is_none());
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, Some(reference)).is_none());
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }).is_some());
+}
+TEST(Scene, CameraReferenceTransform) {
+    auto asset        = Arc<Asset>::make();
+    asset->generation = u64(13);
+    Node root;
+    root.has_matrix = true;
+    root.matrix     = compose({ 0, 0, 0 },
+                              { -0.70710678f, 0, 0, 0.70710678f },
+                              { 0.0034276119f, 0.0034276119f, 0.0034276119f });
+    asset->nodes.push(rstd::move(root));
+    Scene scene;
+    scene.roots.push(0);
+    asset->scenes.push(rstd::move(scene));
+    SceneInstance instance(asset.clone());
+    auto          reference = instance.scene_root();
+    CameraLookAt  look { { 100, 200, 300 }, { 100, 400, 300 } };
+    auto          frame = instance.camera_frame(look, {}, { 0, 0, 1 }, reference).unwrap();
+    near(frame.position, { 0.34276119f, 1.02828357f, -0.68552238f });
+    near(frame.focus_distance, 0.68552238f);
+    near(frame.projection.near, 0.000034276119f);
+
+    auto& matrix = at(asset->nodes, 0).matrix;
+    matrix       = compose({}, { 0, 0, 0, 1 }, { 2, 3, 2 });
+    instance.set_time(0);
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, reference).is_none());
+    matrix = compose({}, { 0, 0, 0, 1 }, { -2, 2, 2 });
+    instance.set_time(0);
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, reference).is_none());
+    matrix      = Mat4::Identity();
+    matrix.m[4] = 0.5f;
+    instance.set_time(0);
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, reference).is_none());
+    matrix      = Mat4::Identity();
+    matrix.m[3] = 0.1f;
+    instance.set_time(0);
+    rstd_assert(instance.camera_frame(look, {}, { 0, 0, 1 }, reference).is_none());
+
+    matrix = compose({ 1e10f, 0, 0 }, { 0, 0, 0, 1 }, { 2, 2, 2 });
+    instance.set_time(0);
+    frame =
+        instance.camera_frame(CameraLookAt { { 0, 0, 0 }, { 1, 0, 0 } }, {}, { 0, 1, 0 }, reference)
+            .unwrap();
+    near(frame.position, { 1e10f, 0, 0 });
+    near(frame.focus_distance, 2);
+    near(frame.view(1).unwrap().view.vector({ 1, 0, 0 }), { 0, 0, -1 });
+}
 } // namespace vecgltf_test::scene

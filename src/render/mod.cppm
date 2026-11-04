@@ -613,6 +613,10 @@ struct RenderTarget {
     // View.projection always uses the forward [0,1] convention.
     Option<DepthEncoding> depth_encoding;
 };
+struct PrepareOptions {
+    // Upper bound for mipmapped linear samplers, limited by enabled device capabilities.
+    float max_anisotropy { 1 };
+};
 class PreparedAsset {
     friend class Renderer;
     Arc<PreparedData> data_;
@@ -722,7 +726,11 @@ public:
         ++statistics_.environment_preparations;
         return Ok(empty {});
     }
-    auto prepare(Arc<Asset> asset) -> Result<PreparedAsset, Error> {
+    auto prepare(Arc<Asset> asset, PrepareOptions options = {}) -> Result<PreparedAsset, Error> {
+        if (! rstd::f32(options.max_anisotropy).is_finite() || options.max_anisotropy < 1)
+            return Err(render_error("prepare options"_str,
+                                    "anisotropy must be finite and at least one"_str,
+                                    ErrorKind::InvalidAsset));
         LoadScope scope(core_->trace, LoadEvent::PrepareAsset);
         auto      data   = Arc<PreparedData>::make(core_.clone(), rstd::move(asset));
         auto      upload = [&](const void*           bytes,
@@ -766,8 +774,15 @@ public:
                 image = Some(Arc<PreparedTextureImage>::make(prepared.unwrap()));
                 data->images.push({ image_index, srgb, image->clone() });
             }
-            auto sampler = device->CreateSampler({ texture_sample(
-                index == invalid_index ? Sampler {} : at(data->asset->textures, index).sampler) });
+            vrento::texture::SamplerDesc description { texture_sample(
+                index == invalid_index ? Sampler {} : at(data->asset->textures, index).sampler) };
+            if (description.sample.minFilter == vrento::TextureFilter::LINEAR &&
+                description.sample.magFilter == vrento::TextureFilter::LINEAR &&
+                description.sample.mipFilter == vrento::TextureMipmapFilter::Linear)
+                description.max_anisotropy =
+                    minimum(options.max_anisotropy,
+                            core_->session.device().capabilities().max_sampler_anisotropy);
+            auto sampler = device->CreateSampler(description);
             if (sampler.is_err()) return Err(texture_error(sampler.unwrap_err()));
             PreparedTexture result { index, srgb, (*image)->image.view, sampler.unwrap() };
             data->textures.push(PreparedTexture(result));
