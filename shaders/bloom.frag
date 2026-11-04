@@ -11,6 +11,9 @@ layout(set=0,binding=1) uniform Display {
     vec4 post;
     vec4 screen;
     vec4 blur;
+    vec4 balance_shadows;
+    vec4 balance_midtones;
+    vec4 balance_highlights;
 } display;
 vec3 sample_color(vec2 position) {
     return texture(source,min(position,1.0-1.0/vec2(textureSize(source,0)))).rgb;

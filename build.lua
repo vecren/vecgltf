@@ -15,6 +15,10 @@ for _, shader in ipairs({
     output = "model-opaque.frag", definitions = { "BLEND_OPAQUE=1" } },
   { name = "model_shadow_fragment", source = "model.frag", stage = "fragment",
     output = "model-shadow.frag", definitions = { "SHADOW_CAST=1" } },
+  { name = "model_catcher_vertex", source = "model.vert", stage = "vertex",
+    output = "model-catcher.vert", definitions = { "SHADOW_CATCHER=1" } },
+  { name = "model_catcher_fragment", source = "model.frag", stage = "fragment",
+    output = "model-catcher.frag", definitions = { "SHADOW_CATCHER=1" } },
 }) do
   local result = spirv.compile({
     backend = "glslang", tool = lito.tool("glslang"), language = "glsl",

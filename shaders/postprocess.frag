@@ -11,6 +11,9 @@ layout(set=0,binding=1) uniform Display {
     vec4 post;
     vec4 screen;
     vec4 blur;
+    vec4 balance_shadows;
+    vec4 balance_midtones;
+    vec4 balance_highlights;
 } display;
 vec3 encoded(vec3 color) {
     color=max(color,0);

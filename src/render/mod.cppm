@@ -58,10 +58,17 @@ bool valid_environment_image(const HdrImage& image) {
         if (! rstd::f32(value).is_finite() || value < 0) return false;
     return true;
 }
+auto camera_relative_view(const Mat4& view, Vec3 origin) -> Mat4;
+struct PointParameters {
+    Vec4 positions[max_point_lights], radiances[max_point_lights], attenuation[max_point_lights];
+    Vec4 metadata;
+};
+static_assert(sizeof(PointParameters) == 400);
 struct LightingParameters {
     Vec4                     directions[max_directional_lights], radiances[max_directional_lights];
     unsigned                 count {};
     Vec<shadow::ShadowLight> shadows;
+    PointParameters          points {};
 };
 auto lower_lighting(const RenderOptions& options, const View& view, unsigned max_extent)
     -> Result<LightingParameters, Error> {
@@ -76,6 +83,22 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
     if (! non_negative(options.ibl_intensity) || ! non_negative(options.background_intensity) ||
         unsigned(options.debug) > unsigned(DebugView::Emissive))
         return Err(invalid());
+    if (options.background_color && (! non_negative(options.background_color->x) ||
+                                     ! non_negative(options.background_color->y) ||
+                                     ! non_negative(options.background_color->z)))
+        return Err(invalid());
+    if (options.shadow_catcher) {
+        const auto& catcher = *options.shadow_catcher;
+        if (! non_negative(catcher.opacity) || catcher.opacity > 1 || ! non_negative(catcher.fade))
+            return Err(invalid());
+        for (auto value : catcher.transform.m)
+            if (! rstd::f32(value).is_finite()) return Err(invalid());
+        const auto& m           = catcher.transform.m;
+        float       determinant = catcher.transform.determinant3();
+        if (m[3] != 0 || m[7] != 0 || m[11] != 0 || m[15] != 1 ||
+            ! rstd::f32(determinant).is_finite() || absolute(determinant) < 1e-12f)
+            return Err(invalid());
+    }
     const auto& matrix = options.world_to_environment;
     for (auto value : matrix.m)
         if (! rstd::f32(value).is_finite()) return Err(invalid());
@@ -145,6 +168,57 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
         auto added = append(*options.direct_light);
         if (added.is_err()) return Err(added.unwrap_err());
     }
+    if (options.point_lights) {
+        const auto& points = options.point_lights.values();
+        if (count(points) > max_point_lights)
+            return Err(
+                render_error("render options"_str, "too many point lights"_str, ErrorKind::Limit));
+        Option<Mat4> relative_inverse;
+        for (unsigned i = 0; i < count(points); ++i) {
+            const auto& light  = at(points, i);
+            auto        finite = [](Vec3 value) {
+                return rstd::f32(value.x).is_finite() && rstd::f32(value.y).is_finite() &&
+                       rstd::f32(value.z).is_finite();
+            };
+            if (! finite(light.position) || ! non_negative(light.color.x) ||
+                ! non_negative(light.color.y) || ! non_negative(light.color.z) ||
+                ! non_negative(light.intensity) ||
+                ! non_negative(light.color.x * light.intensity) ||
+                ! non_negative(light.color.y * light.intensity) ||
+                ! non_negative(light.color.z * light.intensity) ||
+                ! non_negative(light.attenuation.x) || ! non_negative(light.attenuation.y) ||
+                ! non_negative(light.attenuation.z) ||
+                (light.attenuation.x == 0 && light.attenuation.y == 0 &&
+                 light.attenuation.z == 0) ||
+                (light.space != LightSpace::World && light.space != LightSpace::View))
+                return Err(invalid());
+            Vec3 position;
+            if (light.space == LightSpace::View) {
+                if (! relative_inverse)
+                    relative_inverse = camera_relative_view(view.view, view.eye).inverse();
+                if (! relative_inverse) return Err(invalid());
+                position = relative_inverse->point(light.position);
+            } else
+                position = { float(double(light.position.x) - view.eye.x),
+                             float(double(light.position.y) - view.eye.y),
+                             float(double(light.position.z) - view.eye.z) };
+            if (! finite(position)) return Err(invalid());
+            result.points.positions[i]   = { position.x, position.y, position.z, 0 };
+            result.points.radiances[i]   = { light.color.x * light.intensity,
+                                             light.color.y * light.intensity,
+                                             light.color.z * light.intensity,
+                                             0 };
+            result.points.attenuation[i] = {
+                light.attenuation.x, light.attenuation.y, light.attenuation.z, 0
+            };
+        }
+        result.points.metadata.x = float(count(points));
+    }
+    if (options.background_color) {
+        result.points.metadata.y = options.background_color->x;
+        result.points.metadata.z = options.background_color->y;
+        result.points.metadata.w = options.background_color->z;
+    }
     return Ok(rstd::move(result));
 }
 auto camera_relative_model(const Mat4& model, Vec3 origin) -> Mat4 {
@@ -181,6 +255,21 @@ auto reversed_projection(const Mat4& projection) -> Mat4 {
             float(double(projection.m[column * 4 + 3]) - projection.m[column * 4 + 2]);
     return result;
 }
+auto scene_render_options(const SceneOptions& options) -> RenderOptions {
+    return { 1,
+             options.debug,
+             options.background,
+             options.direct_light,
+             options.ibl_intensity,
+             ToneMapping::Linear,
+             options.directional_lights,
+             options.world_to_environment,
+             options.background_intensity,
+             options.point_lights,
+             options.background_color,
+             options.alpha_dither_seed,
+             options.shadow_catcher };
+}
 enum class ModelPipeline : unsigned
 {
     Opaque,
@@ -190,6 +279,8 @@ enum class ModelPipeline : unsigned
     ReversedBlendOpaque,
     ReversedBlend,
     Background,
+    Catcher,
+    ReversedCatcher,
     Shadow
 };
 struct RenderCore {
@@ -239,6 +330,7 @@ struct PreparedMesh {
 struct PreparedMaterial {
     vk::BufferAllocation                parameters;
     registry::PreparedDescriptorBinding descriptor;
+    bool                                dither {};
 };
 struct PreparedTexture {
     unsigned                        texture {};
@@ -317,6 +409,7 @@ struct ModelFrameResources {
     Option<vrento::texture::TextureViewRef>     coverage;
     Option<vrento::texture::TextureViewRef>     shadow_atlas;
     Option<vk::BufferAllocation>                shadow_parameters;
+    Option<vk::BufferAllocation>                point_parameters;
     Vec<ShadowFrame>                            shadows;
     ModelFrameResources(Arc<PreparedData>                  source,
                         vrento::texture::TextureViewRef    depth_view,
@@ -339,6 +432,7 @@ struct ModelFrameData {
     bool                     background {};
     bool                     reversed_depth {};
     bool                     coverage {};
+    Option<DrawConstants>    catcher;
 };
 template<rstd::size_t N>
 auto shader(const unsigned (&code)[N], vrento::ShaderType stage) -> vk::Uni_ShaderSpv {
@@ -391,6 +485,8 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         { 5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
     frame_info.bindings.push(
         { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
+    frame_info.bindings.push(
+        { 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
     auto frame_layout    = core.descriptor_layouts.Ensure(core.session.device(), frame_info);
     auto material_layout = core.descriptor_layouts.Ensure(core.session.device(), material_info);
     if (frame_layout.is_err())
@@ -540,6 +636,22 @@ auto initialize(RenderCore& core, vk::PipelinePreparationMode mode) -> Result<em
         shader(shaders::background_fragment.words, vrento::ShaderType::FRAGMENT));
     auto added = add(rstd::move(background));
     if (added.is_err()) return added;
+    for (bool reversed : directions) {
+        auto catcher = pipeline.clone();
+        catcher.vertex_bindings.clear();
+        catcher.vertex_attrs.clear();
+        catcher.shader_stages[usize()] =
+            shader(shaders::model_catcher_vertex.words, vrento::ShaderType::VERTEX);
+        catcher.shader_stages[usize(1)] =
+            shader(shaders::model_catcher_fragment.words, vrento::ShaderType::FRAGMENT);
+        catcher.depth.depthWriteEnable = VK_FALSE;
+        catcher.depth.depthCompareOp =
+            reversed ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
+        catcher.color_blend                     = blend;
+        catcher.color_blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        auto ready                              = add(rstd::move(catcher));
+        if (ready.is_err()) return ready;
+    }
     auto caster                 = pipeline.clone();
     caster.has_color_attachment = false;
     caster.shader_stages[usize(1)] =
@@ -638,6 +750,20 @@ struct ModelPrepared {
                 record(draw,
                        inputs->reversed_depth ? ModelPipeline::ReversedBlendOpaque
                                               : ModelPipeline::BlendOpaque);
+        if (inputs->catcher && ! inputs->coverage) {
+            auto pipeline =
+                inputs->reversed_depth ? ModelPipeline::ReversedCatcher : ModelPipeline::Catcher;
+            d.vkCmdBindPipeline(cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                *(*pipelines)[usize(unsigned(pipeline))].pipeline->pipeline.handle);
+            d.vkCmdPushConstants(cmd,
+                                 layout,
+                                 VK_SHADER_STAGE_VERTEX_BIT,
+                                 0,
+                                 sizeof(DrawConstants),
+                                 &*inputs->catcher);
+            d.vkCmdDraw(cmd, 6, 1, 0, 0);
+        }
         for (const auto& draw : *inputs->draws)
             if (draw.transparent)
                 record(draw,
@@ -832,7 +958,8 @@ struct RenderTarget {
 };
 struct PrepareOptions {
     // Upper bound for mipmapped linear samplers, limited by enabled device capabilities.
-    float max_anisotropy { 1 };
+    float             max_anisotropy { 1 };
+    MaterialOverrides material_overrides;
 };
 class PreparedAsset {
     friend class Renderer;
@@ -981,6 +1108,25 @@ public:
             return Err(render_error("prepare options"_str,
                                     "anisotropy must be finite and at least one"_str,
                                     ErrorKind::InvalidAsset));
+        Vec<bool> dither;
+        dither.resize(asset->materials.len(), false);
+        if (options.material_overrides) {
+            Vec<unsigned> seen;
+            for (const auto& override : options.material_overrides.values()) {
+                bool duplicate {};
+                for (auto index : seen) duplicate |= index == override.material;
+                if (override.material >= count(asset->materials) || duplicate ||
+                    (override.alpha_mode != MaterialAlphaMode::Asset &&
+                     override.alpha_mode != MaterialAlphaMode::Dither) ||
+                    (override.alpha_mode == MaterialAlphaMode::Dither &&
+                     at(asset->materials, override.material).alpha != AlphaMode::Blend))
+                    return Err(render_error("prepare options"_str,
+                                            "invalid material alpha override"_str,
+                                            ErrorKind::InvalidAsset));
+                seen.push(unsigned(override.material));
+                at(dither, override.material) = override.alpha_mode == MaterialAlphaMode::Dither;
+            }
+        }
         LoadScope scope(core_->trace, LoadEvent::PrepareAsset);
         auto      data   = Arc<PreparedData>::make(core_.clone(), rstd::move(asset));
         auto      upload = [&](const void*           bytes,
@@ -1058,11 +1204,12 @@ public:
             parameters.specular = {
                 material.specular.x, material.specular.y, material.specular.z, material.glossiness
             };
-            parameters.flags = { float(unsigned(material.alpha)),
-                                 material.alpha_cutoff,
-                                 material.double_sided ? 1.0f : 0.0f,
-                                 float((material.unlit ? 1u : 0u) |
-                                       (specular_glossiness ? 2u : 0u)) };
+            bool material_dither = at(dither, unsigned(count(data->materials)));
+            parameters.flags     = { material_dither ? 3.0f : float(unsigned(material.alpha)),
+                                     material.alpha_cutoff,
+                                     material.double_sided ? 1.0f : 0.0f,
+                                     float((material.unlit ? 1u : 0u) |
+                                           (specular_glossiness ? 2u : 0u)) };
             registry::DescriptorImageBinding images[5];
             for (unsigned i = 0; i < 5; ++i) {
                 const auto& binding        = *bindings[i];
@@ -1094,7 +1241,8 @@ public:
                 registry::DescriptorBindingReuse::Shared);
             if (descriptor.is_err())
                 return Err(backend_error("prepare material"_str, descriptor.unwrap_err()));
-            data->materials.push({ rstd::move(buffer).unwrap(), descriptor.unwrap() });
+            data->materials.push(
+                { rstd::move(buffer).unwrap(), descriptor.unwrap(), material_dither });
         }
         materials.finish();
         LoadScope geometry(core_->trace, LoadEvent::PrepareGeometry);
@@ -1370,18 +1518,10 @@ public:
     }
     auto prepare_scene_target(const RenderTarget& target, SceneOptions options, bool retry = false)
         -> Result<registry::PipelineReadiness, Error> {
-        RenderOptions values { 1,
-                               options.debug,
-                               options.background,
-                               options.direct_light,
-                               options.ibl_intensity,
-                               ToneMapping::Linear,
-                               options.directional_lights,
-                               options.world_to_environment,
-                               options.background_intensity };
-        auto          lights = lower_lighting(values,
-                                              { Mat4::Identity(), Mat4::Identity(), {} },
-                                              core_->session.device().limits().maxImageDimension2D);
+        auto values = scene_render_options(options);
+        auto lights = lower_lighting(values,
+                                     { Mat4::Identity(), Mat4::Identity(), {} },
+                                     core_->session.device().limits().maxImageDimension2D);
         if (lights.is_err()) return Err(lights.unwrap_err());
         return prepare_target_impl(target, retry, true, &*lights);
     }
@@ -1417,15 +1557,7 @@ public:
                       const SceneInstance&         instance,
                       const View&                  view,
                       SceneOptions                 options = {}) -> Result<empty, Error> {
-        RenderOptions values { 1,
-                               options.debug,
-                               options.background,
-                               options.direct_light,
-                               options.ibl_intensity,
-                               ToneMapping::Linear,
-                               options.directional_lights,
-                               options.world_to_environment,
-                               options.background_intensity };
+        auto values = scene_render_options(options);
         return record_impl(work, rstd::move(destination), prepared, instance, view, values, true);
     }
     auto record_scene(vrento::texture::Submission&    work,
@@ -1521,9 +1653,10 @@ private:
             const auto& mesh = at(asset.meshes, mesh_index);
             for (unsigned p = 0; p < count(mesh.primitives); ++p) {
                 const auto& primitive = at(mesh.primitives, p);
+                bool        dither    = at(prepared.data_->materials, primitive.material).dither;
                 auto        position  = at(instance.pose(n).primitive_bounds, p).center();
                 if (! lights.shadows.is_empty() &&
-                    (at(asset.materials, primitive.material).alpha != AlphaMode::Blend ||
+                    (dither || at(asset.materials, primitive.material).alpha != AlphaMode::Blend ||
                      at(asset.materials, primitive.material).base_color.w >= 1)) {
                     auto bounds = instance.relative_primitive_bounds(n, p, origin);
                     if (bounds.valid) {
@@ -1534,7 +1667,8 @@ private:
                 draws.push({ n,
                              p,
                              view_depth(view.view, position),
-                             at(asset.materials, primitive.material).alpha == AlphaMode::Blend });
+                             ! dither && at(asset.materials, primitive.material).alpha ==
+                                             AlphaMode::Blend });
             }
         }
         rstd::slice_::sort_unstable_by(
@@ -1581,10 +1715,22 @@ private:
             Arc<ModelFrameResources>::make(prepared.data_.clone(), depth, work.receipt());
         resources->environment = Some(environment_->clone());
         resources->coverage    = rstd::move(destination.coverage);
-        ModelFrameData inputs {
-            resources.clone(), Arc<Vec<ModelDraw>>::make(), options.background, reversed_depth
-        };
-        const auto relative_view = camera_relative_view(view.view, origin);
+        ModelFrameData inputs { resources.clone(),
+                                Arc<Vec<ModelDraw>>::make(),
+                                options.background || options.background_color.is_some(),
+                                reversed_depth };
+        const auto     relative_view = camera_relative_view(view.view, origin);
+        if (options.shadow_catcher && options.shadow_catcher->opacity > 0 &&
+            ! shadow_plan.views.is_empty()) {
+            DrawConstants constants {};
+            constants.view = relative_view;
+            auto model     = camera_relative_model(options.shadow_catcher->transform, origin);
+            for (unsigned row = 0; row < 3; ++row)
+                constants.model[row] = {
+                    model.m[row], model.m[4 + row], model.m[8 + row], model.m[12 + row]
+                };
+            inputs.catcher = Some(constants);
+        }
         struct PoseOffsets {
             unsigned skin { invalid_index }, weights {};
         };
@@ -1640,7 +1786,9 @@ private:
         frame_parameters.eye     = { 0, 0, 0, 1 };
         frame_parameters.options = { options.exposure,
                                      float(unsigned(options.debug)),
-                                     options.background ? 1.0f : 0.0f,
+                                     options.background_color ? 3.0f
+                                     : options.background     ? 1.0f
+                                                              : 0.0f,
                                      (*environment_)->max_lod };
         frame_parameters.inverse_view_projection =
             (view.projection * relative_view).inverse().unwrap_or(Mat4::Identity());
@@ -1655,10 +1803,11 @@ private:
             frame_parameters.light_directions[i] = lights.directions[i];
             frame_parameters.light_radiances[i]  = lights.radiances[i];
         }
-        frame_parameters.environment_lod = {
-            (*environment_)->lod_scale, (*environment_)->lod_exponent, 0, 0
-        };
-        resources->frame_buffer = core_->buffers.Allocate(
+        frame_parameters.environment_lod = { (*environment_)->lod_scale,
+                                             (*environment_)->lod_exponent,
+                                             __builtin_bit_cast(float, options.alpha_dither_seed),
+                                             0 };
+        resources->frame_buffer          = core_->buffers.Allocate(
             { sizeof(FrameParameters),
               core_->session.device().limits().minUniformBufferOffsetAlignment,
               vk::BufferUploadClass::Uniform });
@@ -1685,9 +1834,11 @@ private:
                 { vrento::texture::Dimension::D2, { vrento::texture::Aspect::Depth } });
             if (atlas.is_err()) return Err(texture_error(atlas.unwrap_err()));
             resources->shadow_atlas = Some(atlas.unwrap());
-            shadow_parameters.atlas = {
-                1.0f / float(shadow_plan.width), 1.0f / float(shadow_plan.height), 0, 0
-            };
+            shadow_parameters.atlas = { 1.0f / float(shadow_plan.width),
+                                        1.0f / float(shadow_plan.height),
+                                        options.shadow_catcher ? options.shadow_catcher->opacity
+                                                               : 0,
+                                        options.shadow_catcher ? options.shadow_catcher->fade : 0 };
             for (auto& shadow : shadow_plan.views) {
                 unsigned index                      = shadow.light_index;
                 shadow_parameters.matrices[index]   = shadow.matrix;
@@ -1718,7 +1869,10 @@ private:
                 return Err(render_error("shadow parameters"_str, "uniform upload failed"_str));
             return Ok(buffer.take().unwrap());
         };
-        auto shadow_uniform = upload_uniform(shadow_parameters);
+        auto point_uniform = upload_uniform(lights.points);
+        if (point_uniform.is_err()) return Err(point_uniform.unwrap_err());
+        resources->point_parameters = Some(point_uniform.unwrap());
+        auto shadow_uniform         = upload_uniform(shadow_parameters);
         if (shadow_uniform.is_err()) return Err(shadow_uniform.unwrap_err());
         resources->shadow_parameters = Some(shadow_uniform.unwrap());
         registry::DescriptorImageBinding images[5];
@@ -1741,14 +1895,18 @@ private:
                 { 5,
                   resources->shadow_parameters->buffer(),
                   resources->shadow_parameters->offset(),
-                  sizeof(ShadowParameters) }
+                  sizeof(ShadowParameters) },
+                { 7,
+                  resources->point_parameters->buffer(),
+                  resources->point_parameters->offset(),
+                  sizeof(PointParameters) }
             };
             auto descriptor = core_->descriptors.Prepare(
                 core_->session.device(),
                 0,
                 **core_->descriptor_layouts.Resolve(core_->frame_layout),
                 slice<registry::DescriptorImageBinding>::from_raw_parts(images, usize(5)),
-                slice<registry::DescriptorBufferBinding>::from_raw_parts(bindings, usize(2)),
+                slice<registry::DescriptorBufferBinding>::from_raw_parts(bindings, usize(3)),
                 registry::DescriptorBindingReuse::Shared);
             if (descriptor.is_err())
                 return Err(backend_error("frame descriptor"_str, descriptor.unwrap_err()));
@@ -2016,6 +2174,13 @@ private:
                        vk::PassUsage::Uniform,
                        vk::PassStages::Vertex | vk::PassStages::Fragment);
         buffer_use(
+            pass, *resources->point_parameters, vk::PassUsage::Uniform, vk::PassStages::Fragment);
+        if (coverage_pass)
+            buffer_use(*coverage_pass,
+                       *resources->point_parameters,
+                       vk::PassUsage::Uniform,
+                       vk::PassStages::Fragment);
+        buffer_use(
             pass, *resources->shadow_parameters, vk::PassUsage::Uniform, vk::PassStages::Fragment);
         if (coverage_pass)
             buffer_use(*coverage_pass,
@@ -2024,8 +2189,10 @@ private:
                        vk::PassStages::Fragment);
         if (shadow_pass)
             for (const auto& shadow : resources->shadows)
-                buffer_use(
-                    *shadow_pass, *shadow.buffer, vk::PassUsage::Uniform, vk::PassStages::Vertex);
+                buffer_use(*shadow_pass,
+                           *shadow.buffer,
+                           vk::PassUsage::Uniform,
+                           vk::PassStages::Vertex | vk::PassStages::Fragment);
         auto shared_buffer_use = [&](const vk::BufferAllocation& allocation,
                                      vk::PassUsage               usage,
                                      vk::PassStages              stages) {

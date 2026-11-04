@@ -25,12 +25,19 @@ struct SettingsLight {
     gltf::DirectionalLight light;
     SettingsReference      reference;
 };
+struct SettingsPointLight {
+    gltf::PointLight  light;
+    SettingsReference reference;
+};
 struct ViewSettings {
     String                          source;
     gltf::SceneOptions              scene;
     gltf::DisplayOptions            display;
     Option<gltf::EnvironmentImages> environment_images;
     Vec<SettingsLight>              lights;
+    Vec<SettingsPointLight>         point_lights;
+    gltf::MaterialOverrides         material_overrides;
+    SettingsReference               shadow_catcher_reference;
     SettingsReference               environment_reference;
     gltf::Mat4                      environment_to_reference { gltf::Mat4::Identity() };
     bool                            environment_transform {};
@@ -193,6 +200,68 @@ public:
                  number((*values)[usize(1)], path),
                  number((*values)[usize(2)], path) };
     }
+    auto unsigned_integer(const Json& value, ref<str> path) -> unsigned {
+        auto input = value.as_f64();
+        if (input && input->is_finite() && input->to_primitive() >= 0 &&
+            input->to_primitive() <= 4294967295.0 &&
+            input->to_primitive() == input->floor().to_primitive())
+            return unsigned(input->to_primitive());
+        fail(path, "expected an integer from zero to 4294967295"_str);
+        return 0;
+    }
+    void materials(const Json& input, ViewSettings& settings) {
+        auto values = input.as_array();
+        if (! values) {
+            fail("material_overrides"_str, "expected an array"_str);
+            return;
+        }
+        Vec<gltf::MaterialOverride> overrides;
+        for (const auto& value : values.unwrap().get()) {
+            auto path = rstd::format("material_overrides[{}]", overrides.len());
+            if (! object(value, path.as_str())) return;
+            gltf::MaterialOverride entry;
+            if (auto material = field(value, "material"_str))
+                entry.material =
+                    unsigned_integer(*material, rstd::format("{}.material", path).as_str());
+            else
+                fail(path.as_str(), "material is required"_str);
+            if (auto mode = field(value, "alpha_mode"_str)) {
+                auto name = text(*mode, rstd::format("{}.alpha_mode", path).as_str());
+                if (name == "dither"_str)
+                    entry.alpha_mode = gltf::MaterialAlphaMode::Dither;
+                else if (name != "asset"_str)
+                    fail(rstd::format("{}.alpha_mode", path).as_str(),
+                         "alpha mode must be asset or dither"_str);
+            }
+            for (const auto& previous : overrides)
+                if (previous.material == entry.material)
+                    fail(path.as_str(), "material override is duplicated"_str);
+            overrides.push(rstd::move(entry));
+        }
+        settings.material_overrides = gltf::MaterialOverrides(rstd::move(overrides));
+    }
+    void shadow_catcher(const Json& input, ViewSettings& settings) {
+        if (! object(input, "shadow_catcher"_str)) return;
+        gltf::ShadowCatcher result;
+        gltf::Vec3          position {};
+        float               scale = 1;
+        if (auto value = field(input, "position"_str))
+            position = vector3(*value, "shadow_catcher.position"_str);
+        number(input, "scale"_str, scale, "shadow_catcher"_str);
+        if (scale <= 0) fail("shadow_catcher.scale"_str, "scale must be positive"_str);
+        if (auto value = field(input, "reference"_str))
+            settings.shadow_catcher_reference = reference(*value, "shadow_catcher.reference"_str);
+        if (settings.shadow_catcher_reference.space == SettingsSpace::View)
+            fail("shadow_catcher.reference"_str,
+                 "view-space shadow catcher references are unsupported"_str,
+                 gltf::ErrorKind::Unsupported);
+        nonnegative(input, "opacity"_str, result.opacity, "shadow_catcher"_str);
+        if (result.opacity > 1)
+            fail("shadow_catcher.opacity"_str, "opacity must be at most one"_str);
+        nonnegative(input, "fade"_str, result.fade, "shadow_catcher"_str);
+        result.transform = gltf::compose(position, { 0, 0, 0, 1 }, { scale, scale, scale });
+        settings.scene.shadow_catcher = Some(result);
+    }
     auto reference(const Json& value, ref<str> location) -> SettingsReference {
         if (auto input = value.as_str()) {
             if (*input == "world"_str) return {};
@@ -275,6 +344,48 @@ public:
         settings.scene.direct_light       = None();
         settings.scene.directional_lights = gltf::DirectionalLights(rstd::move(initial));
     }
+    void point_lights(const Json& input, ViewSettings& settings) {
+        auto values = input.as_array();
+        if (! values || values.unwrap().get().len() > usize(gltf::max_point_lights)) {
+            fail("point_lights"_str, "expected at most eight point lights"_str);
+            return;
+        }
+        Vec<gltf::PointLight> initial;
+        for (const auto& value : values.unwrap().get()) {
+            auto path = rstd::format("point_lights[{}]", settings.point_lights.len());
+            if (! object(value, path.as_str())) return;
+            SettingsPointLight entry;
+            entry.light.intensity = 1;
+            if (auto position = field(value, "position"_str))
+                entry.light.position =
+                    vector3(*position, rstd::format("{}.position", path).as_str());
+            else
+                fail(path.as_str(), "position is required"_str);
+            if (auto color = field(value, "color"_str))
+                entry.light.color = vector3(*color, rstd::format("{}.color", path).as_str());
+            if (entry.light.color.x < 0 || entry.light.color.y < 0 || entry.light.color.z < 0)
+                fail(rstd::format("{}.color", path).as_str(),
+                     "light color must be nonnegative"_str);
+            nonnegative(value, "intensity"_str, entry.light.intensity, path.as_str());
+            if (auto attenuation = field(value, "attenuation"_str))
+                entry.light.attenuation =
+                    vector3(*attenuation, rstd::format("{}.attenuation", path).as_str());
+            const auto& attenuation = entry.light.attenuation;
+            if (attenuation.x < 0 || attenuation.y < 0 || attenuation.z < 0 ||
+                (attenuation.x == 0 && attenuation.y == 0 && attenuation.z == 0))
+                fail(rstd::format("{}.attenuation", path).as_str(),
+                     "attenuation must be nonnegative and nonzero"_str);
+            if (auto reference_value = field(value, "reference"_str))
+                entry.reference =
+                    reference(*reference_value, rstd::format("{}.reference", path).as_str());
+            entry.light.space = entry.reference.space == SettingsSpace::View
+                                    ? gltf::LightSpace::View
+                                    : gltf::LightSpace::World;
+            initial.push(gltf::PointLight(entry.light));
+            settings.point_lights.push(rstd::move(entry));
+        }
+        settings.scene.point_lights = gltf::PointLights(rstd::move(initial));
+    }
     auto environment(const Json& input, ViewSettings& settings) -> Option<EnvironmentFiles> {
         if (! object(input, "environment"_str)) return None();
         settings.environment_transform = true;
@@ -302,6 +413,13 @@ public:
                     settings.scene.background_intensity,
                     "environment"_str);
         boolean(input, "background"_str, settings.scene.background, "environment"_str);
+        if (auto color = field(input, "background_color"_str)) {
+            auto value = vector3(*color, "environment.background_color"_str);
+            if (value.x < 0 || value.y < 0 || value.z < 0)
+                fail("environment.background_color"_str,
+                     "background color must be nonnegative"_str);
+            settings.scene.background_color = Some(value);
+        }
         auto files = field(input, "preprocessed"_str);
         if (! files) return None();
         if (! object(*files, "environment.preprocessed"_str)) return None();
@@ -390,6 +508,23 @@ public:
         nonnegative(input, "sampling_scale"_str, output.sampling_scale, "display"_str);
         if (output.sampling_scale == 0)
             fail("display.sampling_scale"_str, "sampling scale must be positive"_str);
+        if (auto value = field(input, "color_balance"_str)) {
+            if (! object(*value, "display.color_balance"_str)) return;
+            gltf::ColorBalance balance;
+            auto               parse = [&](ref<str> key, gltf::Vec3& target) {
+                if (auto color = field(*value, key)) {
+                    auto path = rstd::format("display.color_balance.{}", key);
+                    target    = vector3(*color, path.as_str());
+                    if (target.x < -1 || target.x > 1 || target.y < -1 || target.y > 1 ||
+                        target.z < -1 || target.z > 1)
+                        fail(path.as_str(), "color balance components must be in [-1,1]"_str);
+                }
+            };
+            parse("shadows"_str, balance.shadows);
+            parse("midtones"_str, balance.midtones);
+            parse("highlights"_str, balance.highlights);
+            output.color_balance = Some(balance);
+        }
     }
 };
 auto read_document(ref<str> source) -> Result<Vec<u8>, gltf::Error> {
@@ -414,10 +549,10 @@ auto read_document(ref<str> source) -> Result<Vec<u8>, gltf::Error> {
             error(source, "settings"_str, "cannot read settings file"_str, gltf::ErrorKind::Io));
     return Ok(rstd::move(bytes));
 }
-auto reference_rotation(SettingsReference          reference,
-                        const gltf::SceneInstance& instance,
-                        ref<str>                   source,
-                        ref<str>                   location) -> Result<gltf::Mat4, gltf::Error> {
+auto reference_transform(SettingsReference          reference,
+                         const gltf::SceneInstance& instance,
+                         ref<str>                   source,
+                         ref<str>                   location) -> Result<gltf::Mat4, gltf::Error> {
     if (reference.space == SettingsSpace::World) return Ok(gltf::Mat4::Identity());
     auto index = reference.node;
     if (reference.space == SettingsSpace::SceneRoot) {
@@ -430,7 +565,22 @@ auto reference_rotation(SettingsReference          reference,
     if (reference.space == SettingsSpace::View || index >= gltf::count(instance.asset().nodes) ||
         ! instance.visible(index))
         return Err(error(source, location, "reference node is not valid in this scene"_str));
-    return rotation(instance.pose(index).world, source, location, true);
+    const auto& matrix = instance.pose(index).world;
+    for (auto value : matrix.m)
+        if (! rstd::f32(value).is_finite())
+            return Err(
+                error(source, location, "reference must have a finite affine transform"_str));
+    if (matrix.m[3] != 0 || matrix.m[7] != 0 || matrix.m[11] != 0 || matrix.m[15] != 1)
+        return Err(error(source, location, "reference must have a finite affine transform"_str));
+    return Ok(matrix);
+}
+auto reference_rotation(SettingsReference          reference,
+                        const gltf::SceneInstance& instance,
+                        ref<str>                   source,
+                        ref<str>                   location) -> Result<gltf::Mat4, gltf::Error> {
+    auto matrix = reference_transform(reference, instance, source, location);
+    if (matrix.is_err()) return Err(matrix.unwrap_err());
+    return rotation(matrix.unwrap(), source, location, true);
 }
 } // namespace viewer::settings
 
@@ -456,6 +606,13 @@ auto LoadViewSettings(ref<str> source) -> Result<ViewSettings, gltf::Error> {
     if (! version || reader.number(*version, "version"_str) != 1)
         reader.fail("version"_str, "settings version must be one"_str);
     if (auto lights = reader.field(data, "directional_lights"_str)) reader.lights(*lights, output);
+    if (auto lights = reader.field(data, "point_lights"_str)) reader.point_lights(*lights, output);
+    if (auto values = reader.field(data, "material_overrides"_str))
+        reader.materials(*values, output);
+    if (auto value = reader.field(data, "shadow_catcher"_str))
+        reader.shadow_catcher(*value, output);
+    if (auto seed = reader.field(data, "alpha_dither_seed"_str))
+        output.scene.alpha_dither_seed = reader.unsigned_integer(*seed, "alpha_dither_seed"_str);
     Option<settings::EnvironmentFiles> files;
     if (auto input = reader.field(data, "environment"_str))
         files = reader.environment(*input, output);
@@ -520,7 +677,18 @@ auto ResolveSceneOptions(const ViewSettings&        configured,
     result.direct_light         = current.direct_light;
     result.ibl_intensity        = current.ibl_intensity;
     result.background_intensity = current.background_intensity;
+    result.background_color     = current.background_color;
     result.world_to_environment = current.world_to_environment;
+    result.alpha_dither_seed    = current.alpha_dither_seed;
+    result.shadow_catcher       = current.shadow_catcher;
+    if (result.shadow_catcher) {
+        auto transform = settings::reference_transform(configured.shadow_catcher_reference,
+                                                       instance,
+                                                       configured.source.as_str(),
+                                                       "shadow_catcher.reference"_str);
+        if (transform.is_err()) return Err(transform.unwrap_err());
+        result.shadow_catcher->transform = transform.unwrap() * result.shadow_catcher->transform;
+    }
     if (current.directional_lights) {
         const auto& inputs = current.directional_lights.values();
         if (! inputs.is_empty() && inputs.len() != configured.lights.len())
@@ -546,6 +714,32 @@ auto ResolveSceneOptions(const ViewSettings&        configured,
             lights.push(rstd::move(light));
         }
         result.directional_lights = gltf::DirectionalLights(rstd::move(lights));
+    }
+    if (current.point_lights) {
+        const auto& inputs = current.point_lights.values();
+        if (! inputs.is_empty() && inputs.len() != configured.point_lights.len())
+            return Err(settings::error(configured.source.as_str(),
+                                       "point_lights"_str,
+                                       "light count differs from reference settings"_str));
+        Vec<gltf::PointLight> lights;
+        for (unsigned i = 0; i < gltf::count(inputs); ++i) {
+            auto light     = gltf::at(inputs, i);
+            auto reference = gltf::at(configured.point_lights, i).reference;
+            if (reference.space == SettingsSpace::View)
+                light.space = gltf::LightSpace::View;
+            else {
+                auto transform = settings::reference_transform(
+                    reference,
+                    instance,
+                    configured.source.as_str(),
+                    rstd::format("point_lights[{}].reference", i).as_str());
+                if (transform.is_err()) return Err(transform.unwrap_err());
+                light.position = transform.unwrap().point(light.position);
+                light.space    = gltf::LightSpace::World;
+            }
+            lights.push(rstd::move(light));
+        }
+        result.point_lights = gltf::PointLights(rstd::move(lights));
     }
     if (configured.environment_transform) {
         auto rotation = settings::reference_rotation(configured.environment_reference,

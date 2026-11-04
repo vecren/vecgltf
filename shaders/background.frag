@@ -13,13 +13,19 @@ layout(set=0,binding=0) uniform Frame {
     vec4 environment_lod;
 } frame;
 layout(set=0,binding=4) uniform sampler2D environment;
+layout(set=0,binding=7) uniform Points {
+    vec4 positions[8];
+    vec4 radiances[8];
+    vec4 attenuation[8];
+    vec4 metadata;
+} points;
 void main() {
     vec4 relative_world=frame.inverse_view_projection*vec4(ndc,1,1);
     vec3 direction=relative_world.xyz-frame.eye.xyz*relative_world.w;
     if(relative_world.w<0) direction=-direction;
     vec3 d=mat3(frame.world_to_environment)*normalize(direction);
     vec2 uv=vec2(atan(d.z,d.x)/6.28318530718+0.5,acos(clamp(d.y,-1,1))/3.14159265359);
-    vec3 color=texture(environment,uv).rgb*frame.options.x*frame.lighting.w;
+    vec3 color=(frame.options.z==3 ? points.metadata.yzw : texture(environment,uv).rgb*frame.lighting.w)*frame.options.x;
     if(frame.lighting.y==1) color=color/(1+max(max(color.r,color.g),color.b));
     else if(frame.lighting.y!=2) color=clamp((color*(2.51*color+0.03))/(color*(2.43*color+0.59)+0.14),0,1);
     result=vec4(color,1);

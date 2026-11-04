@@ -10,6 +10,9 @@ layout(set=0,binding=1) uniform Display {
     vec4 post;
     vec4 screen;
     vec4 blur;
+    vec4 balance_shadows;
+    vec4 balance_midtones;
+    vec4 balance_highlights;
 } display;
 layout(set=0,binding=3) uniform sampler2D bloom0;
 layout(set=0,binding=4) uniform sampler2D bloom1;
@@ -24,6 +27,20 @@ vec3 encoded(vec3 color) {
 vec3 bloom_sample(sampler2D image) {
     return texture(image,min(uv,1.0-1.0/vec2(textureSize(image,0)))).rgb;
 }
+vec3 color_balance(vec3 color) {
+    float original_length=length(color);
+    if(original_length<1e-5) return color;
+    float lightness=(min(min(color.r,color.g),color.b)+max(max(color.r,color.g),color.b))*0.5;
+    lightness=1.5*lightness/(lightness+0.5);
+    float low=clamp((lightness-0.333)/-0.25+0.5,0,1);
+    float mid=clamp((lightness-0.333)/0.25+0.5,0,1)*
+              clamp((lightness+0.333-1)/-0.25+0.5,0,1);
+    float high=clamp((lightness+0.333-1)/0.25+0.5,0,1);
+    vec3 shifted=max(color+0.7*(display.balance_shadows.rgb*low+
+        display.balance_midtones.rgb*mid+display.balance_highlights.rgb*high),vec3(0));
+    float shifted_length=length(shifted);
+    return shifted_length<1e-5 ? shifted*original_length : shifted*original_length/shifted_length;
+}
 void main() {
     vec4 input_color=texture(source,uv);
     float alpha=clamp(input_color.a,0,1);
@@ -36,6 +53,7 @@ void main() {
             bloom_sample(bloom1)*weight.y+bloom_sample(bloom2)*weight.z+
             bloom_sample(bloom3)*weight.w+bloom_sample(bloom4)*last);
     }
+    if(display.balance_shadows.w>0) color=color_balance(color);
     color*=display.mapping.x*display.mapping.z;
     float luminance=dot(color,vec3(0.2126,0.7152,0.0722));
     color=mix(vec3(luminance),color,display.mapping.w);

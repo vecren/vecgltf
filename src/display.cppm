@@ -28,6 +28,10 @@ struct Grain {
     // A fixed application-supplied phase yields stable screen noise.
     float strength {}, phase {};
 };
+struct ColorBalance {
+    // Signed RGB shifts in [-1,1], followed by RGB-length normalization.
+    Vec3 shadows {}, midtones {}, highlights {};
+};
 struct DisplayOptions {
     float            exposure { 1 };
     ToneMapping      tone_mapping { ToneMapping::ACES };
@@ -38,7 +42,8 @@ struct DisplayOptions {
     float            sharpen {};
     Option<Grain>    grain;
     // Scales Bloom and sharpen taps; FXAA follows the input pixel grid.
-    float sampling_scale { 1 };
+    float                sampling_scale { 1 };
+    Option<ColorBalance> color_balance;
 };
 struct DisplayInput {
     vrento::texture::TextureViewRef color;
@@ -119,6 +124,17 @@ auto options_valid(const DisplayOptions& options) -> Result<empty, Error> {
                            ! rstd::f32(options.grain->phase).is_finite())))
         return Err(error(
             "display options"_str, "invalid postprocess options"_str, ErrorKind::InvalidAsset));
+    if (options.color_balance) {
+        auto valid = [](Vec3 value) {
+            return rstd::f32(value.x).is_finite() && value.x >= -1 && value.x <= 1 &&
+                   rstd::f32(value.y).is_finite() && value.y >= -1 && value.y <= 1 &&
+                   rstd::f32(value.z).is_finite() && value.z >= -1 && value.z <= 1;
+        };
+        const auto& value = *options.color_balance;
+        if (! valid(value.shadows) || ! valid(value.midtones) || ! valid(value.highlights))
+            return Err(
+                error("display options"_str, "invalid color balance"_str, ErrorKind::InvalidAsset));
+    }
     return Ok(empty {});
 }
 bool bloom_enabled(const DisplayOptions& options) {
@@ -137,8 +153,9 @@ enum class Stage : unsigned
 constexpr unsigned sampler_count = 7;
 struct Parameters {
     Vec4 mapping, grading, vignette, bloom, post, screen, blur;
+    Vec4 balance_shadows, balance_midtones, balance_highlights;
 };
-static_assert(sizeof(Parameters) == 112);
+static_assert(sizeof(Parameters) == 160);
 struct Core {
     vk::DeviceSession                      session;
     vk::BufferManager                      buffers;
@@ -390,6 +407,19 @@ auto parameters(const DisplayOptions& options) -> Parameters {
                        options.grain ? options.grain->strength : 0,
                        options.grain ? options.grain->phase : 0 };
     value.screen.z = options.sampling_scale;
+    if (options.color_balance) {
+        const auto& balance = *options.color_balance;
+        if (balance.shadows != Vec3 {} || balance.midtones != Vec3 {} ||
+            balance.highlights != Vec3 {}) {
+            value.balance_shadows  = { balance.shadows.x, balance.shadows.y, balance.shadows.z, 1 };
+            value.balance_midtones = {
+                balance.midtones.x, balance.midtones.y, balance.midtones.z, 0
+            };
+            value.balance_highlights = {
+                balance.highlights.x, balance.highlights.y, balance.highlights.z, 0
+            };
+        }
+    }
     return value;
 }
 auto scratch(Frame& frame, tex::Extent size) -> Result<tex::TextureViewRef, Error> {

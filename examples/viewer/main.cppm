@@ -71,9 +71,17 @@ int main(int argc, char** argv) {
         options.render.background_intensity = scene.background_intensity;
         options.render.world_to_environment = scene.world_to_environment;
         options.render.directional_lights   = scene.directional_lights;
-        if (options.render_overrides.direct_light)
+        options.render.point_lights         = scene.point_lights;
+        options.render.alpha_dither_seed    = scene.alpha_dither_seed;
+        options.render.shadow_catcher       = scene.shadow_catcher;
+        options.prepare.material_overrides  = settings->material_overrides;
+        options.render.background_color =
+            options.render_overrides.background ? None() : scene.background_color;
+        if (options.render_overrides.direct_light) {
             options.render.directional_lights =
                 gltf::DirectionalLights(Vec<gltf::DirectionalLight> {});
+            options.render.point_lights = gltf::PointLights(Vec<gltf::PointLight> {});
+        }
     }
     auto loaded = gltf::LoadAsset(options.path.as_str());
     if (loaded.is_err()) {

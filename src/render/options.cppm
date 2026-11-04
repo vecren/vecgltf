@@ -58,6 +58,68 @@ public:
     explicit                     operator bool() const { return present(); }
     const Vec<DirectionalLight>& values() const { return **values_; }
 };
+struct PointLight {
+    Vec3  position {}, color { 1, 1, 1 };
+    float intensity { 3 };
+    // Constant, linear and quadratic distance terms.
+    Vec3       attenuation { 1, 0, 1 };
+    LightSpace space { LightSpace::World };
+};
+inline constexpr unsigned max_point_lights = 8;
+class PointLights {
+    Option<Arc<Vec<PointLight>>> values_;
+
+public:
+    PointLights() = default;
+    explicit PointLights(Vec<PointLight> values)
+        : values_(Some(Arc<Vec<PointLight>>::make(rstd::move(values)))) {}
+    PointLights(const PointLights& other)
+        : values_(other.present() ? Some(other.values_->clone()) : None()) {}
+    PointLights(PointLights&&)                    = default;
+    auto operator=(PointLights&&) -> PointLights& = default;
+    auto operator=(const PointLights& other) -> PointLights& {
+        if (this != &other) values_ = other.present() ? Some(other.values_->clone()) : None();
+        return *this;
+    }
+    bool                   present() const { return values_.is_some(); }
+    explicit               operator bool() const { return present(); }
+    const Vec<PointLight>& values() const { return **values_; }
+};
+enum class MaterialAlphaMode
+{
+    Asset,
+    // Replaces BLEND with stochastic coverage and depth writes.
+    Dither
+};
+struct MaterialOverride {
+    unsigned          material {};
+    MaterialAlphaMode alpha_mode { MaterialAlphaMode::Asset };
+};
+class MaterialOverrides {
+    Option<Arc<Vec<MaterialOverride>>> values_;
+
+public:
+    MaterialOverrides() = default;
+    explicit MaterialOverrides(Vec<MaterialOverride> values)
+        : values_(Some(Arc<Vec<MaterialOverride>>::make(rstd::move(values)))) {}
+    MaterialOverrides(const MaterialOverrides& other)
+        : values_(other.present() ? Some(other.values_->clone()) : None()) {}
+    MaterialOverrides(MaterialOverrides&&)                    = default;
+    auto operator=(MaterialOverrides&&) -> MaterialOverrides& = default;
+    auto operator=(const MaterialOverrides& other) -> MaterialOverrides& {
+        if (this != &other) values_ = other.present() ? Some(other.values_->clone()) : None();
+        return *this;
+    }
+    bool                         present() const { return values_.is_some(); }
+    explicit                     operator bool() const { return present(); }
+    const Vec<MaterialOverride>& values() const { return **values_; }
+};
+struct ShadowCatcher {
+    // Maps the local XY square [-1,1] into world space.
+    Mat4 transform { Mat4::Identity() };
+    // Shadow alpha is opacity * (1 - visibility) * clamp(1 - radius^2 * fade, 0, 1)^2.
+    float opacity { 1 }, fade {};
+};
 enum class ToneMapping
 {
     ACES,
@@ -75,8 +137,14 @@ struct RenderOptions {
     // An absent override uses direct_light; an explicit empty list disables direct lighting.
     DirectionalLights directional_lights;
     // Pure rotation from world directions into the environment's Y-up basis.
-    Mat4  world_to_environment { Mat4::Identity() };
-    float background_intensity { 1 };
+    Mat4        world_to_environment { Mat4::Identity() };
+    float       background_intensity { 1 };
+    PointLights point_lights;
+    // Opaque linear background before geometry; takes precedence over the environment.
+    Option<Vec3> background_color;
+    // Stable screen-space sample; callers may advance it when accumulating frames.
+    unsigned              alpha_dither_seed {};
+    Option<ShadowCatcher> shadow_catcher;
 };
 struct SceneOptions {
     DebugView                debug {};
@@ -86,5 +154,9 @@ struct SceneOptions {
     DirectionalLights        directional_lights;
     Mat4                     world_to_environment { Mat4::Identity() };
     float                    background_intensity { 1 };
+    PointLights              point_lights;
+    Option<Vec3>             background_color;
+    unsigned                 alpha_dither_seed {};
+    Option<ShadowCatcher>    shadow_catcher;
 };
 } // namespace vecgltf
