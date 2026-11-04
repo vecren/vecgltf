@@ -188,6 +188,68 @@ TEST(Lighting, EnvironmentSampling) {
     near(sample(half_background, 0), 0);
     rstd_assert(fixture.session.validation_errors() == 0);
 }
+TEST(Lighting, BackgroundProjection) {
+    Fixture fixture;
+    auto    images    = environment();
+    images.background = { 256, 128 };
+    for (unsigned y = 0; y < 128; ++y)
+        for (unsigned x = 0; x < 256; ++x) {
+            float phi   = ((float(x) + 0.5f) / 256 - 0.5f) * 6.28318530718f;
+            float theta = (float(y) + 0.5f) / 128 * 3.14159265359f;
+            images.background.rgba.push(0.2f * (1 + sine(theta) * cosine(phi)));
+            images.background.rgba.push(0.2f * (1 + cosine(theta)));
+            images.background.rgba.push(0.2f * (1 + sine(theta) * sine(phi)));
+            images.background.rgba.push(1.0f);
+        }
+    fixture.renderer.set_environment(rstd::move(images)).unwrap();
+    auto asset                = surface();
+    at(asset->nodes, 0).scale = {};
+    RenderOptions options;
+    options.background    = true;
+    options.direct_light  = None();
+    options.ibl_intensity = 0;
+    options.tone_mapping  = ToneMapping::Linear;
+    Vec3     eyes[] { { 3, -5, 2 }, { -7, 2, 9 }, { 1, 2, 3 }, { -2, -3, -4 } };
+    unsigned samples[] { 3, 18, 43, 60 };
+    for (auto eye : eyes)
+        for (unsigned projection = 0; projection < 4; ++projection) {
+            CameraProjection lens;
+            lens.near         = 0.01f;
+            lens.far          = projection == 0 ? 0 : projection == 1 ? 100000000.0f : 30.0f;
+            lens.orthographic = projection == 3;
+            OrbitCamera camera;
+            rstd_assert(
+                camera.restore(camera_frame(CameraLookAt { eye, {} }, lens).unwrap(), 1.7777778f));
+            fixture.view       = camera.view(1.7777778f);
+            auto       inverse = fixture.view.view.inverse().unwrap();
+            const auto pixels  = fixture.draw(asset.clone(), options);
+            for (unsigned y : samples)
+                for (unsigned x : samples) {
+                    Vec3 camera_ray { 0, 0, -1 };
+                    if (projection != 3) {
+                        camera_ray.x = ((float(x) + 0.5f) / 32 - 1) / fixture.view.projection.m[0];
+                        camera_ray.y = ((float(y) + 0.5f) / 32 - 1) / fixture.view.projection.m[5];
+                    }
+                    auto  ray = normalized(inverse.vector(camera_ray));
+                    float expected[] { 0.2f * (1 + ray.x), 0.2f * (1 + ray.y), 0.2f * (1 + ray.z) };
+                    for (unsigned c = 0; c < 3; ++c) {
+                        auto actual    = sample(pixels, c, x, y);
+                        auto reference = unsigned(expected[c] * 255 + 0.5f);
+                        if (actual + 2 < reference || actual > reference + 2)
+                            rstd::io::eprintln("background projection={} pixel=({},{}) channel={} "
+                                               "actual={} expected={}",
+                                               projection,
+                                               x,
+                                               y,
+                                               c,
+                                               actual,
+                                               reference);
+                        near(actual, reference);
+                    }
+                }
+        }
+    rstd_assert(fixture.session.validation_errors() == 0);
+}
 TEST(Lighting, EnvironmentLod) {
     Fixture       fixture;
     RenderOptions options;

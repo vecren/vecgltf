@@ -20,9 +20,10 @@ layout(set=0,binding=7) uniform Points {
     vec4 metadata;
 } points;
 void main() {
-    vec4 relative_world=frame.inverse_view_projection*vec4(ndc,1,1);
-    vec3 direction=relative_world.xyz-frame.eye.xyz*relative_world.w;
-    if(relative_world.w<0) direction=-direction;
+    // The far plane can have w=0 for an infinite perspective projection.
+    vec4 near_world=frame.inverse_view_projection*vec4(ndc,0,1);
+    vec4 middle_world=frame.inverse_view_projection*vec4(ndc,0.5,1);
+    vec3 direction=middle_world.xyz*near_world.w-near_world.xyz*middle_world.w;
     vec3 d=mat3(frame.world_to_environment)*normalize(direction);
     vec2 uv=vec2(atan(d.z,d.x)/6.28318530718+0.5,acos(clamp(d.y,-1,1))/3.14159265359);
     vec3 color=(frame.options.z==3 ? points.metadata.yzw : texture(environment,uv).rgb*frame.lighting.w)*frame.options.x;
