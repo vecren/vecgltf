@@ -101,6 +101,43 @@ TEST(ShadowCatcher, OpacityFadeAndCoverage) {
     rstd_assert(session.validation_errors() == 0);
 }
 
+TEST(ShadowCatcher, SpotLight) {
+    auto          session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto          queue    = vk::TextureContext::create(session).unwrap();
+    auto          renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    auto          source   = asset();
+    auto          prepared = renderer.prepare(source.clone()).unwrap();
+    SceneInstance scene(source.clone());
+    auto          target = image::texture(queue), coverage = image::texture(queue);
+    auto          settings = []() {
+        SceneOptions result;
+        result.direct_light   = None();
+        result.ibl_intensity  = 0;
+        result.shadow_catcher = Some(ShadowCatcher {});
+        SpotLight light;
+        light.point.position    = { 0.9f, 0, 1.5f };
+        light.point.attenuation = { 1, 0, 0 };
+        light.direction         = normalized(Vec3 { -0.9f, 0, -1.5f });
+        light.outer_cos         = 0.6f;
+        light.inner_cos         = 0.9f;
+        ShadowOptions options;
+        options.resolution = 256;
+        light.shadow       = Some(options);
+        Vec<SpotLight> lights;
+        lights.push(rstd::move(light));
+        result.spot_lights = SpotLights(rstd::move(lights));
+        return result;
+    };
+    const auto pixels =
+        draw(renderer, queue, session, target, coverage, prepared, scene, settings());
+    unsigned shadowed {};
+    for (unsigned y = 20; y < 44; ++y)
+        for (unsigned x = 5; x < 26; ++x)
+            if (image::channel(pixels, 3, x, y) > 0.2f) ++shadowed;
+    rstd_assert(shadowed > 10);
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(ShadowCatcher, TransformAndDepth) {
     auto          session  = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto          queue    = vk::TextureContext::create(session).unwrap();

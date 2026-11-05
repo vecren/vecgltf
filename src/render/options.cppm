@@ -22,7 +22,7 @@ enum class ShadowFilter
     Nearest,
     Bilinear
 };
-struct DirectionalShadow {
+struct ShadowOptions {
     unsigned     resolution { 1024 };
     ShadowFilter filter { ShadowFilter::Bilinear };
     // Receiver depth bias is clamp(slope_bias * tan(theta), bias, max_bias).
@@ -30,6 +30,7 @@ struct DirectionalShadow {
     // Offset along the world-space surface normal, in scene units.
     float normal_bias {};
 };
+using DirectionalShadow = ShadowOptions;
 struct DirectionalLight {
     // Direction toward the light; magnitude does not affect intensity.
     Vec3                      direction { 0.3f, 0.7f, 1 };
@@ -68,8 +69,9 @@ struct PointLight {
 struct SpotLight {
     PointLight point;
     // Direction from the light into the cone; cosine limits are in [-1, 1].
-    Vec3  direction { 0, 0, -1 };
-    float inner_cos { 1 }, outer_cos { 0 };
+    Vec3                  direction { 0, 0, -1 };
+    float                 inner_cos { 1 }, outer_cos { 0 };
+    Option<ShadowOptions> shadow;
 };
 class SpotLights {
     Option<Arc<Vec<SpotLight>>> values_;

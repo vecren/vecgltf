@@ -203,7 +203,7 @@ TEST(Presentation, SpotReference) {
     auto asset = model({ 2, 2, 2 });
     auto spec =
         parse(
-            R"({"version":2,"spot_lights":[{"position":[1,2,3],"direction":[0,0,-1],"inner_cos":0.9,"outer_cos":0.8,"reference":"scene-root","attenuation":[1,4,8],"attenuation_units":"reference"}]})"_str)
+            R"({"version":2,"spot_lights":[{"position":[1,2,3],"direction":[0,0,-1],"inner_cos":0.9,"outer_cos":0.8,"reference":"scene-root","attenuation":[1,4,8],"attenuation_units":"reference","shadow":{"resolution":256,"bias":0.002}}]})"_str)
             .unwrap();
     auto                bound = gltf::BindPresentation(rstd::move(spec), asset.clone()).unwrap();
     gltf::SceneInstance instance(asset.clone());
@@ -214,6 +214,8 @@ TEST(Presentation, SpotReference) {
     near(light.point.attenuation.z, 2);
     near(light.direction.z, -1);
     near(light.inner_cos, 0.9f);
+    rstd_assert(light.shadow && light.shadow->resolution == 256);
+    near(light.shadow->bias, 0.002f);
     rstd_assert(
         parse(R"({"version":2,"spot_lights":[{"position":[0,0,0],"direction":[0,0,0]}]})"_str)
             .is_err());

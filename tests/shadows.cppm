@@ -265,6 +265,73 @@ TEST(Shadow, OcclusionAndDepth) {
     rstd_assert(session.validation_errors() == 0);
 }
 
+TEST(Shadow, SpotOcclusion) {
+    auto          session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto          queue    = vk::TextureContext::create(session).unwrap();
+    auto          renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    auto          source   = scene_asset();
+    auto          prepared = renderer.prepare(source.clone()).unwrap();
+    SceneInstance scene(source.clone());
+    auto          target    = image::texture(queue);
+    auto          spotlight = [](bool shadow, bool colored = false, bool view_space = false) {
+        SpotLight spot;
+        spot.point.position    = { 0.9f, 0, 1.5f };
+        spot.point.attenuation = { 1, 0, 0 };
+        if (colored) spot.point.color = { 0, 1, 0 };
+        if (view_space) {
+            spot.point.position.z -= 3;
+            spot.point.space = LightSpace::View;
+        }
+        spot.direction = normalized(Vec3 { -0.9f, 0, -1.5f });
+        spot.outer_cos = 0.6f;
+        spot.inner_cos = 0.9f;
+        if (shadow) {
+            ShadowOptions options;
+            options.resolution = 256;
+            options.filter     = ShadowFilter::Nearest;
+            spot.shadow        = Some(options);
+        }
+        Vec<SpotLight> values;
+        values.push(rstd::move(spot));
+        SceneOptions result;
+        result.direct_light  = None();
+        result.ibl_intensity = 0;
+        result.spot_lights   = SpotLights(rstd::move(values));
+        return result;
+    };
+    const auto off = draw(renderer, queue, session, target, prepared, scene, spotlight(false));
+    const auto on  = draw(renderer, queue, session, target, prepared, scene, spotlight(true));
+    unsigned   dark {}, lit {};
+    for (unsigned y = 5; y < 59; ++y)
+        for (unsigned x = 5; x < 59; ++x) {
+            float before = image::channel(off, 0, x, y);
+            float after  = image::channel(on, 0, x, y);
+            if (before > 0.1f && after < before * 0.3f) ++dark;
+            if (before > 0.1f && absolute(after - before) < 0.01f) ++lit;
+        }
+    rstd_assert(dark > 10 && lit > 100);
+    const auto view_light =
+        draw(renderer, queue, session, target, prepared, scene, spotlight(true, false, true));
+    for (unsigned y = 12; y < 54; y += 7)
+        for (unsigned x = 12; x < 54; x += 7)
+            near(image::channel(on, 0, x, y), image::channel(view_light, 0, x, y), 0.01f);
+    auto direction_only                = settings();
+    direction_only.direct_light->color = { 1, 0, 0 };
+    auto both                          = spotlight(true, true);
+    both.direct_light                  = direction_only.direct_light;
+    const auto mixed = draw(renderer, queue, session, target, prepared, scene, rstd::move(both));
+    const auto directional =
+        draw(renderer, queue, session, target, prepared, scene, rstd::move(direction_only));
+    const auto spot =
+        draw(renderer, queue, session, target, prepared, scene, spotlight(true, true));
+    for (unsigned y = 12; y < 54; y += 7)
+        for (unsigned x = 12; x < 54; x += 7) {
+            near(image::channel(mixed, 0, x, y), image::channel(directional, 0, x, y), 0.01f);
+            near(image::channel(mixed, 1, x, y), image::channel(spot, 1, x, y), 0.01f);
+        }
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(Shadow, AlphaAndCulling) {
     auto session  = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto queue    = vk::TextureContext::create(session).unwrap();
@@ -519,6 +586,15 @@ TEST(Shadow, PreparationAndLifetime) {
     invalid                                   = settings();
     invalid.direct_light->shadow->normal_bias = -1;
     rejected(rstd::move(invalid));
+    SpotLight bad_spot;
+    bad_spot.point.position = { 0, 0, 2 };
+    bad_spot.outer_cos      = 0;
+    bad_spot.shadow         = Some(ShadowOptions {});
+    Vec<SpotLight> bad_lights;
+    bad_lights.push(rstd::move(bad_spot));
+    SceneOptions bad_options;
+    bad_options.spot_lights = SpotLights(rstd::move(bad_lights));
+    rejected(rstd::move(bad_options));
     auto pending = renderer.record_scene(work, target, prepared, scene, view(), settings());
     rstd_assert(pending.is_err() && pending.unwrap_err().kind == ErrorKind::Pending);
     unchanged();

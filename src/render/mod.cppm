@@ -216,7 +216,18 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
                     return Err(invalid());
                 if (light.space == LightSpace::View)
                     direction = relative_inverse->vector(direction);
-                direction                   = normalized(direction);
+                direction = normalized(direction);
+                if (spot->shadow) {
+                    auto valid = shadow::ValidateShadow(*spot->shadow, max_extent);
+                    if (valid.is_err()) return Err(valid.unwrap_err());
+                    if (spot->outer_cos <= 0 || spot->outer_cos >= 1) return Err(invalid());
+                    result.shadows.push({ max_directional_lights + i,
+                                          direction,
+                                          *spot->shadow,
+                                          position,
+                                          spot->outer_cos,
+                                          true });
+                }
                 result.points.directions[i] = { direction.x, direction.y, direction.z, 1 };
                 result.points.cones[i]      = { spot->inner_cos, spot->outer_cos, 0, 0 };
             }
@@ -375,11 +386,12 @@ struct FrameParameters {
 };
 static_assert(sizeof(FrameParameters) == 512);
 struct ShadowParameters {
-    Mat4 matrices[max_directional_lights];
-    Vec4 rectangles[max_directional_lights], biases[max_directional_lights];
+    Mat4 matrices[max_directional_lights + max_point_lights];
+    Vec4 rectangles[max_directional_lights + max_point_lights],
+        biases[max_directional_lights + max_point_lights];
     Vec4 atlas;
 };
-static_assert(sizeof(ShadowParameters) == 784);
+static_assert(sizeof(ShadowParameters) == 1552);
 struct PreparedEnvironment {
     Arc<RenderCore>                          core;
     Vec<Arc<vrento::texture::PreparedImage>> textures;

@@ -26,13 +26,12 @@ layout(set=0,binding=3) uniform sampler2D brdf_lut;
 #endif
 #ifndef SHADOW_CAST
 layout(set=0,binding=5) uniform Shadows {
-    mat4 matrices[8];
-    vec4 rectangles[8];
-    vec4 biases[8];
+    mat4 matrices[16];
+    vec4 rectangles[16];
+    vec4 biases[16];
     vec4 atlas;
 } shadows;
 layout(set=0,binding=6) uniform sampler2D shadow_map;
-#ifndef SHADOW_CATCHER
 layout(set=0,binding=7) uniform Points {
     vec4 positions[8];
     vec4 radiances[8];
@@ -41,7 +40,6 @@ layout(set=0,binding=7) uniform Points {
     vec4 directions[8];
     vec4 cones[8];
 } points;
-#endif
 #endif
 #ifndef SHADOW_CATCHER
 layout(set=1,binding=0) uniform sampler2D base_texture;
@@ -117,6 +115,7 @@ float shadow_visibility(int light,vec3 normal,vec3 direction) {
     if(rectangle.z==0) return 1;
     vec4 bias=shadows.biases[light];
     vec4 projected=shadows.matrices[light]*vec4(relative_position+normal*bias.w,1);
+    if(projected.w<=0) return 1;
     vec3 position=projected.xyz/projected.w;
     if(any(lessThan(position,vec3(-1,-1,0))) || any(greaterThan(position.xy,vec2(1)))) return 1;
     float cosine=clamp(dot(normal,direction),0.0005,1);
@@ -131,6 +130,26 @@ float shadow_visibility(int light,vec3 normal,vec3 direction) {
     float c=shadow_compare(first+vec2(0,1),rectangle,depth);
     float d=shadow_compare(first+vec2(1),rectangle,depth);
     return mix(mix(a,b,weight.x),mix(c,d,weight.x),weight.y);
+}
+vec3 local_radiance(int index,out vec3 l) {
+    vec3 delta=points.positions[index].xyz-relative_position;
+    float scale=max(abs(delta.x),max(abs(delta.y),abs(delta.z)));
+    if(scale==0) { l=vec3(0); return vec3(0); }
+    vec3 scaled=delta/scale;
+    float unit_distance=length(scaled);
+    l=scaled/unit_distance;
+    vec3 coefficients=points.attenuation[index].xyz;
+    float attenuation=coefficients.x;
+    if(coefficients.y>0) attenuation+=(coefficients.y*scale)*unit_distance;
+    if(coefficients.z>0) attenuation+=((coefficients.z*scale)*scale)*(unit_distance*unit_distance);
+    vec3 radiance=points.radiances[index].rgb/max(attenuation,0.0001);
+    if(points.directions[index].w>0) {
+        float c=dot(-l,points.directions[index].xyz);
+        vec2 limits=points.cones[index].xy;
+        float angular=limits.x>limits.y ? smoothstep(limits.y,limits.x,c) : step(limits.y,c);
+        radiance*=max(c,0)*angular;
+    }
+    return radiance;
 }
 #ifndef SHADOW_CATCHER
 vec3 direct_brdf(vec3 n,vec3 v,vec3 l,vec3 f0,vec3 diffuse_color,float a2,float nv,bool specular_glossiness) {
@@ -156,6 +175,14 @@ void main() {
         float weight=dot(frame.light_radiances[index].rgb,vec3(0.2126,0.7152,0.0722));
         total+=weight;
         visibility+=weight*shadow_visibility(index,normal,frame.light_directions[index].xyz);
+    }
+    for(int index=0;index<int(points.metadata.x);++index) {
+        if(shadows.rectangles[8+index].z==0) continue;
+        vec3 l;
+        vec3 radiance=local_radiance(index,l);
+        float weight=dot(radiance,vec3(0.2126,0.7152,0.0722))*max(dot(normal,l),0);
+        total+=weight;
+        visibility+=weight*shadow_visibility(8+index,normal,l);
     }
     if(total<=0) discard;
     visibility/=total;
@@ -204,22 +231,11 @@ void main() {
         color+=direct_brdf(n,v,l,f0,diffuse_color,a2,nv,specular_glossiness)*frame.light_radiances[index].rgb*shadow;
     }
     for(int index=0;index<int(points.metadata.x);++index) {
-        vec3 delta=points.positions[index].xyz-relative_position;
-        float scale=max(abs(delta.x),max(abs(delta.y),abs(delta.z)));
-        if(scale==0) continue;
-        vec3 scaled=delta/scale;
-        float unit_distance=length(scaled);
-        vec3 l=scaled/unit_distance;
-        vec3 coefficients=points.attenuation[index].xyz;
-        float attenuation=coefficients.x;
-        if(coefficients.y>0) attenuation+=(coefficients.y*scale)*unit_distance;
-        if(coefficients.z>0) attenuation+=((coefficients.z*scale)*scale)*(unit_distance*unit_distance);
-        vec3 radiance=points.radiances[index].rgb/max(attenuation,0.0001);
+        vec3 l;
+        vec3 radiance=local_radiance(index,l);
         if(points.directions[index].w>0) {
-            float c=dot(-l,points.directions[index].xyz);
-            vec2 limits=points.cones[index].xy;
-            float angular=limits.x>limits.y ? smoothstep(limits.y,limits.x,c) : step(limits.y,c);
-            radiance*=max(c,0)*angular;
+            vec3 geometry_normal=normalize(world_normal)*(front ? 1 : -1);
+            radiance*=shadow_visibility(8+index,geometry_normal,l);
         }
         color+=direct_brdf(n,v,l,f0,diffuse_color,a2,nv,specular_glossiness)*radiance;
     }

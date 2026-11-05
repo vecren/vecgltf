@@ -511,6 +511,8 @@ public:
                     fail(path.as_str(), "direction is required"_str);
                 number(value, "inner_cos"_str, light.inner_cos, path.as_str());
                 number(value, "outer_cos"_str, light.outer_cos, path.as_str());
+                if (auto input = field(value, "shadow"_str))
+                    light.shadow = Some(shadow(*input, rstd::format("{}.shadow", path).as_str()));
                 if (gltf::dot(light.direction, light.direction) <= 1e-20f || light.outer_cos < -1 ||
                     light.inner_cos > 1 || light.outer_cos > light.inner_cos)
                     fail(path.as_str(), "invalid spot direction or cone"_str);

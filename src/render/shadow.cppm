@@ -6,7 +6,7 @@ using namespace rstd::literals;
 namespace vecgltf::shadow::detail
 {
 auto error(ref<str> message, ErrorKind kind = ErrorKind::InvalidAsset) -> Error {
-    return { kind, {}, "directional shadow"_Str, String::make(message) };
+    return { kind, {}, "shadow"_Str, String::make(message) };
 }
 bool finite(Vec3 value) {
     return rstd::f32(value.x).is_finite() && rstd::f32(value.y).is_finite() &&
@@ -25,6 +25,9 @@ struct ShadowLight {
     unsigned          index {};
     Vec3              direction;
     DirectionalShadow options;
+    Vec3              position {};
+    float             outer_cos {};
+    bool              spot {};
 };
 struct ShadowView {
     unsigned          light_index {}, x {}, y {}, resolution {};
@@ -47,7 +50,7 @@ auto ValidateShadow(const DirectionalShadow& options, unsigned max_extent) -> Re
         return Err(detail::error("invalid shadow options"_str));
     return Ok(empty {});
 }
-// Directions are normalized world-space vectors toward the lights; bounds use the render origin.
+// Directions point toward directional lights and away from spot lights.
 auto BuildShadowPlan(slice<ShadowLight> lights, const Bounds& bounds, unsigned max_extent)
     -> Result<ShadowPlan, Error> {
     unsigned cell {};
@@ -95,7 +98,11 @@ auto BuildShadowPlan(slice<ShadowLight> lights, const Bounds& bounds, unsigned m
         const auto& light = lights[i];
         if (! detail::finite(light.direction) || dot(light.direction, light.direction) <= 1e-20f)
             return Err(detail::error("invalid shadow direction"_str));
-        Vec3 eye = center + light.direction * (2 * radius);
+        if (light.spot &&
+            (! detail::finite(light.position) || ! rstd::f32(light.outer_cos).is_finite() ||
+             light.outer_cos <= 0 || light.outer_cos >= 1))
+            return Err(detail::error("invalid spot shadow projection"_str));
+        Vec3 eye = light.spot ? light.position : center + light.direction * (2 * radius);
         if (! detail::finite(eye))
             return Err(detail::error("caster bounds exceed shadow precision"_str));
         Vec3       up = absolute(light.direction.y) > 0.99f ? Vec3 { 0, 0, 1 } : Vec3 { 0, 1, 0 };
@@ -105,7 +112,14 @@ auto BuildShadowPlan(slice<ShadowLight> lights, const Bounds& bounds, unsigned m
         view.y           = unsigned(i.to_primitive() / columns) * cell;
         view.resolution  = light.options.resolution;
         view.options     = light.options;
-        view.view        = look_at(eye, center, up);
+        if (light.spot) {
+            view.view = look_at({}, light.direction, up);
+            for (unsigned row = 0; row < 3; ++row)
+                view.view.m[12 + row] =
+                    float(-double(view.view.m[row]) * eye.x - double(view.view.m[4 + row]) * eye.y -
+                          double(view.view.m[8 + row]) * eye.z);
+        } else
+            view.view = look_at(eye, center, up);
         float near = rstd::f32::INFINITY_.to_primitive(), far = -near;
         for (unsigned corner = 0; corner < 8; ++corner) {
             Vec3  point { corner & 1 ? bounds.max.x : bounds.min.x,
@@ -115,16 +129,28 @@ auto BuildShadowPlan(slice<ShadowLight> lights, const Bounds& bounds, unsigned m
             near           = minimum(near, distance);
             far            = maximum(far, distance);
         }
-        near = maximum(0, near - padding);
+        if (light.spot && far <= 0) continue;
+        near = light.spot ? maximum(maximum(radius * 0.0001f, far * 0.0001f), near - padding)
+                          : maximum(0, near - padding);
         far  = maximum(near + padding, far + padding);
         if (! rstd::f32(near).is_finite() || ! rstd::f32(far).is_finite() || far <= near)
             return Err(detail::error("caster bounds exceed shadow precision"_str));
-        view.projection       = Mat4::Identity();
-        view.projection.m[0]  = 1 / radius;
-        view.projection.m[5]  = -1 / radius;
-        view.projection.m[10] = 1 / (near - far);
-        view.projection.m[14] = near / (near - far);
-        view.matrix           = view.projection * view.view;
+        view.projection = Mat4::Identity();
+        if (light.spot) {
+            float cotangent = light.outer_cos / square_root(1 - light.outer_cos * light.outer_cos);
+            view.projection.m[0]  = cotangent;
+            view.projection.m[5]  = -cotangent;
+            view.projection.m[10] = far / (near - far);
+            view.projection.m[11] = -1;
+            view.projection.m[14] = far * near / (near - far);
+            view.projection.m[15] = 0;
+        } else {
+            view.projection.m[0]  = 1 / radius;
+            view.projection.m[5]  = -1 / radius;
+            view.projection.m[10] = 1 / (near - far);
+            view.projection.m[14] = near / (near - far);
+        }
+        view.matrix = view.projection * view.view;
         if (! detail::finite(view.view) || ! detail::finite(view.projection) ||
             ! detail::finite(view.matrix))
             return Err(detail::error("caster bounds exceed shadow precision"_str));
