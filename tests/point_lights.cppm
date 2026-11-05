@@ -116,6 +116,35 @@ TEST(PointLight, AttenuationAndDirectional) {
     rstd_assert(session.validation_errors() == 0);
 }
 
+TEST(PointLight, SpotCone) {
+    auto          session  = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto          queue    = vk::TextureContext::create(session).unwrap();
+    auto          renderer = Renderer::create(session, { 64, 64 }).unwrap();
+    auto          source   = triangle();
+    auto          prepared = renderer.prepare(source.clone()).unwrap();
+    SceneInstance scene(source.clone());
+    auto          target    = image::texture(queue);
+    auto          draw_spot = [&](Vec3 direction) {
+        auto           settings = empty_options();
+        Vec<SpotLight> lights;
+        SpotLight      spot;
+        spot.point     = point();
+        spot.direction = direction;
+        spot.inner_cos = 0.9f;
+        spot.outer_cos = 0.8f;
+        lights.push(rstd::move(spot));
+        settings.spot_lights = SpotLights(rstd::move(lights));
+        return draw(renderer, queue, session, target, prepared, scene, rstd::move(settings));
+    };
+    const auto inside  = draw_spot({ 0, 0, -1 });
+    const auto edge    = draw_spot({ 0.5267827f, 0, -0.85f });
+    const auto outside = draw_spot({ 1, 0, 0 });
+    rstd_assert(image::channel(inside, 0) > 0.1f);
+    near(image::channel(edge, 0) / image::channel(inside, 0), 0.425f, 0.015f);
+    rstd_assert(image::channel(outside, 0) < 0.001f);
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(PointLight, AdditionAndEmpty) {
     auto          session  = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto          queue    = vk::TextureContext::create(session).unwrap();

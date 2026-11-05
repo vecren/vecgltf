@@ -18,6 +18,8 @@ layout(set=0,binding=7) uniform Points {
     vec4 radiances[8];
     vec4 attenuation[8];
     vec4 metadata;
+    vec4 directions[8];
+    vec4 cones[8];
 } points;
 void main() {
     // The far plane can have w=0 for an infinite perspective projection.

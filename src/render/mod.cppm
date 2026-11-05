@@ -62,8 +62,9 @@ auto camera_relative_view(const Mat4& view, Vec3 origin) -> Mat4;
 struct PointParameters {
     Vec4 positions[max_point_lights], radiances[max_point_lights], attenuation[max_point_lights];
     Vec4 metadata;
+    Vec4 directions[max_point_lights], cones[max_point_lights];
 };
-static_assert(sizeof(PointParameters) == 400);
+static_assert(sizeof(PointParameters) == 656);
 struct LightingParameters {
     Vec4                     directions[max_directional_lights], radiances[max_directional_lights];
     unsigned                 count {};
@@ -168,14 +169,17 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
         auto added = append(*options.direct_light);
         if (added.is_err()) return Err(added.unwrap_err());
     }
-    if (options.point_lights) {
-        const auto& points = options.point_lights.values();
-        if (count(points) > max_point_lights)
+    {
+        unsigned point_count = options.point_lights ? count(options.point_lights.values()) : 0;
+        unsigned spot_count  = options.spot_lights ? count(options.spot_lights.values()) : 0;
+        if (point_count + spot_count > max_point_lights)
             return Err(
-                render_error("render options"_str, "too many point lights"_str, ErrorKind::Limit));
+                render_error("render options"_str, "too many local lights"_str, ErrorKind::Limit));
         Option<Mat4> relative_inverse;
-        for (unsigned i = 0; i < count(points); ++i) {
-            const auto& light  = at(points, i);
+        for (unsigned i = 0; i < point_count + spot_count; ++i) {
+            const auto* spot =
+                i >= point_count ? &at(options.spot_lights.values(), i - point_count) : nullptr;
+            const auto& light  = spot ? spot->point : at(options.point_lights.values(), i);
             auto        finite = [](Vec3 value) {
                 return rstd::f32(value.x).is_finite() && rstd::f32(value.y).is_finite() &&
                        rstd::f32(value.z).is_finite();
@@ -203,6 +207,19 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
                              float(double(light.position.y) - view.eye.y),
                              float(double(light.position.z) - view.eye.z) };
             if (! finite(position)) return Err(invalid());
+            if (spot) {
+                auto direction = spot->direction;
+                if (! finite(direction) || dot(direction, direction) <= 1e-20f ||
+                    ! rstd::f32(spot->inner_cos).is_finite() ||
+                    ! rstd::f32(spot->outer_cos).is_finite() || spot->outer_cos < -1 ||
+                    spot->inner_cos > 1 || spot->outer_cos > spot->inner_cos)
+                    return Err(invalid());
+                if (light.space == LightSpace::View)
+                    direction = relative_inverse->vector(direction);
+                direction                   = normalized(direction);
+                result.points.directions[i] = { direction.x, direction.y, direction.z, 1 };
+                result.points.cones[i]      = { spot->inner_cos, spot->outer_cos, 0, 0 };
+            }
             result.points.positions[i]   = { position.x, position.y, position.z, 0 };
             result.points.radiances[i]   = { light.color.x * light.intensity,
                                              light.color.y * light.intensity,
@@ -212,7 +229,7 @@ auto lower_lighting(const RenderOptions& options, const View& view, unsigned max
                 light.attenuation.x, light.attenuation.y, light.attenuation.z, 0
             };
         }
-        result.points.metadata.x = float(count(points));
+        result.points.metadata.x = float(point_count + spot_count);
     }
     if (options.background_color) {
         result.points.metadata.y = options.background_color->x;
@@ -268,7 +285,8 @@ auto scene_render_options(const SceneOptions& options) -> RenderOptions {
              options.point_lights,
              options.background_color,
              options.alpha_dither_seed,
-             options.shadow_catcher };
+             options.shadow_catcher,
+             options.spot_lights };
 }
 enum class ModelPipeline : unsigned
 {

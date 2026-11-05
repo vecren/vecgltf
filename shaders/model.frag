@@ -38,6 +38,8 @@ layout(set=0,binding=7) uniform Points {
     vec4 radiances[8];
     vec4 attenuation[8];
     vec4 metadata;
+    vec4 directions[8];
+    vec4 cones[8];
 } points;
 #endif
 #endif
@@ -213,6 +215,12 @@ void main() {
         if(coefficients.y>0) attenuation+=(coefficients.y*scale)*unit_distance;
         if(coefficients.z>0) attenuation+=((coefficients.z*scale)*scale)*(unit_distance*unit_distance);
         vec3 radiance=points.radiances[index].rgb/max(attenuation,0.0001);
+        if(points.directions[index].w>0) {
+            float c=dot(-l,points.directions[index].xyz);
+            vec2 limits=points.cones[index].xy;
+            float angular=limits.x>limits.y ? smoothstep(limits.y,limits.x,c) : step(limits.y,c);
+            radiance*=max(c,0)*angular;
+        }
         color+=direct_brdf(n,v,l,f0,diffuse_color,a2,nv,specular_glossiness)*radiance;
     }
     float occlusion=mix(1,texture(occlusion_texture,uv(3)).r,material.factors.w);

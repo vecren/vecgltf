@@ -199,6 +199,30 @@ TEST(Presentation, PointAttenuationUsesDeclaredDistanceUnits) {
     rstd_assert(gltf::BindPresentation(rstd::move(world), nonuniform.clone()).is_ok());
 }
 
+TEST(Presentation, SpotReference) {
+    auto asset = model({ 2, 2, 2 });
+    auto spec =
+        parse(
+            R"({"version":2,"spot_lights":[{"position":[1,2,3],"direction":[0,0,-1],"inner_cos":0.9,"outer_cos":0.8,"reference":"scene-root","attenuation":[1,4,8],"attenuation_units":"reference"}]})"_str)
+            .unwrap();
+    auto                bound = gltf::BindPresentation(rstd::move(spec), asset.clone()).unwrap();
+    gltf::SceneInstance instance(asset.clone());
+    auto                resolved = gltf::ResolvePresentation(bound, instance).unwrap();
+    auto                light    = gltf::at(resolved.scene.spot_lights.values(), 0);
+    near(light.point.position.x, 3);
+    near(light.point.attenuation.y, 2);
+    near(light.point.attenuation.z, 2);
+    near(light.direction.z, -1);
+    near(light.inner_cos, 0.9f);
+    rstd_assert(
+        parse(R"({"version":2,"spot_lights":[{"position":[0,0,0],"direction":[0,0,0]}]})"_str)
+            .is_err());
+    rstd_assert(
+        parse(
+            R"({"version":2,"spot_lights":[{"position":[0,0,0],"direction":[0,0,-1],"inner_cos":0.1,"outer_cos":0.9}]})"_str)
+            .is_err());
+}
+
 TEST(Presentation, ExposureAndViewEnvironmentResolveWithoutReparsing) {
     auto asset = model();
     auto bound =

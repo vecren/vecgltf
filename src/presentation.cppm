@@ -30,6 +30,9 @@ struct PresentationPointLight {
     PresentationReference reference;
     bool                  reference_attenuation {};
 };
+struct PresentationSpotLight {
+    PresentationPointLight point;
+};
 struct PresentationCamera {
     CameraLookAt          look_at;
     Vec3                  up { 0, 1, 0 };
@@ -52,6 +55,7 @@ struct PresentationSpec {
     Option<PresentationEnvironment> environment;
     Vec<PresentationLight>          lights;
     Vec<PresentationPointLight>     point_lights;
+    Vec<PresentationSpotLight>      spot_lights;
     gltf::MaterialOverrides         material_overrides;
     PresentationReference           shadow_catcher_reference;
     PresentationReference           environment_reference;
@@ -451,15 +455,17 @@ public:
         settings.scene.direct_light       = None();
         settings.scene.directional_lights = gltf::DirectionalLights(rstd::move(initial));
     }
-    void point_lights(const Json& input, PresentationSpec& settings) {
+    void point_lights(const Json& input, PresentationSpec& settings, bool spot = false) {
         auto values = input.as_array();
         if (! values || values.unwrap().get().len() > usize(gltf::max_point_lights)) {
             fail("point_lights"_str, "expected at most eight point lights"_str);
             return;
         }
         Vec<gltf::PointLight> initial;
+        Vec<gltf::SpotLight>  initial_spots;
         for (const auto& value : values.unwrap().get()) {
-            auto path = rstd::format("point_lights[{}]", settings.point_lights.len());
+            auto path = spot ? rstd::format("spot_lights[{}]", settings.spot_lights.len())
+                             : rstd::format("point_lights[{}]", settings.point_lights.len());
             if (! object(value, path.as_str())) return;
             PresentationPointLight entry;
             entry.light.intensity = 1;
@@ -495,10 +501,30 @@ public:
             entry.light.space = entry.reference.space == PresentationSpace::View
                                     ? gltf::LightSpace::View
                                     : gltf::LightSpace::World;
-            initial.push(gltf::PointLight(entry.light));
-            settings.point_lights.push(rstd::move(entry));
+            if (spot) {
+                gltf::SpotLight light;
+                light.point = entry.light;
+                if (auto direction = field(value, "direction"_str))
+                    light.direction =
+                        vector3(*direction, rstd::format("{}.direction", path).as_str());
+                else
+                    fail(path.as_str(), "direction is required"_str);
+                number(value, "inner_cos"_str, light.inner_cos, path.as_str());
+                number(value, "outer_cos"_str, light.outer_cos, path.as_str());
+                if (gltf::dot(light.direction, light.direction) <= 1e-20f || light.outer_cos < -1 ||
+                    light.inner_cos > 1 || light.outer_cos > light.inner_cos)
+                    fail(path.as_str(), "invalid spot direction or cone"_str);
+                initial_spots.push(rstd::move(light));
+                settings.spot_lights.push({ rstd::move(entry) });
+            } else {
+                initial.push(gltf::PointLight(entry.light));
+                settings.point_lights.push(rstd::move(entry));
+            }
         }
-        settings.scene.point_lights = gltf::PointLights(rstd::move(initial));
+        if (spot)
+            settings.scene.spot_lights = gltf::SpotLights(rstd::move(initial_spots));
+        else
+            settings.scene.point_lights = gltf::PointLights(rstd::move(initial));
     }
     auto environment(const Json& input, PresentationSpec& settings) -> Option<EnvironmentFiles> {
         if (! object(input, "environment"_str)) return None();
@@ -771,6 +797,8 @@ auto ParsePresentation(slice<u8> bytes, ref<str> source) -> Result<PresentationS
     if (auto input = reader.field(data, "camera"_str)) reader.camera(*input, output);
     if (auto lights = reader.field(data, "directional_lights"_str)) reader.lights(*lights, output);
     if (auto lights = reader.field(data, "point_lights"_str)) reader.point_lights(*lights, output);
+    if (auto lights = reader.field(data, "spot_lights"_str))
+        reader.point_lights(*lights, output, true);
     if (auto values = reader.field(data, "material_overrides"_str))
         reader.materials(*values, output);
     if (auto value = reader.field(data, "shadow_catcher"_str))
@@ -928,6 +956,33 @@ auto resolve_scene(const PresentationSpec&    configured,
         }
         result.directional_lights = gltf::DirectionalLights(rstd::move(lights));
     }
+    auto resolve_local_light = [&](gltf::PointLight&             light,
+                                   const PresentationPointLight& config) -> Result<Mat4, Error> {
+        if (config.reference.space == PresentationSpace::View) {
+            light.space = gltf::LightSpace::View;
+            return Ok(Mat4::Identity());
+        }
+        auto transform = presentation_detail::reference_transform(
+            config.reference, instance, configured.source.as_str(), "local_light.reference"_str);
+        if (transform.is_err()) return Err(transform.unwrap_err());
+        auto matrix    = transform.unwrap();
+        light.position = matrix.point(light.position);
+        if (config.reference_attenuation) {
+            auto scale = uniform_scale(
+                matrix, configured.source.as_str(), "local_light.attenuation_units"_str);
+            if (scale.is_err()) return Err(scale.unwrap_err());
+            float s = scale.unwrap();
+            light.attenuation.y /= s;
+            light.attenuation.z /= s * s;
+            if (! rstd::f32(light.attenuation.y).is_finite() ||
+                ! rstd::f32(light.attenuation.z).is_finite())
+                return Err(error(configured.source.as_str(),
+                                 "local_light.attenuation"_str,
+                                 "attenuation conversion is not finite"_str));
+        }
+        light.space = gltf::LightSpace::World;
+        return Ok(matrix);
+    };
     if (current.point_lights) {
         const auto& inputs = current.point_lights.values();
         if (! inputs.is_empty() && inputs.len() != configured.point_lights.len())
@@ -937,36 +992,35 @@ auto resolve_scene(const PresentationSpec&    configured,
                                            "light count differs from reference settings"_str));
         Vec<gltf::PointLight> lights;
         for (unsigned i = 0; i < gltf::count(inputs); ++i) {
-            auto light     = gltf::at(inputs, i);
-            auto reference = gltf::at(configured.point_lights, i).reference;
-            if (reference.space == PresentationSpace::View)
-                light.space = gltf::LightSpace::View;
-            else {
-                auto transform = presentation_detail::reference_transform(
-                    reference,
-                    instance,
-                    configured.source.as_str(),
-                    rstd::format("point_lights[{}].reference", i).as_str());
-                if (transform.is_err()) return Err(transform.unwrap_err());
-                light.position = transform.unwrap().point(light.position);
-                if (gltf::at(configured.point_lights, i).reference_attenuation) {
-                    auto scale = uniform_scale(transform.unwrap(),
-                                               configured.source.as_str(),
-                                               "point_lights.attenuation_units"_str);
-                    if (scale.is_err()) return Err(scale.unwrap_err());
-                    light.attenuation.y /= scale.unwrap();
-                    light.attenuation.z /= scale.unwrap() * scale.unwrap();
-                    if (! rstd::f32(light.attenuation.y).is_finite() ||
-                        ! rstd::f32(light.attenuation.z).is_finite())
-                        return Err(error(configured.source.as_str(),
-                                         "point_lights.attenuation"_str,
-                                         "attenuation conversion is not finite"_str));
-                }
-                light.space = gltf::LightSpace::World;
-            }
+            auto light    = gltf::at(inputs, i);
+            auto resolved = resolve_local_light(light, gltf::at(configured.point_lights, i));
+            if (resolved.is_err()) return Err(resolved.unwrap_err());
             lights.push(rstd::move(light));
         }
         result.point_lights = gltf::PointLights(rstd::move(lights));
+    }
+    if (current.spot_lights) {
+        const auto& inputs = current.spot_lights.values();
+        if (! inputs.is_empty() && inputs.len() != configured.spot_lights.len())
+            return Err(error(configured.source.as_str(),
+                             "spot_lights"_str,
+                             "light count differs from reference settings"_str));
+        Vec<gltf::SpotLight> lights;
+        for (unsigned i = 0; i < gltf::count(inputs); ++i) {
+            auto light = gltf::at(inputs, i);
+            auto resolved =
+                resolve_local_light(light.point, gltf::at(configured.spot_lights, i).point);
+            if (resolved.is_err()) return Err(resolved.unwrap_err());
+            auto matrix = resolved.unwrap();
+            if (light.point.space == gltf::LightSpace::World) {
+                auto orientation =
+                    rotation(matrix, configured.source.as_str(), "spot_lights.reference"_str, true);
+                if (orientation.is_err()) return Err(orientation.unwrap_err());
+                light.direction = orientation.unwrap().vector(light.direction);
+            }
+            lights.push(rstd::move(light));
+        }
+        result.spot_lights = gltf::SpotLights(rstd::move(lights));
     }
     if (configured.environment_transform) {
         Result<Mat4, Error> rotation =

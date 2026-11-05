@@ -65,6 +65,31 @@ struct PointLight {
     Vec3       attenuation { 1, 0, 1 };
     LightSpace space { LightSpace::World };
 };
+struct SpotLight {
+    PointLight point;
+    // Direction from the light into the cone; cosine limits are in [-1, 1].
+    Vec3  direction { 0, 0, -1 };
+    float inner_cos { 1 }, outer_cos { 0 };
+};
+class SpotLights {
+    Option<Arc<Vec<SpotLight>>> values_;
+
+public:
+    SpotLights() = default;
+    explicit SpotLights(Vec<SpotLight> values)
+        : values_(Some(Arc<Vec<SpotLight>>::make(rstd::move(values)))) {}
+    SpotLights(const SpotLights& other)
+        : values_(other.present() ? Some(other.values_->clone()) : None()) {}
+    SpotLights(SpotLights&&)                    = default;
+    auto operator=(SpotLights&&) -> SpotLights& = default;
+    auto operator=(const SpotLights& other) -> SpotLights& {
+        if (this != &other) values_ = other.present() ? Some(other.values_->clone()) : None();
+        return *this;
+    }
+    bool                  present() const { return values_.is_some(); }
+    explicit              operator bool() const { return present(); }
+    const Vec<SpotLight>& values() const { return **values_; }
+};
 inline constexpr unsigned max_point_lights = 8;
 class PointLights {
     Option<Arc<Vec<PointLight>>> values_;
@@ -145,6 +170,7 @@ struct RenderOptions {
     // Stable screen-space sample; callers may advance it when accumulating frames.
     unsigned              alpha_dither_seed {};
     Option<ShadowCatcher> shadow_catcher;
+    SpotLights            spot_lights;
 };
 struct SceneOptions {
     DebugView                debug {};
@@ -158,5 +184,6 @@ struct SceneOptions {
     Option<Vec3>             background_color;
     unsigned                 alpha_dither_seed {};
     Option<ShadowCatcher>    shadow_catcher;
+    SpotLights               spot_lights;
 };
 } // namespace vecgltf
