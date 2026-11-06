@@ -3,6 +3,11 @@ export import vecgltf.camera;
 
 export namespace vecgltf
 {
+enum class SceneBoundsMode
+{
+    Exact,
+    Conservative
+};
 struct NodePose {
     Vec3        translation, scale;
     Vec4        rotation;
@@ -12,15 +17,16 @@ struct NodePose {
     Vec<Bounds> primitive_bounds;
 };
 class SceneInstance {
-    Arc<Asset>    asset_;
-    Vec<NodePose> poses_;
-    Vec<unsigned> order_;
-    Vec<bool>     visible_;
-    unsigned      scene_ {}, animation_ { invalid_index };
-    float         time_ {};
-    bool          playing_ { true }, looping_ { true };
-    u64           revision_ { 1 };
-    Bounds        bounds_;
+    Arc<Asset>      asset_;
+    Vec<NodePose>   poses_;
+    Vec<unsigned>   order_;
+    Vec<bool>       visible_;
+    unsigned        scene_ {}, animation_ { invalid_index };
+    float           time_ {};
+    bool            playing_ { true }, looping_ { true };
+    SceneBoundsMode bounds_mode_ { SceneBoundsMode::Exact };
+    u64             revision_ { 1 };
+    Bounds          bounds_;
 
     struct Position {
         double x, y, z;
@@ -147,7 +153,7 @@ class SceneInstance {
             if (! at(visible_, i) || node.mesh == invalid_index) continue;
             const auto& mesh = at(asset_->meshes, node.mesh);
             for (unsigned p = 0; p < count(mesh.primitives); ++p) {
-                auto bounds = relative_primitive_bounds(i, p, {});
+                auto bounds = selected_primitive_bounds(i, p, {});
                 if (bounds.valid) {
                     bounds_.include(bounds.min);
                     bounds_.include(bounds.max);
@@ -159,7 +165,8 @@ class SceneInstance {
     }
 
 public:
-    explicit SceneInstance(Arc<Asset> asset): asset_(rstd::move(asset)) {
+    explicit SceneInstance(Arc<Asset> asset, SceneBoundsMode bounds_mode = SceneBoundsMode::Exact)
+        : asset_(rstd::move(asset)), bounds_mode_(bounds_mode) {
         for (const auto& node : asset_->nodes)
             poses_.push({ node.translation,
                           node.scale,
@@ -182,14 +189,37 @@ public:
         if (roots.len() != usize(1) || ! visible(at(roots, 0))) return None();
         return Some(asset_->node_id(at(roots, 0)));
     }
-    unsigned      animation() const { return animation_; }
-    float         time() const { return time_; }
-    bool          playing() const { return playing_; }
-    void          set_playing(bool value) { playing_ = value; }
-    void          set_looping(bool value) { looping_ = value; }
-    u64           revision() const { return revision_; }
-    const Bounds& bounds() const { return bounds_; }
-    auto          camera_frame(AssetId id, float focus_distance = 1) const -> Option<CameraFrame> {
+    unsigned        animation() const { return animation_; }
+    float           time() const { return time_; }
+    bool            playing() const { return playing_; }
+    void            set_playing(bool value) { playing_ = value; }
+    void            set_looping(bool value) { looping_ = value; }
+    u64             revision() const { return revision_; }
+    const Bounds&   bounds() const { return bounds_; }
+    SceneBoundsMode bounds_mode() const { return bounds_mode_; }
+    void            set_bounds_mode(SceneBoundsMode value) {
+        if (value == bounds_mode_) return;
+        bounds_mode_ = value;
+        evaluate();
+    }
+    auto exact_bounds(Vec3 origin = {}) const -> Bounds {
+        Bounds result;
+        for (unsigned i = 0; i < count(asset_->nodes); ++i) {
+            const auto& node = at(asset_->nodes, i);
+            if (! visible(i) || node.mesh == invalid_index || node.mesh >= count(asset_->meshes))
+                continue;
+            const auto& mesh = at(asset_->meshes, node.mesh);
+            for (unsigned p = 0; p < count(mesh.primitives); ++p) {
+                auto bounds = relative_primitive_bounds(i, p, origin);
+                if (bounds.valid) {
+                    result.include(bounds.min);
+                    result.include(bounds.max);
+                }
+            }
+        }
+        return result;
+    }
+    auto camera_frame(AssetId id, float focus_distance = 1) const -> Option<CameraFrame> {
         auto node = asset_->node(id);
         if (node.is_none() || (**node).camera == invalid_index ||
             (**node).camera >= count(asset_->cameras))
@@ -322,6 +352,70 @@ public:
                 result.include({ float(point.x), float(point.y), float(point.z) });
             }
         }
+        return result;
+    }
+    auto selected_primitive_bounds(unsigned node_index, unsigned primitive_index, Vec3 origin) const
+        -> Bounds {
+        if (bounds_mode_ != SceneBoundsMode::Conservative || ! visible(node_index))
+            return relative_primitive_bounds(node_index, primitive_index, origin);
+        const auto& node = at(asset_->nodes, node_index);
+        if (node.skin == invalid_index || node.mesh == invalid_index ||
+            node.mesh >= count(asset_->meshes))
+            return relative_primitive_bounds(node_index, primitive_index, origin);
+        const auto& mesh = at(asset_->meshes, node.mesh);
+        if (primitive_index >= count(mesh.primitives))
+            return relative_primitive_bounds(node_index, primitive_index, origin);
+        const auto& primitive = at(mesh.primitives, primitive_index);
+        if (primitive.joint_bounds.is_empty() || ! primitive.morphs.is_empty())
+            return relative_primitive_bounds(node_index, primitive_index, origin);
+        const auto& palette = at(poses_, node_index).skin_palette;
+        Bounds      result;
+        double      scale[] { 0, 0, 0 };
+        auto        abs_double = [](double value) {
+            return value < 0 ? -value : value;
+        };
+        for (const auto& joint : primitive.joint_bounds) {
+            if (! joint.bounds.valid || joint.joint >= count(palette))
+                return relative_primitive_bounds(node_index, primitive_index, origin);
+            const auto& matrix = at(palette, joint.joint);
+            for (float value : matrix.m)
+                if (! rstd::f32(value).is_finite())
+                    return relative_primitive_bounds(node_index, primitive_index, origin);
+            if (matrix.m[3] != 0 || matrix.m[7] != 0 || matrix.m[11] != 0 || matrix.m[15] != 1)
+                return relative_primitive_bounds(node_index, primitive_index, origin);
+            for (unsigned corner = 0; corner < 8; ++corner) {
+                Vec3  point { corner & 1 ? joint.bounds.max.x : joint.bounds.min.x,
+                              corner & 2 ? joint.bounds.max.y : joint.bounds.min.y,
+                              corner & 4 ? joint.bounds.max.z : joint.bounds.min.z };
+                auto  p = relative_point(matrix, point, origin);
+                float origins[] { origin.x, origin.y, origin.z };
+                for (unsigned axis = 0; axis < 3; ++axis) {
+                    double terms = abs_double(double(matrix.m[axis]) * point.x) +
+                                   abs_double(double(matrix.m[4 + axis]) * point.y) +
+                                   abs_double(double(matrix.m[8 + axis]) * point.z) +
+                                   abs_double(double(matrix.m[12 + axis]) - origins[axis]);
+                    if (terms > scale[axis]) scale[axis] = terms;
+                }
+                Vec3 value { float(p.x), float(p.y), float(p.z) };
+                if (! rstd::f32(value.x).is_finite() || ! rstd::f32(value.y).is_finite() ||
+                    ! rstd::f32(value.z).is_finite())
+                    return relative_primitive_bounds(node_index, primitive_index, origin);
+                result.include(value);
+            }
+        }
+        if (! result.valid) return relative_primitive_bounds(node_index, primitive_index, origin);
+        auto pad = [&](float& lower, float& upper, double term_scale) {
+            float magnitude = maximum(absolute(lower), absolute(upper));
+            float margin    = float(double(magnitude) * primitive.joint_weight_error +
+                                    term_scale * (16 * double(rstd::f32::EPSILON.to_primitive())));
+            lower           = rstd::f32(lower - margin).next_down().to_primitive();
+            upper           = rstd::f32(upper + margin).next_up().to_primitive();
+            return rstd::f32(lower).is_finite() && rstd::f32(upper).is_finite();
+        };
+        if (! pad(result.min.x, result.max.x, scale[0]) ||
+            ! pad(result.min.y, result.max.y, scale[1]) ||
+            ! pad(result.min.z, result.max.z, scale[2]))
+            return relative_primitive_bounds(node_index, primitive_index, origin);
         return result;
     }
 };

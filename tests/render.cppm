@@ -872,12 +872,37 @@ TEST(Render, BlendOcclusion) {
             vertex.uv0        = { 0.25f, 0.5f };
             primitive.bounds.include(vertex.position);
         }
+        bool skin_blend = sample.split && ! sample.opaque_rear;
+        if (skin_blend) {
+            primitive.skin_attributes = true;
+            for (auto& vertex : primitive.vertices) {
+                vertex.joints[1] = 1;
+                vertex.weights   = { 0.9f, 0.1f, 0, 0 };
+            }
+            rstd_assert(primitive.prepare_joint_bounds());
+            at(asset->nodes, 0).skin = 0;
+            Skin  skin;
+            float translations[] { 1, -9, 0 };
+            for (unsigned i = 0; i < 3; ++i) {
+                Node joint;
+                joint.translation.z = translations[i];
+                asset->nodes.push(rstd::move(joint));
+                at(asset->scenes, 0).roots.push(i + 1);
+                skin.joints.push(i + 1);
+                skin.inverse_bind.push(Mat4::Identity());
+            }
+            asset->skins.push(rstd::move(skin));
+        }
         Primitive rear;
         for (unsigned i = 0; i < 3; ++i) {
             auto vertex       = Vertex(at(primitive.vertices, i));
             vertex.position.z = -0.25f;
             vertex.color      = { 0, 0, 1, 1 };
             vertex.uv0        = { 0.75f, 0.5f };
+            if (skin_blend) {
+                vertex.joints[0] = 2;
+                vertex.weights   = { 1, 0, 0, 0 };
+            }
             if (sample.split) {
                 rear.bounds.include(vertex.position);
                 rear.vertices.push(rstd::move(vertex));
@@ -887,25 +912,37 @@ TEST(Render, BlendOcclusion) {
             }
         }
         if (sample.split) {
+            if (skin_blend) {
+                rear.skin_attributes = true;
+                rstd_assert(rear.prepare_joint_bounds());
+            }
             Material background;
             background.alpha = sample.opaque_rear ? AlphaMode::Opaque : AlphaMode::Blend;
             rear.material    = count(asset->materials);
             asset->materials.push(rstd::move(background));
             mesh.primitives.push(rstd::move(rear));
         }
-        auto          prepared = renderer.prepare(asset.clone()).unwrap();
-        SceneInstance instance(asset.clone());
-        auto          work = queue.Begin().unwrap();
-        renderer.record(work, target, prepared, instance, view, { 1, DebugView::BaseColor })
-            .unwrap();
-        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
-        auto result = read_pixels(session, queue, target);
-        auto center = [&](unsigned channel) {
-            return u8(result[usize((32 * 64 + 32) * 4 + channel)]).to_primitive();
-        };
-        near(center(0), sample.red);
-        near(center(1), 0);
-        near(center(2), sample.blue);
+        auto            prepared = renderer.prepare(asset.clone()).unwrap();
+        SceneBoundsMode modes[] { SceneBoundsMode::Exact, SceneBoundsMode::Conservative };
+        for (auto mode : modes) {
+            SceneInstance instance(asset.clone(), mode);
+            if (skin_blend && mode == SceneBoundsMode::Conservative) {
+                auto exact   = instance.relative_primitive_bounds(0, 0, {}).center();
+                auto bounded = instance.selected_primitive_bounds(0, 0, {}).center();
+                rstd_assert(exact.z > -0.25f && bounded.z < -0.25f);
+            }
+            auto work = queue.Begin().unwrap();
+            renderer.record(work, target, prepared, instance, view, { 1, DebugView::BaseColor })
+                .unwrap();
+            queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+            auto result = read_pixels(session, queue, target);
+            auto center = [&](unsigned channel) {
+                return u8(result[usize((32 * 64 + 32) * 4 + channel)]).to_primitive();
+            };
+            near(center(0), sample.red);
+            near(center(1), 0);
+            near(center(2), sample.blue);
+        }
     }
     rstd_assert(session.validation_errors() == 0);
 }

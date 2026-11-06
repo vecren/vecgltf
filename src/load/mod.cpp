@@ -527,6 +527,7 @@ struct AssetBuilder {
             }
         }
         if (! result.indexed) result.indices.clear();
+        if (result.skin_attributes && result.morphs.is_empty()) result.prepare_joint_bounds();
         return Ok(rstd::move(result));
     }
     auto geometry() -> Result<empty, Error> {

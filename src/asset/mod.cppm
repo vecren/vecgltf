@@ -61,6 +61,10 @@ struct TexcoordSet {
     unsigned  index {};
     Vec<Vec2> coordinates;
 };
+struct JointBounds {
+    unsigned joint {};
+    Bounds   bounds;
+};
 struct Primitive {
     Vec<Vertex>      vertices;
     Vec<unsigned>    indices;
@@ -68,9 +72,55 @@ struct Primitive {
     unsigned         material {};
     bool             indexed {}, skin_attributes {};
     Bounds           bounds;
+    Vec<JointBounds> joint_bounds;
+    float            joint_weight_error {};
     Vec<TexcoordSet> extra_texcoords;
     SourceObjectId   source;
-    auto             texcoord(unsigned set, unsigned vertex) const -> Option<Vec2> {
+    // Rebuild after changing positions, joints or weights.
+    bool prepare_joint_bounds() {
+        joint_bounds.clear();
+        joint_weight_error = 0;
+        if (! skin_attributes || vertices.is_empty() || ! morphs.is_empty()) return false;
+        unsigned largest {};
+        for (const auto& vertex : vertices) {
+            if (! rstd::f32(vertex.position.x).is_finite() ||
+                ! rstd::f32(vertex.position.y).is_finite() ||
+                ! rstd::f32(vertex.position.z).is_finite())
+                return false;
+            float weights[] {
+                vertex.weights.x, vertex.weights.y, vertex.weights.z, vertex.weights.w
+            };
+            double sum {};
+            for (unsigned j = 0; j < 4; ++j) {
+                if (! rstd::f32(weights[j]).is_finite() || weights[j] < 0 ||
+                    vertex.joints[j] > 65535)
+                    return false;
+                sum += double(weights[j]);
+                if (weights[j] > 0 && vertex.joints[j] > largest) largest = vertex.joints[j];
+            }
+            double error = sum > 1 ? sum - 1 : 1 - sum;
+            if (error > 0.00001) return false;
+            if (error > joint_weight_error) joint_weight_error = float(error);
+        }
+        Vec<unsigned> mapping;
+        mapping.resize(usize(largest + 1), invalid_index);
+        for (const auto& vertex : vertices) {
+            float weights[] {
+                vertex.weights.x, vertex.weights.y, vertex.weights.z, vertex.weights.w
+            };
+            for (unsigned j = 0; j < 4; ++j) {
+                if (weights[j] <= 0) continue;
+                unsigned joint = vertex.joints[j];
+                if (at(mapping, joint) == invalid_index) {
+                    at(mapping, joint) = unsigned(count(joint_bounds));
+                    joint_bounds.push({ joint, {} });
+                }
+                at(joint_bounds, at(mapping, joint)).bounds.include(vertex.position);
+            }
+        }
+        return ! joint_bounds.is_empty();
+    }
+    auto texcoord(unsigned set, unsigned vertex) const -> Option<Vec2> {
         if (vertex >= count(vertices)) return None();
         if (set == 0) return Some(Vec2(at(vertices, vertex).uv0));
         if (set == 1) return Some(Vec2(at(vertices, vertex).uv1));

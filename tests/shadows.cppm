@@ -396,9 +396,11 @@ TEST(Shadow, AnimationAndCamera) {
     auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
     auto target   = image::texture(queue);
     for (unsigned deformation = 1; deformation < 4; ++deformation) {
-        auto          source = scene_asset(AlphaMode::Opaque, 1, false, false, false, deformation);
+        auto source = scene_asset(AlphaMode::Opaque, 1, false, false, false, deformation);
+        if (deformation == 2)
+            rstd_assert(at(at(source->meshes, 1).primitives, 0).prepare_joint_bounds());
         auto          prepared = renderer.prepare(source.clone()).unwrap();
-        SceneInstance scene(source.clone());
+        SceneInstance scene(source.clone(), SceneBoundsMode::Conservative);
         rstd_assert(scene.set_animation(0));
         auto off      = draw(renderer, queue, session, target, prepared, scene, settings(false));
         auto initial  = draw(renderer, queue, session, target, prepared, scene, settings());

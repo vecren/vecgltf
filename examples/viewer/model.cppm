@@ -16,7 +16,7 @@ auto reload(vecgltf::Renderer&               renderer,
     auto next = loaded.unwrap();
     auto gpu  = renderer.prepare(next.clone(), options);
     if (gpu.is_err()) return Err(gpu.unwrap_err());
-    auto scene = vecgltf::SceneInstance(next.clone());
+    auto scene = vecgltf::SceneInstance(next.clone(), vecgltf::SceneBoundsMode::Conservative);
     prepared   = gpu.unwrap();
     asset      = rstd::move(next);
     instance   = rstd::move(scene);

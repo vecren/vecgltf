@@ -151,6 +151,110 @@ TEST(Scene, AnimationAndCamera) {
     rstd::io::println("scene: linear, step, cubic, quaternion, skin, morph, "
                       "independent instances and camera passed");
 }
+
+TEST(Scene, ConservativeSkinBounds) {
+    auto      asset = Arc<Asset>::make();
+    Mesh      mesh;
+    Primitive primitive;
+    primitive.skin_attributes = true;
+    Vec3 positions[] { { -2, 1, 0 }, { 1, 2, 1 }, { 2, -1, 2 }, { -1, -2, -1 } };
+    Vec4 weights[] { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0.25f, 0.75f, 0, 0 }, { 0.5f, 0.5f, 0, 0 } };
+    for (unsigned i = 0; i < 4; ++i) {
+        Vertex vertex;
+        vertex.position  = positions[i];
+        vertex.joints[1] = 1;
+        vertex.weights   = weights[i];
+        primitive.vertices.push(rstd::move(vertex));
+    }
+    rstd_assert(primitive.prepare_joint_bounds());
+    rstd_assert(count(primitive.joint_bounds) == 2);
+    mesh.primitives.push(rstd::move(primitive));
+    asset->meshes.push(rstd::move(mesh));
+    Node node;
+    node.mesh = 0;
+    node.skin = 0;
+    asset->nodes.push(rstd::move(node));
+    Node first;
+    first.translation = { 3, -1, 2 };
+    first.scale       = { -2, 0.5f, 1.5f };
+    asset->nodes.push(rstd::move(first));
+    Node second;
+    second.translation = { -4, 2, -1 };
+    second.rotation    = normalized(Vec4 { 0, 0, 0.6f, 0.8f });
+    asset->nodes.push(rstd::move(second));
+    Skin skin;
+    skin.joints.push(1);
+    skin.joints.push(2);
+    skin.inverse_bind.push(Mat4::Identity());
+    skin.inverse_bind.push(Mat4::Identity());
+    asset->skins.push(rstd::move(skin));
+    Scene scene;
+    scene.roots.push(0);
+    scene.roots.push(1);
+    scene.roots.push(2);
+    asset->scenes.push(rstd::move(scene));
+    asset->animations.push(translation(Interpolation::Linear));
+    SceneInstance exact(asset.clone());
+    SceneInstance conservative(asset.clone(), SceneBoundsMode::Conservative);
+    rstd_assert(exact.bounds_mode() == SceneBoundsMode::Exact);
+    rstd_assert(exact.set_animation(0) && conservative.set_animation(0));
+    auto contains = [](Bounds bounds, Vec3 point) {
+        return bounds.valid && point.x >= bounds.min.x && point.x <= bounds.max.x &&
+               point.y >= bounds.min.y && point.y <= bounds.max.y && point.z >= bounds.min.z &&
+               point.z <= bounds.max.z;
+    };
+    Vec3  origins[] { {}, { 100000000, -100000000, 0 } };
+    float times[] { 0.0f, 0.5f, 1.0f, 2.0f };
+    for (float time : times) {
+        exact.set_time(time);
+        conservative.set_time(time);
+        for (Vec3 origin : origins) {
+            auto        box      = conservative.selected_primitive_bounds(0, 0, origin);
+            const auto& geometry = at(at(asset->meshes, 0).primitives, 0);
+            for (unsigned i = 0; i < count(geometry.vertices); ++i)
+                rstd_assert(contains(box, exact.world_position(0, geometry, i, origin)));
+        }
+        near(conservative.exact_bounds().min, exact.bounds().min);
+        near(conservative.exact_bounds().max, exact.bounds().max);
+    }
+    conservative.set_bounds_mode(SceneBoundsMode::Exact);
+    near(conservative.bounds().min, exact.bounds().min);
+    near(conservative.bounds().max, exact.bounds().max);
+    auto& geometry                  = at(at(asset->meshes, 0).primitives, 0);
+    at(asset->nodes, 1).has_matrix  = true;
+    at(asset->nodes, 1).matrix      = Mat4::Identity();
+    at(asset->nodes, 1).matrix.m[3] = 0.01f;
+    conservative.set_bounds_mode(SceneBoundsMode::Conservative);
+    auto non_affine       = conservative.selected_primitive_bounds(0, 0, {});
+    auto non_affine_exact = conservative.relative_primitive_bounds(0, 0, {});
+    near(non_affine.min, non_affine_exact.min);
+    near(non_affine.max, non_affine_exact.max);
+    at(asset->nodes, 1).has_matrix   = false;
+    at(geometry.vertices, 0).weights = { -0.1f, 1.1f, 0, 0 };
+    rstd_assert(! geometry.prepare_joint_bounds());
+    rstd_assert(geometry.joint_bounds.is_empty());
+    at(geometry.vertices, 0).weights = {};
+    rstd_assert(! geometry.prepare_joint_bounds());
+    at(geometry.vertices, 0).weights   = { 1, 0, 0, 0 };
+    at(geometry.vertices, 0).joints[0] = 7;
+    rstd_assert(geometry.prepare_joint_bounds());
+    conservative.set_time(0.5f);
+    auto invalid_joint       = conservative.selected_primitive_bounds(0, 0, {});
+    auto invalid_joint_exact = conservative.relative_primitive_bounds(0, 0, {});
+    near(invalid_joint.min, invalid_joint_exact.min);
+    near(invalid_joint.max, invalid_joint_exact.max);
+    at(geometry.vertices, 0).joints[0] = 0;
+    MorphTarget morph;
+    for (unsigned i = 0; i < count(geometry.vertices); ++i) morph.positions.push({ 1, 0, 0 });
+    geometry.morphs.push(rstd::move(morph));
+    at(asset->nodes, 0).weights.push(0.5f);
+    rstd_assert(! geometry.prepare_joint_bounds());
+    conservative.set_time(0.5f);
+    auto morphed       = conservative.selected_primitive_bounds(0, 0, {});
+    auto morphed_exact = conservative.relative_primitive_bounds(0, 0, {});
+    near(morphed.min, morphed_exact.min);
+    near(morphed.max, morphed_exact.max);
+}
 TEST(Scene, CameraFrames) {
     Bounds bounds;
     bounds.include({ -2, -1, -3 });

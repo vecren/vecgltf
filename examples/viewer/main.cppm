@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     }
     for (const auto& diagnostic : asset->diagnostics)
         rstd::io::eprintln("{}: {}", diagnostic.location, diagnostic.message);
-    gltf::SceneInstance instance(asset.clone());
+    gltf::SceneInstance instance(asset.clone(), gltf::SceneBoundsMode::Conservative);
     if ((options.scene != gltf::invalid_index && ! instance.set_scene(options.scene)) ||
         (options.animation != gltf::invalid_index && ! instance.set_animation(options.animation))) {
         rstd::io::eprintln("scene or animation index is out of range");

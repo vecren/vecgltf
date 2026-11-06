@@ -1700,21 +1700,22 @@ private:
             for (unsigned p = 0; p < count(mesh.primitives); ++p) {
                 const auto& primitive = at(mesh.primitives, p);
                 bool        dither    = at(prepared.data_->materials, primitive.material).dither;
-                auto        position  = at(instance.pose(n).primitive_bounds, p).center();
+                bool        transparent =
+                    ! dither && at(asset.materials, primitive.material).alpha == AlphaMode::Blend;
+                auto position =
+                    transparent && instance.bounds_mode() == SceneBoundsMode::Conservative
+                        ? instance.relative_primitive_bounds(n, p, {}).center()
+                        : at(instance.pose(n).primitive_bounds, p).center();
                 if (! lights.shadows.is_empty() &&
                     (dither || at(asset.materials, primitive.material).alpha != AlphaMode::Blend ||
                      at(asset.materials, primitive.material).base_color.w >= 1)) {
-                    auto bounds = instance.relative_primitive_bounds(n, p, origin);
+                    auto bounds = instance.selected_primitive_bounds(n, p, origin);
                     if (bounds.valid) {
                         caster_bounds.include(bounds.min);
                         caster_bounds.include(bounds.max);
                     }
                 }
-                draws.push({ n,
-                             p,
-                             view_depth(view.view, position),
-                             ! dither && at(asset.materials, primitive.material).alpha ==
-                                             AlphaMode::Blend });
+                draws.push({ n, p, view_depth(view.view, position), transparent });
             }
         }
         rstd::slice_::sort_unstable_by(
