@@ -4,7 +4,7 @@ import vecgltf.presentation;
 import vecgltf;
 import vecgltf.render;
 import vecgltf.display;
-import vui.sdl;
+import vui.host;
 import vecgltf.viewer.panel;
 import vecgltf.viewer.model;
 import vecgltf.viewer.camera;
@@ -15,20 +15,11 @@ namespace gltf = vecgltf;
 
 using viewer::CameraReference;
 
-auto argument(const char* value) -> ref<str> {
-    return rstd::ffi::CStr::from_ptr(value).to_str().unwrap_or(""_str);
-}
 void report(gltf::Error error) {
     rstd::io::eprintln(
         "{} [{}] {}: {}", error.source, unsigned(error.kind), error.location, error.message);
 }
-bool capture(vui::gpu::Renderer& renderer, ref<str> path) {
-    auto result = renderer.readback();
-    if (result.is_err()) {
-        rstd::io::eprintln("capture failed: {}", unsigned(result.unwrap_err().stage));
-        return false;
-    }
-    auto image  = result.unwrap();
+bool capture(vui::gpu::Pixels image, ref<str> path) {
     auto header = rstd::format("P6\n{} {}\n255\n", image.width, image.height);
     auto data   = Vec<u8>::from(header.as_str().as_bytes());
     data.reserve(usize(image.width) * usize(image.height) * usize(3));
@@ -184,18 +175,39 @@ int main(int argc, char** argv) {
         rstd::io::eprintln("camera path has insufficient keyframes");
         return 2;
     }
-    vui::sdl::Window   window;
+    vui::host::Window  window;
     vui::gpu::Renderer ui_renderer;
     auto               gpu_error = [&](vui::gpu::Error error) {
-        rstd::io::eprintln("renderer stage={} Vulkan={} SDL={}",
+        rstd::io::eprintln("renderer stage={} Vulkan={}",
                            unsigned(error.stage),
-                           int(error.result),
-                           argument(window.error()));
+                           int(error.result));
         return 1;
     };
+    Vec<vui::InputEvent> startup_input;
     if (! options.headless) {
         auto opened = window.open("vecgltf", options.width, options.height);
         if (opened.is_err()) return gpu_error(opened.unwrap_err());
+        auto started = rstd::time::Instant::now();
+        while (! window.configured()) {
+            auto received = window.wait(100);
+            if (received.is_err()) return gpu_error(received.unwrap_err());
+            if (received->close_requested) return 0;
+            if (received->dropped_input) {
+                rstd::io::eprintln("window startup input was dropped");
+                return 1;
+            }
+            for (auto& input : received->input) {
+                if (startup_input.len() >= usize(4096)) {
+                    rstd::io::eprintln("window startup input limit reached");
+                    return 1;
+                }
+                startup_input.push(rstd::move(input));
+            }
+            if (! window.configured() && started.elapsed().as_millis().to_primitive() >= 5000) {
+                rstd::io::eprintln("window configure timed out");
+                return 1;
+            }
+        }
     }
     auto initialized =
         options.headless
@@ -256,6 +268,10 @@ int main(int argc, char** argv) {
     auto           prepared = preparing.unwrap();
     auto           source   = vui::ContentSource::create(producer).unwrap();
     vui::UiSession session;
+    if (! options.headless) {
+        session.input().set_native_capture(
+            [&](vui::PointerKind kind, bool enabled) { return window.capture(kind, enabled); });
+    }
     auto&          document = session.document();
     if (! options.headless) {
         auto text_service = Box<vectext::SystemTextService>::make();
@@ -356,28 +372,35 @@ int main(int argc, char** argv) {
         .unwrap();
     rstd::uint64_t previous {}, serial {};
     unsigned       completed {};
+    Option<vui::gpu::Pixels> last_capture;
     bool           close {}, refresh_surface {}, redraw_pending { true };
     while (! close) {
-        vui::sdl::Events events;
+        vui::host::WindowEvents events;
         vui::FrameTiming timing;
         if (options.headless) {
             events.surface = { { double(extent.width), double(extent.height) }, 1, 1 };
             timing.now_ns  = ++serial * 16'666'667;
         } else {
-            events = window.wait(
+            auto waited = window.wait(
                 ! completed
                     ? 0
                     : (options.frames || cameras.animating() ||
                                (instance.playing() && instance.animation() != gltf::invalid_index)
                            ? 16
                            : 1000));
+            if (waited.is_err()) return gpu_error(waited.unwrap_err());
+            events = rstd::move(waited).unwrap();
+            if (! startup_input.is_empty()) {
+                for (auto& input : events.input) startup_input.push(rstd::move(input));
+                events.input = rstd::move(startup_input);
+            }
             timing = window.timing();
             close  = events.close_requested;
             for (const auto& event : events.input)
                 if (event.type == vui::EventType::KeyDown && event.key == vui::Key::Escape)
                     close = true;
             if (close) break;
-            if (events.minimized) {
+            if (events.suspended.unwrap_or(false)) {
                 session.advance(events.input.as_slice(), timing, events.surface).unwrap();
                 refresh_surface = true;
                 previous        = timing.now_ns;
@@ -771,12 +794,16 @@ int main(int argc, char** argv) {
             if (present.is_err()) return gpu_error(present.unwrap_err());
             refresh_surface = present.unwrap().status != vui::gpu::PresentStatus::Queued;
         }
+        if (! options.capture.is_empty()) {
+            auto captured = ui_renderer.readback();
+            if (captured.is_err()) return gpu_error(captured.unwrap_err());
+            last_capture = Some(captured.unwrap());
+        }
         redraw_pending = false;
         ++completed;
         if (options.frames && completed >= options.frames) close = true;
     }
-    if (completed && ! options.capture.is_empty() &&
-        ! capture(ui_renderer, options.capture.as_str()))
+    if (last_capture.is_some() && ! capture(last_capture.take().unwrap(), options.capture.as_str()))
         return 1;
     source.close().unwrap();
     session.close().unwrap();
