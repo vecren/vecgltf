@@ -305,14 +305,17 @@ int main(int argc, char** argv) {
     document.mount(root).unwrap();
     vui::Point         last {};
     vui::PointerButton drag {};
+    Option<vui::PointerKey> drag_pointer;
     session.input()
         .on(viewport,
             vui::EventType::PointerDown,
             [&](auto& context, const auto& event) {
+                if (drag_pointer.is_some()) return;
                 if (! cameras.take_control(instance, camera_aspect)) return;
                 drag = event.input.button;
                 last = event.input.position;
                 context.capture_pointer().unwrap();
+                drag_pointer = Some(vui::PointerKey { event.input.device, event.input.pointer });
                 context.focus().unwrap();
             })
         .unwrap();
@@ -320,7 +323,9 @@ int main(int argc, char** argv) {
         .on(viewport,
             vui::EventType::PointerMove,
             [&](auto&, const auto& event) {
-                if (session.input().captured(event.input.pointer) != Some(viewport)) return;
+                auto pointer = vui::PointerKey { event.input.device, event.input.pointer };
+                if (drag_pointer != Some(pointer) ||
+                    session.input().captured(pointer.pointer, pointer.device) != Some(viewport)) return;
                 auto  p = event.input.position;
                 float x = float(p.x - last.x), y = float(p.y - last.y);
                 last = p;
@@ -336,11 +341,21 @@ int main(int argc, char** argv) {
     session.input()
         .on(viewport,
             vui::EventType::PointerUp,
-            [&](auto& context, const auto&) {
+            [&](auto& context, const auto& event) {
+                if (drag_pointer != Some(vui::PointerKey { event.input.device, event.input.pointer }) ||
+                    event.input.button != drag) return;
                 context.release_pointer().unwrap();
                 drag = {};
+                drag_pointer = None();
             })
         .unwrap();
+    auto clear_drag = [&](auto&, const auto& event) {
+        if (drag_pointer != Some(vui::PointerKey { event.input.device, event.input.pointer })) return;
+        drag = {};
+        drag_pointer = None();
+    };
+    session.input().on(viewport, vui::EventType::PointerCancel, clear_drag).unwrap();
+    session.input().on(viewport, vui::EventType::CaptureLost, clear_drag).unwrap();
     session.input()
         .on(viewport,
             vui::EventType::Wheel,

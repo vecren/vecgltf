@@ -42,6 +42,7 @@ class Panel {
     struct Timeline {
         UiId  track, fill;
         float fraction {};
+        Option<PointerKey> pointer;
     };
     UiSession& session_;
     UiId       content_, scroll_, name_, details_, scene_, camera_, animation_, play_, loop_, time_,
@@ -113,11 +114,14 @@ class Panel {
         value.fill                  = ui.append<Rectangle>(value.track, fill_style).unwrap();
         auto* target                = &value;
         auto  seek                  = [this, target, action](auto& context, const auto& event) {
+            auto pointer = PointerKey { event.input.device, event.input.pointer };
             if (event.input.type == EventType::PointerDown) {
-                if (event.input.button != PointerButton::Primary) return;
+                if (event.input.button != PointerButton::Primary || target->pointer.is_some()) return;
                 context.capture_pointer().unwrap();
                 context.focus().unwrap();
-            } else if (session_.input().captured(event.input.pointer) != Some(target->track))
+                target->pointer = Some(pointer);
+            } else if (target->pointer != Some(pointer) ||
+                       session_.input().captured(pointer.pointer, pointer.device) != Some(target->track))
                 return;
             target->fraction = gltf::clamp(float(event.local.x / 216), 0, 1);
             commands_.push({ action, target->fraction });
@@ -130,13 +134,22 @@ class Panel {
             .on(value.track,
                 EventType::PointerUp,
                 [this, target](auto& context, const auto& event) {
-                    if (session_.input().captured(event.input.pointer) == Some(target->track)) {
+                    auto pointer = PointerKey { event.input.device, event.input.pointer };
+                    if (target->pointer != Some(pointer) || event.input.button != PointerButton::Primary) return;
+                    target->pointer = None();
+                    if (session_.input().captured(pointer.pointer, pointer.device) == Some(target->track)) {
                         context.release_pointer().unwrap();
                         context.stop_propagation();
                         context.prevent_default();
                     }
                 })
             .unwrap();
+        auto clear_pointer = [target](auto&, const auto& event) {
+            if (target->pointer == Some(PointerKey { event.input.device, event.input.pointer }))
+                target->pointer = None();
+        };
+        session_.input().on(value.track, EventType::PointerCancel, clear_pointer).unwrap();
+        session_.input().on(value.track, EventType::CaptureLost, clear_pointer).unwrap();
         session_.input()
             .on(value.track,
                 EventType::KeyDown,

@@ -32,12 +32,22 @@ TEST(Viewer, Controls) {
     auto     root       = ui.create<vui::Stack>(style).unwrap();
     auto     viewport   = ui.append<vui::SceneViewport>(root, style).unwrap();
     unsigned viewport_events {}, root_keys {};
+    bool     take_capture {};
     session.input()
         .on(viewport,
             vui::EventType::PointerDown,
             [&](auto&, const auto&) {
                 ++viewport_events;
             })
+        .unwrap();
+    session.input()
+        .on(root, vui::EventType::PointerMove,
+            [&](auto& context, const auto& event) {
+                if (take_capture && event.input.device == 27) {
+                    take_capture = false;
+                    context.capture_pointer().unwrap();
+                }
+            }, vui::RoutePhase::Capture)
         .unwrap();
     session.input()
         .on(
@@ -75,6 +85,62 @@ TEST(Viewer, Controls) {
         rstd_assert(commands.len() == usize(1) && gltf::at(commands, 0).action == action);
         return gltf::at(commands, 0).value;
     };
+    auto drag_timeline = [&](double y, viewer::Action action) {
+        vui::InputEvent event;
+        event.device = 27;
+        event.type = vui::EventType::PointerDown;
+        event.button = vui::PointerButton::Primary;
+        event.position = { 70, y };
+        advance(event);
+        rstd_assert(gltf::absolute(command(action) - 0.25f) < 0.001f);
+        event.button = vui::PointerButton::Secondary;
+        advance(event);
+        event.type = vui::EventType::PointerUp;
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+        event.type = vui::EventType::PointerDown;
+        event.button = vui::PointerButton::Primary;
+        event.device = 28;
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+        event.type = vui::EventType::PointerMove;
+        event.position = { 200, y };
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+        event.type = vui::EventType::PointerUp;
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+        event.device = 27;
+        event.type = vui::EventType::PointerMove;
+        event.position = { 178, y };
+        advance(event);
+        rstd_assert(gltf::absolute(command(action) - 0.75f) < 0.001f);
+        event.type = vui::EventType::PointerCancel;
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+        event.type = vui::EventType::PointerDown;
+        event.position = { 124, y };
+        advance(event);
+        rstd_assert(gltf::absolute(command(action) - 0.5f) < 0.001f);
+        take_capture = true;
+        event.type = vui::EventType::PointerMove;
+        event.position = { 178, y };
+        advance(event);
+        rstd_assert(gltf::absolute(command(action) - 0.75f) < 0.001f);
+        rstd_assert(session.input().captured(0, 27) == Some(root));
+        event.type = vui::EventType::PointerUp;
+        advance(event);
+        event.type = vui::EventType::PointerDown;
+        event.position = { 124, y };
+        advance(event);
+        rstd_assert(gltf::absolute(command(action) - 0.5f) < 0.001f);
+        event.type = vui::EventType::PointerUp;
+        advance(event);
+        event.type = vui::EventType::PointerMove;
+        event.position = { 200, y };
+        advance(event);
+        rstd_assert(panel.take_commands().is_empty());
+    };
     auto scroll = [&](double pixels) {
         vui::InputEvent event;
         event.type         = vui::EventType::Wheel;
@@ -101,6 +167,7 @@ TEST(Viewer, Controls) {
     command(viewer::Action::CameraLoop);
     click(124, 476);
     rstd_assert(gltf::absolute(command(viewer::Action::CameraSeek) - 0.5f) < 0.001f);
+    drag_timeline(476, viewer::Action::CameraSeek);
     vui::InputEvent key;
     key.type = vui::EventType::KeyDown;
     key.key  = vui::Key::End;
@@ -121,6 +188,7 @@ TEST(Viewer, Controls) {
     scroll(100);
     click(124, 644);
     rstd_assert(gltf::absolute(command(viewer::Action::Seek) - 0.5f) < 0.001f);
+    drag_timeline(644, viewer::Action::Seek);
     key.key = vui::Key::End;
     advance(key);
     rstd_assert(command(viewer::Action::Seek) == 1);
