@@ -38,9 +38,7 @@ void lifecycle(bool verify_minimize) {
     auto           source = vui::ContentSource::create(37).unwrap();
     vui::UiSession session;
     auto&          ui = session.document();
-    vui::NodeStyle style;
-    style.layout.width  = Some(640.0);
-    style.layout.height = Some(480.0);
+    auto style = vui::NodeStyleBuilder{}.width(640).height(480).build();
     auto root           = ui.create<vui::SceneViewport>(style).unwrap();
     ui.set_scene_source(root, Some(vui::ContentSource(source))).unwrap();
     ui.mount(root).unwrap();
@@ -52,8 +50,8 @@ void lifecycle(bool verify_minimize) {
         renderer.resize(extent).unwrap();
         output.resize(extent);
         ui.set_layout(root,
-                      { .width  = Some(events.surface.logical_size.width),
-                        .height = Some(events.surface.logical_size.height) })
+                      vui::LayoutStyleBuilder{}.width(events.surface.logical_size.width)
+                          .height(events.surface.logical_size.height).build())
             .unwrap();
         auto frame =
             output

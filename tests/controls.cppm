@@ -26,9 +26,7 @@ TEST(Viewer, Controls) {
     ui.set_text_service(Box<vui::TextService>::from_raw(
                             rstd::move(fonts).into_raw().template cast<vui::TextService>()))
         .unwrap();
-    vui::NodeStyle style;
-    style.layout.width  = Some(960.0);
-    style.layout.height = Some(720.0);
+    auto style = vui::NodeStyleBuilder{}.width(960).height(720).build();
     auto     root       = ui.create<vui::Stack>(style).unwrap();
     auto     viewport   = ui.append<vui::SceneViewport>(root, style).unwrap();
     unsigned viewport_events {}, root_keys {};

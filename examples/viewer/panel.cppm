@@ -53,11 +53,7 @@ class Panel {
     Vec<Binding>           click_bindings_;
     static constexpr Color text { 0.82, 0.86, 0.9, 1 }, muted { 0.42, 0.5, 0.57, 1 };
     NodeStyle              box(double x, double y, double width, double height) {
-        NodeStyle style;
-        style.layout.width  = Some(width);
-        style.layout.height = Some(height);
-        style.transform     = { 1, 0, 0, 1, x, y };
-        return style;
+        return NodeStyleBuilder{}.width(width).height(height).transform({ 1, 0, 0, 1, x, y }).build();
     }
     UiId label(UiId     parent,
                ref<str> value,
@@ -68,14 +64,11 @@ class Panel {
                bool     bold  = false,
                double   width = 216) {
         auto& ui               = session_.document();
-        auto  style            = box(x, y, width, 40);
-        style.hit_test_visible = false;
+        auto  style            = NodeStyleBuilder{box(x, y, width, 40)}.hit_test_visible(false).build();
         auto id                = ui.append<Text>(parent, style).unwrap();
         ui.set_text_format(id,
-                           { .family   = "Noto Sans CJK SC"_str,
-                             .language = "zh"_str,
-                             .size     = size,
-                             .bold     = bold })
+                           TextFormatBuilder{}.family("Noto Sans CJK SC"_str)
+                               .language("zh"_str).size(size).bold(bold).build())
             .unwrap();
         ui.set_text(id, value).unwrap();
         ui.set_text_color(id, color).unwrap();
@@ -87,7 +80,9 @@ class Panel {
             Button::create(
                 session_,
                 box(x, y, width, 34),
-                { { 0.055, 0.085, 0.11, 1 }, { 0.025, 0.12, 0.16, 1 }, { 0.12, 0.3, 0.4, 1 }, 4 })
+                ButtonStyleBuilder{}.normal({ 0.055, 0.085, 0.11, 1 })
+                    .pressed({ 0.025, 0.12, 0.16, 1 })
+                    .focused({ 0.12, 0.3, 0.4, 1 }).radius(4).build())
                 .unwrap();
         ui.attach(content_, id).unwrap();
         auto caption = label(id, value, 10, 6, 14, text, false, width - 20);
@@ -102,15 +97,13 @@ class Panel {
     }
     void timeline(Timeline& value, double y, Action action) {
         auto& ui                    = session_.document();
-        auto  style                 = box(16, y, 216, 20);
-        style.background            = { 0.06, 0.09, 0.12, 1 };
-        style.radius                = 3;
-        style.focusable             = true;
+        auto  style                 = NodeStyleBuilder{box(16, y, 216, 20)}
+                                          .background({ 0.06, 0.09, 0.12, 1 })
+                                          .radius(3).focusable(true).build();
         value.track                 = ui.append<Stack>(content_, style).unwrap();
-        auto fill_style             = box(0, 0, 0, 20);
-        fill_style.background       = { 0.13, 0.36, 0.5, 1 };
-        fill_style.hit_test_visible = false;
-        fill_style.radius           = 3;
+        auto fill_style             = NodeStyleBuilder{box(0, 0, 0, 20)}
+                                          .background({ 0.13, 0.36, 0.5, 1 })
+                                          .hit_test_visible(false).radius(3).build();
         value.fill                  = ui.append<Rectangle>(value.track, fill_style).unwrap();
         auto* target                = &value;
         auto  seek                  = [this, target, action](auto& context, const auto& event) {
@@ -193,7 +186,7 @@ class Panel {
         value.fraction = gltf::clamp(fraction, 0, 1);
         session_.document()
             .set_layout(value.fill,
-                        { .width = Some(double(value.fraction) * 216), .height = Some(20.0) })
+                        LayoutStyleBuilder{}.width(double(value.fraction) * 216).height(20).build())
             .unwrap();
     }
 
@@ -204,8 +197,8 @@ public:
     explicit Panel(UiSession& session, UiId root): session_(session) {
         auto& ui         = session_.document();
         content_         = ui.create<Stack>(box(0, 0, 248, 1106)).unwrap();
-        auto style       = box(0, 0, 248, 720);
-        style.background = { 0.018, 0.033, 0.05, 1 };
+        auto style       = NodeStyleBuilder{box(0, 0, 248, 720)}
+                               .background({ 0.018, 0.033, 0.05, 1 }).build();
         scroll_          = ScrollView::create(session_, content_, style).unwrap();
         ui.attach(root, scroll_).unwrap();
         label(content_, "vecgltf"_str, 16, 14, 22, text, true);
@@ -241,13 +234,13 @@ public:
         debug_      = button(""_str, 16, 886, 216, Action::Debug);
         button("重新加载模型"_str, 16, 936, 216, Action::Reload);
         status_ = label(content_, ""_str, 16, 980, 12, { 0.88, 0.5, 0.28, 1 });
-        ui.set_layout(status_, { .width = Some(216.0), .height = Some(56.0) }).unwrap();
+        ui.set_layout(status_, LayoutStyleBuilder{}.width(216).height(56).build()).unwrap();
         label(content_, "左键旋转，右键平移\n滚轮缩放，Home 取景"_str, 16, 1044, 12, muted);
     }
     void set_visible(bool value) { session_.document().set_visible(scroll_, value).unwrap(); }
     void resize(double height) {
         session_.document()
-            .set_layout(scroll_, { .width = Some(248.0), .height = Some(height) })
+            .set_layout(scroll_, LayoutStyleBuilder{}.width(248).height(height).build())
             .unwrap();
     }
     auto take_commands() -> Vec<Command> { return rstd::exchange(commands_, Vec<Command> {}); }

@@ -280,10 +280,11 @@ int main(int argc, char** argv) {
                 rstd::move(text_service).into_raw().template cast<vui::TextService>()))
             .unwrap();
     }
-    vui::NodeStyle style;
-    style.focusable     = true;
-    style.layout.width  = Some(vui::Scalar(extent.width));
-    style.layout.height = Some(vui::Scalar(extent.height));
+    auto style = vui::NodeStyleBuilder{}
+                     .focusable(true)
+                     .width(vui::Scalar(extent.width))
+                     .height(vui::Scalar(extent.height))
+                     .build();
     auto root           = document.create<vui::Stack>(style).unwrap();
     auto viewport       = document.append<vui::SceneViewport>(root, style).unwrap();
     document.set_scene_source(viewport, Some(vui::ContentSource(source))).unwrap();
@@ -431,9 +432,10 @@ int main(int argc, char** argv) {
                 events.redraw   = true;
             }
         }
-        vui::LayoutStyle layout;
-        layout.width  = Some(events.surface.logical_size.width);
-        layout.height = Some(events.surface.logical_size.height);
+        auto layout = vui::LayoutStyleBuilder{}
+                          .width(events.surface.logical_size.width)
+                          .height(events.surface.logical_size.height)
+                          .build();
         document.set_layout(root, layout).unwrap();
         double panel_width = options.headless ? 0 : 248;
         if (! options.headless && events.surface.logical_size.width < 480) panel_width = 0;
@@ -442,8 +444,8 @@ int main(int argc, char** argv) {
             (*panel)->resize(events.surface.logical_size.height);
         }
         double model_width = events.surface.logical_size.width - panel_width;
-        layout.width       = Some(model_width);
-        document.set_layout(viewport, layout).unwrap();
+        document.set_layout(viewport, vui::LayoutStyleBuilder{layout}.width(model_width).build())
+            .unwrap();
         document.set_transform(viewport, { 1, 0, 0, 1, panel_width, 0 }).unwrap();
         VkExtent2D model_extent { unsigned(model_width * events.surface.scale + 0.5),
                                   extent.height };

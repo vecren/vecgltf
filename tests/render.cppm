@@ -443,9 +443,8 @@ TEST(Render, SharedDepth) {
         vui::gpu::Renderer ui;
         ui.initialize(session, false).unwrap();
         vui::UiSession document;
-        vui::NodeStyle style;
-        style.layout.width = style.layout.height = Some(vui::Scalar(16));
-        style.background                         = { 0, 0.5f, 0, 0.5f };
+        auto style = vui::NodeStyleBuilder{}.width(16).height(16)
+                         .background({ 0, 0.5f, 0, 0.5f }).build();
         auto node = document.document().create<vui::Rectangle>(style).unwrap();
         document.document().mount(node).unwrap();
         document.advance({}, { 1, {} }, { { 64, 64 }, 1, 1 }).unwrap();
@@ -1258,8 +1257,7 @@ TEST(Render, Integration) {
     rstd::uint64_t output_version {};
     auto           source = vui::ContentSource::create(19).unwrap();
     vui::UiSession document;
-    vui::NodeStyle style;
-    style.layout.width = style.layout.height = Some(vui::Scalar(64));
+    auto style = vui::NodeStyleBuilder{}.width(64).height(64).build();
     auto root     = document.document().create<vui::Stack>(style).unwrap();
     auto viewport = document.document().append<vui::SceneViewport>(root, style).unwrap();
     document.document().set_scene_source(viewport, Some(vui::ContentSource(source))).unwrap();
