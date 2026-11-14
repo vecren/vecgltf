@@ -16,6 +16,7 @@ rstd-nostd = { version = "0.1.5", usage = "link" }
 vui-render = { version = "0.1.0" }
 vui-host = { version = "0.1.0" }
 vui-controls = { version = "0.1.0" }
+vui-compose = { version = "0.1.0" }
 
 [[bin]]
 name = "viewer"

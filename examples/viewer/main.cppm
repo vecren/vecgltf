@@ -178,9 +178,7 @@ int main(int argc, char** argv) {
     vui::host::Window  window;
     vui::gpu::Renderer ui_renderer;
     auto               gpu_error = [&](vui::gpu::Error error) {
-        rstd::io::eprintln("renderer stage={} Vulkan={}",
-                           unsigned(error.stage),
-                           int(error.result));
+        rstd::io::eprintln("renderer stage={} Vulkan={}", unsigned(error.stage), int(error.result));
         return 1;
     };
     Vec<vui::InputEvent> startup_input;
@@ -269,10 +267,11 @@ int main(int argc, char** argv) {
     auto           source   = vui::ContentSource::create(producer).unwrap();
     vui::UiSession session;
     if (! options.headless) {
-        session.input().set_native_capture(
-            [&](vui::PointerKind kind, bool enabled) { return window.capture(kind, enabled); });
+        session.input().set_native_capture([&](vui::PointerKind kind, bool enabled) {
+            return window.capture(kind, enabled);
+        });
     }
-    auto&          document = session.document();
+    auto& document = session.document();
     if (! options.headless) {
         auto text_service = Box<vectext::SystemTextService>::make();
         document
@@ -280,13 +279,13 @@ int main(int argc, char** argv) {
                 rstd::move(text_service).into_raw().template cast<vui::TextService>()))
             .unwrap();
     }
-    auto style = vui::NodeStyleBuilder{}
-                     .focusable(true)
-                     .width(vui::Scalar(extent.width))
-                     .height(vui::Scalar(extent.height))
-                     .build();
-    auto root           = document.create<vui::Stack>(style).unwrap();
-    auto viewport       = document.append<vui::SceneViewport>(root, style).unwrap();
+    auto style    = vui::NodeStyleBuilder {}
+                        .focusable(true)
+                        .width(vui::Scalar(extent.width))
+                        .height(vui::Scalar(extent.height))
+                        .build();
+    auto root     = document.create<vui::Stack>(style).unwrap();
+    auto viewport = document.append<vui::SceneViewport>(root, style).unwrap();
     document.set_scene_source(viewport, Some(vui::ContentSource(source))).unwrap();
     document.set_scene_presentation(viewport, vui::ImageFit::Fill, vui::ImageSampling::Linear)
         .unwrap();
@@ -304,8 +303,8 @@ int main(int argc, char** argv) {
                          status.as_str(),
                          cameras.status());
     document.mount(root).unwrap();
-    vui::Point         last {};
-    vui::PointerButton drag {};
+    vui::Point              last {};
+    vui::PointerButton      drag {};
     Option<vui::PointerKey> drag_pointer;
     session.input()
         .on(viewport,
@@ -326,7 +325,8 @@ int main(int argc, char** argv) {
             [&](auto&, const auto& event) {
                 auto pointer = vui::PointerKey { event.input.device, event.input.pointer };
                 if (drag_pointer != Some(pointer) ||
-                    session.input().captured(pointer.pointer, pointer.device) != Some(viewport)) return;
+                    session.input().captured(pointer.pointer, pointer.device) != Some(viewport))
+                    return;
                 auto  p = event.input.position;
                 float x = float(p.x - last.x), y = float(p.y - last.y);
                 last = p;
@@ -343,16 +343,19 @@ int main(int argc, char** argv) {
         .on(viewport,
             vui::EventType::PointerUp,
             [&](auto& context, const auto& event) {
-                if (drag_pointer != Some(vui::PointerKey { event.input.device, event.input.pointer }) ||
-                    event.input.button != drag) return;
+                if (drag_pointer !=
+                        Some(vui::PointerKey { event.input.device, event.input.pointer }) ||
+                    event.input.button != drag)
+                    return;
                 context.release_pointer().unwrap();
-                drag = {};
+                drag         = {};
                 drag_pointer = None();
             })
         .unwrap();
     auto clear_drag = [&](auto&, const auto& event) {
-        if (drag_pointer != Some(vui::PointerKey { event.input.device, event.input.pointer })) return;
-        drag = {};
+        if (drag_pointer != Some(vui::PointerKey { event.input.device, event.input.pointer }))
+            return;
+        drag         = {};
         drag_pointer = None();
     };
     session.input().on(viewport, vui::EventType::PointerCancel, clear_drag).unwrap();
@@ -386,13 +389,13 @@ int main(int argc, char** argv) {
                 }
             })
         .unwrap();
-    rstd::uint64_t previous {}, serial {};
-    unsigned       completed {};
+    rstd::uint64_t           previous {}, serial {};
+    unsigned                 completed {};
     Option<vui::gpu::Pixels> last_capture;
-    bool           close {}, refresh_surface {}, redraw_pending { true };
+    bool                     close {}, refresh_surface {}, redraw_pending { true };
     while (! close) {
         vui::host::WindowEvents events;
-        vui::FrameTiming timing;
+        vui::FrameTiming        timing;
         if (options.headless) {
             events.surface = { { double(extent.width), double(extent.height) }, 1, 1 };
             timing.now_ns  = ++serial * 16'666'667;
@@ -418,6 +421,7 @@ int main(int argc, char** argv) {
             if (close) break;
             if (events.suspended.unwrap_or(false)) {
                 session.advance(events.input.as_slice(), timing, events.surface).unwrap();
+                if (panel && ! (*panel)->check()) return 1;
                 refresh_surface = true;
                 previous        = timing.now_ns;
                 continue;
@@ -432,7 +436,7 @@ int main(int argc, char** argv) {
                 events.redraw   = true;
             }
         }
-        auto layout = vui::LayoutStyleBuilder{}
+        auto layout = vui::LayoutStyleBuilder {}
                           .width(events.surface.logical_size.width)
                           .height(events.surface.logical_size.height)
                           .build();
@@ -444,7 +448,7 @@ int main(int argc, char** argv) {
             (*panel)->resize(events.surface.logical_size.height);
         }
         double model_width = events.surface.logical_size.width - panel_width;
-        document.set_layout(viewport, vui::LayoutStyleBuilder{layout}.width(model_width).build())
+        document.set_layout(viewport, vui::LayoutStyleBuilder { layout }.width(model_width).build())
             .unwrap();
         document.set_transform(viewport, { 1, 0, 0, 1, panel_width, 0 }).unwrap();
         VkExtent2D model_extent { unsigned(model_width * events.surface.scale + 0.5),
@@ -462,6 +466,7 @@ int main(int argc, char** argv) {
             rstd::io::eprintln("input/session stage={}", unsigned(advance.unwrap_err().stage));
             return 1;
         }
+        if (panel && ! (*panel)->check()) return 1;
         bool changed = ! events.input.is_empty();
         if (panel) {
             auto commands = (*panel)->take_commands();
@@ -773,6 +778,7 @@ int main(int argc, char** argv) {
             rstd::io::eprintln("frame/session stage={}", unsigned(update.unwrap_err().stage));
             return 1;
         }
+        if (panel && ! (*panel)->check()) return 1;
         auto plan = session.plan_frame();
         if (plan.is_err()) {
             rstd::io::eprintln("frame planning failed");

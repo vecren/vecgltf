@@ -2,7 +2,7 @@ export module vecgltf.viewer.panel;
 import vecgltf;
 import vecgltf.render;
 import vecgltf.viewer.camera;
-import vui.controls;
+import vui.compose;
 
 export namespace viewer
 {
@@ -38,272 +38,426 @@ struct Command {
     Action action;
     float  value {};
 };
-class Panel {
-    struct Timeline {
-        UiId  track, fill;
-        float fraction {};
-        Option<PointerKey> pointer;
-    };
-    UiSession& session_;
-    UiId       content_, scroll_, name_, details_, scene_, camera_, animation_, play_, loop_, time_,
-        camera_time_, camera_play_, camera_loop_, camera_interval_, camera_save_, light_,
-        background_, debug_, status_;
-    Timeline               animation_timeline_, camera_timeline_;
-    Vec<Command>           commands_;
-    Vec<Binding>           click_bindings_;
-    static constexpr Color text { 0.82, 0.86, 0.9, 1 }, muted { 0.42, 0.5, 0.57, 1 };
-    NodeStyle              box(double x, double y, double width, double height) {
-        return NodeStyleBuilder{}.width(width).height(height).transform({ 1, 0, 0, 1, x, y }).build();
-    }
-    UiId label(UiId     parent,
-               ref<str> value,
-               double   x,
-               double   y,
-               double   size  = 14,
-               Color    color = text,
-               bool     bold  = false,
-               double   width = 216) {
-        auto& ui               = session_.document();
-        auto  style            = NodeStyleBuilder{box(x, y, width, 40)}.hit_test_visible(false).build();
-        auto id                = ui.append<Text>(parent, style).unwrap();
-        ui.set_text_format(id,
-                           TextFormatBuilder{}.family("Noto Sans CJK SC"_str)
-                               .language("zh"_str).size(size).bold(bold).build())
-            .unwrap();
-        ui.set_text(id, value).unwrap();
-        ui.set_text_color(id, color).unwrap();
-        return id;
-    }
-    UiId button(ref<str> value, double x, double y, double width, Action action) {
-        auto& ui = session_.document();
-        auto  id =
-            Button::create(
-                session_,
-                box(x, y, width, 34),
-                ButtonStyleBuilder{}.normal({ 0.055, 0.085, 0.11, 1 })
-                    .pressed({ 0.025, 0.12, 0.16, 1 })
-                    .focused({ 0.12, 0.3, 0.4, 1 }).radius(4).build())
-                .unwrap();
-        ui.attach(content_, id).unwrap();
-        auto caption = label(id, value, 10, 6, 14, text, false, width - 20);
-        ui.set_clip(caption, { true, { 0, 0, width - 20, 22 }, 0 }).unwrap();
-        click_bindings_.push(Button::on_clicked(ui, id, [this, action](auto&, const auto&) {
-                                 commands_.push({ action });
-                             }).unwrap());
-        return caption;
-    }
-    void caption(UiId id, String value) {
-        session_.document().set_text(id, value.as_str()).unwrap();
-    }
-    void timeline(Timeline& value, double y, Action action) {
-        auto& ui                    = session_.document();
-        auto  style                 = NodeStyleBuilder{box(16, y, 216, 20)}
-                                          .background({ 0.06, 0.09, 0.12, 1 })
-                                          .radius(3).focusable(true).build();
-        value.track                 = ui.append<Stack>(content_, style).unwrap();
-        auto fill_style             = NodeStyleBuilder{box(0, 0, 0, 20)}
-                                          .background({ 0.13, 0.36, 0.5, 1 })
-                                          .hit_test_visible(false).radius(3).build();
-        value.fill                  = ui.append<Rectangle>(value.track, fill_style).unwrap();
-        auto* target                = &value;
-        auto  seek                  = [this, target, action](auto& context, const auto& event) {
-            auto pointer = PointerKey { event.input.device, event.input.pointer };
-            if (event.input.type == EventType::PointerDown) {
-                if (event.input.button != PointerButton::Primary || target->pointer.is_some()) return;
-                context.capture_pointer().unwrap();
-                context.focus().unwrap();
-                target->pointer = Some(pointer);
-            } else if (target->pointer != Some(pointer) ||
-                       session_.input().captured(pointer.pointer, pointer.device) != Some(target->track))
-                return;
-            target->fraction = gltf::clamp(float(event.local.x / 216), 0, 1);
-            commands_.push({ action, target->fraction });
-            context.stop_propagation();
-            context.prevent_default();
-        };
-        session_.input().on(value.track, EventType::PointerDown, seek).unwrap();
-        session_.input().on(value.track, EventType::PointerMove, seek).unwrap();
-        session_.input()
-            .on(value.track,
-                EventType::PointerUp,
-                [this, target](auto& context, const auto& event) {
-                    auto pointer = PointerKey { event.input.device, event.input.pointer };
-                    if (target->pointer != Some(pointer) || event.input.button != PointerButton::Primary) return;
-                    target->pointer = None();
-                    if (session_.input().captured(pointer.pointer, pointer.device) == Some(target->track)) {
-                        context.release_pointer().unwrap();
-                        context.stop_propagation();
-                        context.prevent_default();
-                    }
-                })
-            .unwrap();
-        auto clear_pointer = [target](auto&, const auto& event) {
-            if (target->pointer == Some(PointerKey { event.input.device, event.input.pointer }))
-                target->pointer = None();
-        };
-        session_.input().on(value.track, EventType::PointerCancel, clear_pointer).unwrap();
-        session_.input().on(value.track, EventType::CaptureLost, clear_pointer).unwrap();
-        session_.input()
-            .on(value.track,
-                EventType::KeyDown,
-                [this, target, action](auto& context, const auto& event) {
-                    switch (event.input.key) {
-                    case Key::Home: target->fraction = 0; break;
-                    case Key::End: target->fraction = 1; break;
-                    case Key::Left:
-                        target->fraction = gltf::clamp(target->fraction - 0.01f, 0, 1);
-                        break;
-                    case Key::Right:
-                        target->fraction = gltf::clamp(target->fraction + 0.01f, 0, 1);
-                        break;
-                    default: return;
-                    }
-                    commands_.push({ action, target->fraction });
-                    context.stop_propagation();
-                    context.prevent_default();
-                })
-            .unwrap();
-        session_.input()
-            .on(value.track,
-                EventType::FocusGained,
-                [target](auto& context, const auto&) {
-                    context.document()
-                        .set_background(target->track, { 0.12, 0.3, 0.4, 1 }, 3)
-                        .unwrap();
-                })
-            .unwrap();
-        session_.input()
-            .on(value.track,
-                EventType::FocusLost,
-                [target](auto& context, const auto&) {
-                    context.document()
-                        .set_background(target->track, { 0.06, 0.09, 0.12, 1 }, 3)
-                        .unwrap();
-                })
-            .unwrap();
-    }
-    void progress(Timeline& value, float fraction) {
-        value.fraction = gltf::clamp(fraction, 0, 1);
-        session_.document()
-            .set_layout(value.fill,
-                        LayoutStyleBuilder{}.width(double(value.fraction) * 216).height(20).build())
-            .unwrap();
+namespace cx = vui::compose;
+
+enum class Caption
+{
+    Name,
+    Details,
+    Scene,
+    Camera,
+    Animation,
+    Play,
+    Loop,
+    Time,
+    CameraTime,
+    CameraPlay,
+    CameraLoop,
+    CameraInterval,
+    CameraSave,
+    Light,
+    Background,
+    Debug,
+    Status,
+    Count
+};
+struct CommandQueue {
+    Vec<Command> values;
+};
+
+auto panel_box(double x, double y, double width, double height) -> NodeStyle {
+    return NodeStyleBuilder {}.width(width).height(height).transform({ 1, 0, 0, 1, x, y }).build();
+}
+
+class Timeline {
+    EventRouter&               input_;
+    rstd::rc::Rc<CommandQueue> commands_;
+    Action                     action_;
+    float                      fraction_ {};
+    Option<PointerKey>         pointer_;
+    void                       seek(EventContext& context, float value) {
+        progress(context.document(), value);
+        commands_.get()->values.push(Command { action_, fraction_ });
+        context.stop_propagation();
+        context.prevent_default();
     }
 
 public:
-    ~Panel() {
-        for (auto& binding : click_bindings_) binding.disconnect();
+    cx::NodeRef fill;
+    Timeline(EventRouter& input, rstd::rc::Rc<CommandQueue> commands, Action action)
+        : input_(input), commands_(rstd::move(commands)), action_(action) {}
+    auto synchronize(UiDocument& document) -> Result<empty, UiError> {
+        auto id = fill.id();
+        if (id.is_err()) return Ok(empty {});
+        return document.set_layout(
+            id.unwrap(), LayoutStyleBuilder {}.width(double(fraction_) * 216).height(20).build());
     }
-    explicit Panel(UiSession& session, UiId root): session_(session) {
-        auto& ui         = session_.document();
-        content_         = ui.create<Stack>(box(0, 0, 248, 1106)).unwrap();
-        auto style       = NodeStyleBuilder{box(0, 0, 248, 720)}
-                               .background({ 0.018, 0.033, 0.05, 1 }).build();
-        scroll_          = ScrollView::create(session_, content_, style).unwrap();
-        ui.attach(root, scroll_).unwrap();
-        label(content_, "vecgltf"_str, 16, 14, 22, text, true);
-        name_    = label(content_, ""_str, 16, 53, 14, text, true);
-        details_ = label(content_, ""_str, 16, 98, 12, muted);
-        label(content_, "场景与视角"_str, 16, 141, 12, muted);
-        scene_  = button(""_str, 16, 166, 216, Action::Scene);
-        camera_ = button(""_str, 16, 208, 216, Action::Camera);
-        button("重新取景"_str, 16, 250, 216, Action::Fit);
-        label(content_, "相机轨迹"_str, 16, 303, 12, muted);
-        button("记录视角"_str, 16, 328, 104, Action::CameraRecord);
-        button("撤回末帧"_str, 128, 328, 104, Action::CameraRemove);
-        camera_time_ = label(content_, ""_str, 16, 372, 12, muted);
-        camera_play_ = button(""_str, 16, 420, 104, Action::CameraPlay);
-        camera_loop_ = button(""_str, 128, 420, 104, Action::CameraLoop);
-        timeline(camera_timeline_, 466, Action::CameraSeek);
-        button("−"_str, 16, 504, 40, Action::CameraIntervalDown);
-        button("+"_str, 192, 504, 40, Action::CameraIntervalUp);
-        camera_interval_ = label(content_, ""_str, 66, 512, 12, text, false, 120);
-        button("清空"_str, 16, 546, 104, Action::CameraClear);
-        camera_save_ = button(""_str, 128, 546, 104, Action::CameraSave);
-        label(content_, "模型动画"_str, 16, 591, 12, muted);
-        animation_ = button(""_str, 16, 616, 216, Action::Animation);
-        play_      = button(""_str, 16, 658, 104, Action::Play);
-        loop_      = button(""_str, 128, 658, 104, Action::Loop);
-        time_      = label(content_, ""_str, 16, 702, 12, muted);
-        timeline(animation_timeline_, 734, Action::Seek);
-        label(content_, "光照与材质"_str, 16, 776, 12, muted);
-        button("−"_str, 16, 802, 40, Action::ExposureDown);
-        button("+"_str, 192, 802, 40, Action::ExposureUp);
-        light_      = label(content_, ""_str, 66, 810, 14, text, false, 120);
-        background_ = button(""_str, 16, 844, 216, Action::Background);
-        debug_      = button(""_str, 16, 886, 216, Action::Debug);
-        button("重新加载模型"_str, 16, 936, 216, Action::Reload);
-        status_ = label(content_, ""_str, 16, 980, 12, { 0.88, 0.5, 0.28, 1 });
-        ui.set_layout(status_, LayoutStyleBuilder{}.width(216).height(56).build()).unwrap();
-        label(content_, "左键旋转，右键平移\n滚轮缩放，Home 取景"_str, 16, 1044, 12, muted);
+    void progress(UiDocument& document, float value) {
+        value = gltf::clamp(value, 0, 1);
+        if (fraction_ == value) return;
+        fraction_ = value;
+        synchronize(document).unwrap();
     }
-    void set_visible(bool value) { session_.document().set_visible(scroll_, value).unwrap(); }
-    void resize(double height) {
-        session_.document()
-            .set_layout(scroll_, LayoutStyleBuilder{}.width(248).height(height).build())
+    void handle(EventContext& context, const RoutedEvent& event) {
+        auto pointer = PointerKey { event.input.device, event.input.pointer };
+        switch (event.input.type) {
+        case EventType::PointerDown:
+            if (event.input.button != PointerButton::Primary || pointer_.is_some()) return;
+            context.capture_pointer().unwrap();
+            context.focus().unwrap();
+            pointer_ = Some(pointer);
+            seek(context, float(event.local.x / 216));
+            break;
+        case EventType::PointerMove:
+            if (pointer_ == Some(pointer) &&
+                input_.captured(pointer.pointer, pointer.device) == Some(UiId(event.current)))
+                seek(context, float(event.local.x / 216));
+            break;
+        case EventType::PointerUp:
+            if (pointer_ != Some(pointer) || event.input.button != PointerButton::Primary) return;
+            pointer_ = None();
+            if (input_.captured(pointer.pointer, pointer.device) == Some(UiId(event.current))) {
+                context.release_pointer().unwrap();
+                context.stop_propagation();
+                context.prevent_default();
+            }
+            break;
+        case EventType::PointerCancel:
+        case EventType::CaptureLost:
+            if (pointer_ == Some(pointer)) pointer_ = None();
+            break;
+        case EventType::KeyDown:
+            switch (event.input.key) {
+            case Key::Home: seek(context, 0); break;
+            case Key::End: seek(context, 1); break;
+            case Key::Left: seek(context, fraction_ - .01f); break;
+            case Key::Right: seek(context, fraction_ + .01f); break;
+            default: break;
+            }
+            break;
+        case EventType::FocusGained:
+            context.document().set_background(event.current, { .12, .3, .4, 1 }, 3).unwrap();
+            break;
+        case EventType::FocusLost:
+            context.document().set_background(event.current, { .06, .09, .12, 1 }, 3).unwrap();
+            break;
+        default: break;
+        }
+    }
+};
+struct TimelineBehavior {
+    rstd::rc::Rc<Timeline> controller;
+    void                   handle(EventContext& context, const RoutedEvent& event) {
+        controller.get()->handle(context, event);
+    }
+};
+struct TimelineElement {
+    rstd::rc::Rc<Timeline> controller;
+    auto prepare(cx::PrepareContext& context, Option<UiId> previous, NodeStyle style)
+        -> cx::ComposeResult<UiNodeRef> {
+        auto node = previous.is_some() ? context.edit().existing(*previous)
+                                       : context.edit().create(LayoutKind::Stack, style);
+        context.style(node, style);
+        if (previous.is_none()) context.edit().state(node, TimelineBehavior { controller });
+        context.behavior<TimelineBehavior>(node);
+        context.on_mount([controller = controller](cx::CommittedContext& context) mutable
+                             -> cx::ComposeResult<cx::EffectLease> {
+            auto result = controller.get()->synchronize(context.session().document());
+            if (result.is_err())
+                return Err(cx::ComposeError(cx::ComposeStage::Effect, Some(result.unwrap_err())));
+            return Ok(cx::EffectLease {});
+        });
+        return Ok(node);
+    }
+};
+struct CaptionTag {};
+struct PanelModel {
+    state::Graph               graph;
+    Vec<state::Cell<String>>   captions;
+    rstd::rc::Rc<CommandQueue> commands { rstd::rc::make_rc<CommandQueue>() };
+    rstd::rc::Rc<Timeline>     animation_timeline, camera_timeline;
+    double                     height { 720 };
+    static constexpr Color     text { .82, .86, .9, 1 }, muted { .42, .5, .57, 1 };
+
+    explicit PanelModel(EventRouter& input)
+        : animation_timeline(rstd::rc::make_rc<Timeline>(input, commands.clone(), Action::Seek)),
+          camera_timeline(
+              rstd::rc::make_rc<Timeline>(input, commands.clone(), Action::CameraSeek)) {
+        for (unsigned i {}; i < unsigned(Caption::Count); ++i)
+            captions.push(graph.cell(String::make()).unwrap());
+    }
+    static auto label(ref<str> value,
+                      double   x,
+                      double   y,
+                      double   size   = 14,
+                      Color    color  = text,
+                      bool     bold   = false,
+                      double   width  = 216,
+                      double   height = 40) -> cx::Element {
+        return cx::text(value)
+            .format(TextFormatBuilder {}
+                        .family("Noto Sans CJK SC"_str)
+                        .language("zh"_str)
+                        .size(size)
+                        .bold(bold)
+                        .build())
+            .color(color)
+            .style(NodeStyleBuilder { panel_box(x, y, width, height) }
+                       .hit_test_visible(false)
+                       .build());
+    }
+    auto label(Caption caption,
+               double  x,
+               double  y,
+               double  size    = 14,
+               Color   color   = text,
+               bool    bold    = false,
+               double  width   = 216,
+               double  height  = 40,
+               bool    clipped = false) const -> cx::Element {
+        auto value = captions[usize(unsigned(caption))].value();
+        return cx::component<CaptionTag>(
+            cx::Key { unsigned(caption) + 1 },
+            [value, x, y, size, color, bold, width, height, clipped](
+                cx::CompositionContext& scope) -> cx::ComposeResult<cx::Element> {
+                auto read = scope.read(value);
+                if (read.is_err()) return Err(read.unwrap_err());
+                auto result =
+                    label(read.unwrap().value().as_str(), x, y, size, color, bold, width, height);
+                if (clipped)
+                    result = result.style(NodeStyleBuilder { panel_box(x, y, width, height) }
+                                              .hit_test_visible(false)
+                                              .clip({ true, { 0, 0, width, 22 }, 0 })
+                                              .build());
+                return Ok(rstd::move(result));
+            });
+    }
+    auto button(cx::Element caption, double x, double y, double width, Action action) const
+        -> cx::Element {
+        return cx::button(
+                   rstd::move(caption),
+                   [commands = commands.clone(), action]() mutable {
+                       commands.get()->values.push(Command { action });
+                   },
+                   ButtonStyleBuilder {}
+                       .normal({ .055, .085, .11, 1 })
+                       .pressed({ .025, .12, .16, 1 })
+                       .focused({ .12, .3, .4, 1 })
+                       .radius(4)
+                       .build())
+            .style(panel_box(x, y, width, 34));
+    }
+    auto button(Caption caption, double x, double y, double width, Action action) const
+        -> cx::Element {
+        return button(
+            label(caption, 10, 6, 14, text, false, width - 20, 40, true), x, y, width, action);
+    }
+    auto button(ref<str> caption, double x, double y, double width, Action action) const
+        -> cx::Element {
+        auto content = label(caption, 10, 6, 14, text, false, width - 20)
+                           .style(NodeStyleBuilder { panel_box(10, 6, width - 20, 40) }
+                                      .hit_test_visible(false)
+                                      .clip({ true, { 0, 0, width - 20, 22 }, 0 })
+                                      .build());
+        return button(rstd::move(content), x, y, width, action);
+    }
+    static auto timeline(rstd::rc::Rc<Timeline> controller, double y, ref<str> key) -> cx::Element {
+        Vec<cx::Element> children;
+        children.push(cx::native(LayoutKind::Leaf)
+                          .style(NodeStyleBuilder { panel_box(0, 0, 0, 20) }
+                                     .background({ .13, .36, .5, 1 })
+                                     .hit_test_visible(false)
+                                     .radius(3)
+                                     .build())
+                          .reference(controller->fill));
+        return cx::element(TimelineElement { rstd::move(controller) }, rstd::move(children))
+            .style(NodeStyleBuilder { panel_box(16, y, 216, 20) }
+                       .background({ .06, .09, .12, 1 })
+                       .radius(3)
+                       .focusable(true)
+                       .build())
+            .key(cx::Key { key });
+    }
+    auto content() const -> cx::Element {
+        return cx::scroll_view(
+                   cx::stack(
+                       {
+                           label("vecgltf"_str, 16, 14, 22, text, true),
+                           label(Caption::Name, 16, 53, 14, text, true),
+                           label(Caption::Details, 16, 98, 12, muted),
+                           label("场景与视角"_str, 16, 141, 12, muted),
+                           button(Caption::Scene, 16, 166, 216, Action::Scene),
+                           button(Caption::Camera, 16, 208, 216, Action::Camera),
+                           button("重新取景"_str, 16, 250, 216, Action::Fit),
+                           label("相机轨迹"_str, 16, 303, 12, muted),
+                           button("记录视角"_str, 16, 328, 104, Action::CameraRecord),
+                           button("撤回末帧"_str, 128, 328, 104, Action::CameraRemove),
+                           label(Caption::CameraTime, 16, 372, 12, muted),
+                           button(Caption::CameraPlay, 16, 420, 104, Action::CameraPlay),
+                           button(Caption::CameraLoop, 128, 420, 104, Action::CameraLoop),
+                           timeline(camera_timeline.clone(), 466, "camera-timeline"_str),
+                           button("−"_str, 16, 504, 40, Action::CameraIntervalDown),
+                           button("+"_str, 192, 504, 40, Action::CameraIntervalUp),
+                           label(Caption::CameraInterval, 66, 512, 12, text, false, 120),
+                           button("清空"_str, 16, 546, 104, Action::CameraClear),
+                           button(Caption::CameraSave, 128, 546, 104, Action::CameraSave),
+                           label("模型动画"_str, 16, 591, 12, muted),
+                           button(Caption::Animation, 16, 616, 216, Action::Animation),
+                           button(Caption::Play, 16, 658, 104, Action::Play),
+                           button(Caption::Loop, 128, 658, 104, Action::Loop),
+                           label(Caption::Time, 16, 702, 12, muted),
+                           timeline(animation_timeline.clone(), 734, "animation-timeline"_str),
+                           label("光照与材质"_str, 16, 776, 12, muted),
+                           button("−"_str, 16, 802, 40, Action::ExposureDown),
+                           button("+"_str, 192, 802, 40, Action::ExposureUp),
+                           label(Caption::Light, 66, 810, 14, text, false, 120),
+                           button(Caption::Background, 16, 844, 216, Action::Background),
+                           button(Caption::Debug, 16, 886, 216, Action::Debug),
+                           button("重新加载模型"_str, 16, 936, 216, Action::Reload),
+                           label(Caption::Status, 16, 980, 12, { .88, .5, .28, 1 }, false, 216, 56),
+                           label(
+                               "左键旋转，右键平移\n滚轮缩放，Home 取景"_str, 16, 1044, 12, muted),
+                       })
+                       .style(panel_box(0, 0, 248, 1106)))
+            .style(NodeStyleBuilder { panel_box(0, 0, 248, height) }
+                       .background({ .018, .033, .05, 1 })
+                       .build());
+    }
+};
+
+class Panel {
+    UiSession&               session_;
+    UiId                     mount_;
+    rstd::rc::Rc<PanelModel> model_;
+    Option<cx::Composition>  composition_;
+    void                     caption(state::GraphUpdate& changes, Caption target, String value) {
+        changes.set(model_->captions[usize(unsigned(target))], rstd::move(value)).unwrap();
+    }
+
+public:
+    explicit Panel(UiSession& session, UiId root)
+        : session_(session), model_(rstd::rc::make_rc<PanelModel>(session.input())) {
+        mount_       = session_.document().append<Stack>(root, panel_box(0, 0, 248, 720)).unwrap();
+        composition_ = Some(cx::Composition::create(session_, mount_).unwrap());
+        composition_
+            ->set_content([model = model_.clone()](
+                              cx::CompositionContext&) -> cx::ComposeResult<cx::Element> {
+                return Ok(model->content());
+            })
             .unwrap();
     }
-    auto take_commands() -> Vec<Command> { return rstd::exchange(commands_, Vec<Command> {}); }
+    void set_visible(bool value) { session_.document().set_visible(mount_, value).unwrap(); }
+    void resize(double height) {
+        if (model_->height == height) return;
+        session_.document()
+            .set_layout(mount_, LayoutStyleBuilder {}.width(248).height(height).build())
+            .unwrap();
+        model_.get()->height = height;
+        composition_->invalidate();
+    }
+    auto take_commands() -> Vec<Command> {
+        return rstd::exchange(model_.get()->commands.get()->values, Vec<Command> {});
+    }
+    auto check() -> bool {
+        auto diagnostics = composition_->take_diagnostics();
+        auto ok          = true;
+        auto report      = [&](const cx::ComposeError& error) {
+            auto file = rstd::ffi::CStr::from_ptr(error.source.file_name()).to_str().unwrap();
+            rstd::io::eprintln("viewer composition stage={} operation={} path={} at={}:{}",
+                               unsigned(error.stage),
+                               error.operation.as_str(),
+                               error.path.as_str(),
+                               file,
+                               error.source.line());
+            ok = false;
+        };
+        for (const auto& error : diagnostics.entries) report(error);
+        if (diagnostics.omitted)
+            rstd::io::eprintln("viewer composition omitted {} diagnostics", diagnostics.omitted);
+        if (diagnostics.entries.is_empty()) {
+            auto result = composition_->last_result();
+            if (result.is_some() && result->is_err()) report(result->unwrap_err());
+        }
+        return ok;
+    }
     void update(const gltf::SceneInstance& instance,
                 unsigned                   camera,
                 bool                       looping,
                 const gltf::RenderOptions& options,
                 ref<str>                   status,
                 const CameraTrackStatus&   camera_track = {}) {
-        const auto& asset = instance.asset();
-        auto        path  = rstd::path::PathBuf::from(asset.source.as_str());
-        auto        name  = path.as_path().file_name();
-        caption(name_,
+        auto        changes = state::begin_update(model_->graph.view()).unwrap();
+        const auto& asset   = instance.asset();
+        auto        path    = rstd::path::PathBuf::from(asset.source.as_str());
+        auto        name    = path.as_path().file_name();
+        caption(changes,
+                Caption::Name,
                 name.is_some() && name->to_str().is_some() ? String::make(*name->to_str())
                                                            : asset.source.clone());
-        caption(details_,
+        caption(changes,
+                Caption::Details,
                 rstd::format("{} 个节点 / {} 个 mesh\n{} 个材质 / {} 段动画",
                              gltf::count(asset.nodes),
                              gltf::count(asset.meshes),
                              gltf::count(asset.materials),
                              gltf::count(asset.animations)));
         const auto& scene = gltf::at(asset.scenes, instance.scene());
-        caption(scene_,
+        caption(changes,
+                Caption::Scene,
                 scene.name.is_empty() ? rstd::format("场景 {}", instance.scene())
                                       : rstd::format("场景 {}：{}", instance.scene(), scene.name));
-        caption(camera_,
+        caption(changes,
+                Caption::Camera,
                 camera_track.active             ? "相机轨迹"_Str
                 : camera == gltf::invalid_index ? "轨道相机"_Str
                                                 : rstd::format("相机节点 {}", camera));
-        caption(camera_time_,
+        caption(changes,
+                Caption::CameraTime,
                 rstd::format("{} 帧  {:.2f} / {:.2f} 秒{}",
                              camera_track.keyframes,
                              f32(camera_track.time),
                              f32(camera_track.duration),
                              camera_track.keyframes < usize(2) ? "\n先记录两个视角"_str : ""_str));
-        caption(camera_play_, camera_track.playing ? "暂停轨迹"_Str : "播放轨迹"_Str);
-        caption(camera_loop_, camera_track.looping ? "循环：开"_Str : "循环：关"_Str);
-        caption(camera_interval_, rstd::format("追加间隔 {:.2f}秒", f32(camera_track.interval)));
-        caption(camera_save_, camera_track.dirty ? "保存轨迹 *"_Str : "保存轨迹"_Str);
-        progress(camera_timeline_,
-                 camera_track.duration > 0 ? camera_track.time / camera_track.duration : 0);
+        caption(
+            changes, Caption::CameraPlay, camera_track.playing ? "暂停轨迹"_Str : "播放轨迹"_Str);
+        caption(
+            changes, Caption::CameraLoop, camera_track.looping ? "循环：开"_Str : "循环：关"_Str);
+        caption(changes,
+                Caption::CameraInterval,
+                rstd::format("追加间隔 {:.2f}秒", f32(camera_track.interval)));
+        caption(
+            changes, Caption::CameraSave, camera_track.dirty ? "保存轨迹 *"_Str : "保存轨迹"_Str);
+        model_.get()->camera_timeline.get()->progress(
+            session_.document(),
+            camera_track.duration > 0 ? camera_track.time / camera_track.duration : 0);
         auto  animation = instance.animation();
         float fraction {}, duration {};
         if (animation == gltf::invalid_index)
-            caption(animation_, "不播放动画"_Str);
+            caption(changes, Caption::Animation, "不播放动画"_Str);
         else {
             const auto& clip = gltf::at(asset.animations, animation);
             duration         = clip.end - clip.start;
             fraction         = duration > 0 ? (instance.time() - clip.start) / duration : 0;
-            caption(animation_,
+            caption(changes,
+                    Caption::Animation,
                     clip.name.is_empty() ? rstd::format("动画 {}", animation)
                                          : rstd::format("{}：{}", animation, clip.name));
         }
-        caption(play_, instance.playing() ? "暂停"_Str : "播放"_Str);
-        caption(loop_, looping ? "循环：开"_Str : "循环：关"_Str);
-        caption(time_, rstd::format("{:.2f} / {:.2f} 秒", f32(instance.time()), f32(duration)));
-        progress(animation_timeline_, fraction);
-        caption(light_, rstd::format("曝光 {:.2f}", f32(options.exposure)));
-        caption(background_, options.background ? "环境背景：开"_Str : "环境背景：关"_Str);
+        caption(changes, Caption::Play, instance.playing() ? "暂停"_Str : "播放"_Str);
+        caption(changes, Caption::Loop, looping ? "循环：开"_Str : "循环：关"_Str);
+        caption(changes,
+                Caption::Time,
+                rstd::format("{:.2f} / {:.2f} 秒", f32(instance.time()), f32(duration)));
+        model_.get()->animation_timeline.get()->progress(session_.document(), fraction);
+        caption(changes, Caption::Light, rstd::format("曝光 {:.2f}", f32(options.exposure)));
+        caption(changes,
+                Caption::Background,
+                options.background ? "环境背景：开"_Str : "环境背景：关"_Str);
         ref<str> modes[] { "PBR"_str,    "Base color"_str, "法线"_str,
                            "金属度"_str, "粗糙度"_str,     "Emissive"_str };
-        caption(debug_, rstd::format("显示：{}", modes[unsigned(options.debug)]));
-        session_.document().set_text(status_, status).unwrap();
+        caption(changes, Caption::Debug, rstd::format("显示：{}", modes[unsigned(options.debug)]));
+        caption(changes, Caption::Status, String::make(status));
+        changes.commit().unwrap();
     }
 };
 } // namespace viewer
