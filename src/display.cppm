@@ -59,7 +59,7 @@ enum class DisplayEncoding
 struct DisplayTarget {
     vrento::texture::TextureViewRef color;
     vrento::vulkan::AttachmentLoad  load { vrento::vulkan::AttachmentLoad::Clear };
-    DisplayEncoding                encoding { DisplayEncoding::Attachment };
+    DisplayEncoding                 encoding { DisplayEncoding::Attachment };
 };
 struct DisplayStatistics {
     rstd::uint64_t recorded_frames {};
@@ -465,7 +465,7 @@ auto populate(Frame&                frame,
               const DisplayInput&   input,
               const DisplayTarget&  target,
               const DisplayOptions& options) -> Result<empty, Error> {
-    auto                values = parameters(options);
+    auto values       = parameters(options);
     values.vignette.w = target.encoding == DisplayEncoding::Srgb ? 1 : 0;
     tex::TextureViewRef levels[5];
     auto                coverage = input.coverage ? *input.coverage : input.color;
@@ -725,19 +725,16 @@ public:
         auto frame     = Arc<Frame>::make(core_.clone(), work.receipt());
         auto populated = populate(*frame, source, target, options);
         if (populated.is_err()) return Err(populated.unwrap_err());
-        Shape                    shape;
-        vk::GraphBindings        bindings(1);
-        Vec<tex::TextureViewRef> references;
-        auto                     bind = [&](tex::TextureViewRef view, bool imported) -> unsigned {
+        Shape                           shape;
+        Vec<Arc<dyn<vk::GraphBinding>>> binding_sources;
+        Vec<tex::TextureViewRef>        references;
+        auto bind = [&](tex::TextureViewRef view, bool imported) -> unsigned {
             for (usize i {}; i < references.len(); ++i)
                 if (references[i].texture().identity() == view.texture().identity() &&
                     references[i].description() == view.description())
                     return unsigned(i.to_primitive());
             unsigned index = unsigned(references.len().to_primitive());
-            bindings
-                .bind({ index + 1, 1 },
-                      Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view)))
-                .unwrap();
+            binding_sources.push(Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view)));
             shape.textures.push({ view.texture().description(), view.description(), imported });
             references.push(rstd::move(view));
             return index;
@@ -785,11 +782,8 @@ public:
             if (descriptor.is_err())
                 return Err(cause("display descriptor"_str, descriptor.unwrap_err()));
             stage.descriptor = Some(descriptor.unwrap());
-            bindings
-                .bind({ references.len().to_primitive() + i.to_primitive() + 1, 1 },
-                      Arc<dyn<vk::GraphBinding>>::make(vk::GraphUploadedBufferBinding(
-                          core_->session, stage.parameters->clone())))
-                .unwrap();
+            binding_sources.push(Arc<dyn<vk::GraphBinding>>::make(
+                vk::GraphUploadedBufferBinding(core_->session, stage.parameters->clone())));
         }
         const auto&               dispatch = core_->session.device().handle().Dispatch();
         vvk::CommandBuffer        command(native.unwrap(), dispatch);
@@ -890,7 +884,20 @@ public:
             if (*continued == vk::CompileProgress::Pending)
                 return Err(error("display pass"_str, "prewarmed pipeline unavailable"_str));
         }
-        auto                      compiled = compiler_->compiled().unwrap();
+        auto compiled = compiler_->compiled().unwrap();
+        auto bindings = compiled.make_bindings();
+        auto versions = compiled.description().binding_layout().versions();
+        for (usize i {}; i < versions.len(); ++i) {
+            const auto& version = versions[i];
+            if (! version.used) continue;
+            auto id = version.version.resource;
+            if (! id.valid() || id.value > binding_sources.len().to_primitive())
+                return Err(graph_error(vk::GraphExecutionError {
+                    vk::GraphExecutionStage::Binding, version.first_pass, id }));
+            auto bound = bindings.bind({ vrento::fg::Index(i.to_primitive()) },
+                                       binding_sources[usize(id.value - 1)].clone());
+            if (bound.is_err()) return Err(graph_error(bound.unwrap_err()));
+        }
         Vec<vk::PassFrameBinding> frames;
         for (usize i {}; i < frame->stages.len(); ++i) {
             auto input = compiled.frame<Pass>(
@@ -901,7 +908,7 @@ public:
             frames.push(input.unwrap());
         }
         auto prepared =
-            compiled.instantiate(bindings,
+            compiled.instantiate(rstd::move(bindings),
                                  frames.as_slice(),
                                  Box<dyn<vk::GraphicsScopeBackend>>::make(Scopes { core_.clone() }),
                                  true,

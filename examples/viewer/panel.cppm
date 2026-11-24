@@ -167,7 +167,7 @@ struct TimelineBehavior {
         if (progress.is_err()) return Err(UiError::PaintFailed);
         auto& paint = context.paint();
         auto  size  = paint.size();
-        paint.rect(
+        paint.canvas().rect(
             { 0, 0, size.width * progress.unwrap().value(), size.height }, { .13, .36, .5, 1 }, 3);
         return Ok(empty {});
     }

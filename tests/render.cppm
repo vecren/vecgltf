@@ -48,6 +48,13 @@ Arc<Asset> triangle(Vec4 color = { 1, 0, 0, 1 }, bool reverse = false) {
 void near(unsigned actual, unsigned expected) {
     rstd_assert(actual + 2 >= expected && actual <= expected + 2);
 }
+auto timeline_signal(const vrento::vulkan::DeviceSession& session) -> PFN_vkSignalSemaphore {
+    auto& device = session.device().handle();
+    auto  load   = device.Dispatch().vkGetDeviceProcAddr;
+    auto  signal = load(*device, "vkSignalSemaphore");
+    return reinterpret_cast<PFN_vkSignalSemaphore>(signal ? signal
+                                                          : load(*device, "vkSignalSemaphoreKHR"));
+}
 
 auto read_pixels(vrento::vulkan::DeviceSession   session,
                  vrento::vulkan::TextureContext& queue,
@@ -175,7 +182,7 @@ TEST(Render, PreparationTimings) {
         auto session  = vk::DeviceSession::create().unwrap();
         auto renderer = Renderer::create(session, { 64, 64 }).unwrap();
         auto stats    = session.graphics_resources().pipelines.stats();
-        rstd_assert(stats.creations == u64(7) && stats.peak_entries == usize(7));
+        rstd_assert(stats.creations == u64(9) && stats.peak_entries == usize(9));
         cold += stats.creation_nanoseconds.to_primitive() / 1e6;
         auto encoded =
             session.graphics_resources().pipelines.driver_cache().encode(session.device()).unwrap();
@@ -183,7 +190,7 @@ TEST(Render, PreparationTimings) {
             vk::DeviceSession::create({ .pipeline_cache_data = encoded.as_slice() }).unwrap();
         auto warmed       = Renderer::create(loaded, { 64, 64 }).unwrap();
         auto warmed_stats = loaded.graphics_resources().pipelines.stats();
-        rstd_assert(warmed_stats.creations == u64(7));
+        rstd_assert(warmed_stats.creations == u64(9));
         warm += warmed_stats.creation_nanoseconds.to_primitive() / 1e6;
         auto                         queue = vk::TextureContext::create(loaded).unwrap();
         vrento::texture::TextureDesc desc;
@@ -208,11 +215,11 @@ TEST(Render, PreparationTimings) {
             rstd::thread::sleep(rstd::time::Duration::from_millis(u64(1)));
         }
         asynchronous += started.elapsed().as_secs_f64() * 1000;
-        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(7));
+        rstd_assert(deferred.graphics_resources().pipelines.stats().creations == u64(9));
     }
-    std::printf("model pipelines: %u samples, 7 recipes; empty driver native "
+    std::printf("model pipelines: %u samples, 9 recipes; empty driver native "
                 "preparation %.3f ms; loaded driver %.3f ms; %u target queries "
-                "%.3f ms; deferred init and ready %.3f ms; peak entries 7\n",
+                "%.3f ms; deferred init and ready %.3f ms; peak entries 9\n",
                 samples,
                 cold / samples,
                 warm / samples,
@@ -377,9 +384,7 @@ TEST(Render, QueuedDynamicInputs) {
     auto uploaded = renderer.upload_statistics();
     rstd_assert(uploaded.recorded_copies[0] == baseline.recorded_copies[0]);
     rstd_assert(uploaded.recorded_copies[1] == baseline.recorded_copies[1]);
-    auto signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
-        session.device().handle().Dispatch().vkGetDeviceProcAddr(*session.device().handle(),
-                                                                 "vkSignalSemaphoreKHR"));
+    auto                  signal = timeline_signal(session);
     VkSemaphoreSignalInfo release { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
     release.semaphore = handle;
     release.value     = 1;
@@ -443,8 +448,8 @@ TEST(Render, SharedDepth) {
         vui::gpu::Renderer ui;
         ui.initialize(session, false).unwrap();
         vui::UiSession document;
-        auto style = vui::NodeStyleBuilder{}.width(16).height(16)
-                         .background({ 0, 0.5f, 0, 0.5f }).build();
+        auto           style =
+            vui::NodeStyleBuilder {}.width(16).height(16).background({ 0, 0.5f, 0, 0.5f }).build();
         auto node = document.document().create<vui::Rectangle>(style).unwrap();
         document.document().mount(node).unwrap();
         document.advance({}, { 1, {} }, { { 64, 64 }, 1, 1 }).unwrap();
@@ -1089,9 +1094,7 @@ TEST(Render, DepthEncoding) {
         record(destination, back_gpu, back_scene);
         record(destination, overlay_gpu, overlay_scene);
     }
-    auto signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
-        session.device().handle().Dispatch().vkGetDeviceProcAddr(*session.device().handle(),
-                                                                 "vkSignalSemaphoreKHR"));
+    auto                  signal = timeline_signal(session);
     VkSemaphoreSignalInfo release { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
     release.semaphore = handle;
     release.value     = 1;
@@ -1257,9 +1260,9 @@ TEST(Render, Integration) {
     rstd::uint64_t output_version {};
     auto           source = vui::ContentSource::create(19).unwrap();
     vui::UiSession document;
-    auto style = vui::NodeStyleBuilder{}.width(64).height(64).build();
-    auto root     = document.document().create<vui::Stack>(style).unwrap();
-    auto viewport = document.document().append<vui::SceneViewport>(root, style).unwrap();
+    auto           style    = vui::NodeStyleBuilder {}.width(64).height(64).build();
+    auto           root     = document.document().create<vui::Stack>(style).unwrap();
+    auto           viewport = document.document().append<vui::SceneViewport>(root, style).unwrap();
     document.document().set_scene_source(viewport, Some(vui::ContentSource(source))).unwrap();
     document.document()
         .set_scene_presentation(viewport, vui::ImageFit::Fill, vui::ImageSampling::Nearest)

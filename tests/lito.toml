@@ -4,10 +4,6 @@ authors = ["hypengw <hypengwip@gmail.com>"]
 source-root = ".."
 autoexamples = false
 
-[profile.base]
-exceptions = false
-rtti = false
-
 [dependencies]
 vecgltf = { path = ".." }
 rstd-test = { version = "0.1.5" }

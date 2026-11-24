@@ -2043,7 +2043,7 @@ private:
             coverage_pass->id   = { 2 };
             coverage_pass->kind = model_kind;
         }
-        vk::GraphBindings                    bindings(1);
+        Vec<Arc<dyn<vk::GraphBinding>>>      binding_sources;
         Vec<vrento::texture::TextureViewRef> references;
         auto                                 bind = [&](vrento::texture::TextureViewRef view) {
             for (usize i {}; i < references.len(); ++i)
@@ -2053,7 +2053,7 @@ private:
             vrento::vulkan::ResourceId id { references.len().to_primitive() + 1, 1 };
             auto binding = Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view));
             auto info    = binding->Info();
-            bindings.bind(id, rstd::move(binding)).unwrap();
+            binding_sources.push(rstd::move(binding));
             const auto& desc   = view.texture().description();
             const auto  range  = view.description().range;
             const auto  extent = vrento::texture::mip_extent(desc, range.first_mip);
@@ -2196,11 +2196,8 @@ private:
             if (! id.value) {
                 id = { next_binding++, 1 };
                 allocations.push({ allocation.identity(), id });
-                bindings
-                    .bind(id,
-                          Arc<dyn<vk::GraphBinding>>::make(
-                              vk::GraphUploadedBufferBinding(core_->session, allocation.clone())))
-                    .unwrap();
+                binding_sources.push(Arc<dyn<vk::GraphBinding>>::make(
+                    vk::GraphUploadedBufferBinding(core_->session, allocation.clone())));
                 shape.resources.push({ id, vrento::fg::ResourceKind::Buffer, allocation.size() });
             }
             for (const auto& use : execution.uses)
@@ -2363,7 +2360,20 @@ private:
             if (*continued == vk::CompileProgress::Pending)
                 return Err(render_error("model pass"_str, "prewarmed pipeline unavailable"_str));
         }
-        auto compiled      = compiler_->compiled().unwrap();
+        auto compiled = compiler_->compiled().unwrap();
+        auto bindings = compiled.make_bindings();
+        auto versions = compiled.description().binding_layout().versions();
+        for (usize i {}; i < versions.len(); ++i) {
+            const auto& version = versions[i];
+            if (! version.used) continue;
+            auto id = version.version.resource;
+            if (! id.valid() || id.value > binding_sources.len().to_primitive())
+                return Err(graph_error(vk::GraphExecutionError {
+                    vk::GraphExecutionStage::Binding, version.first_pass, id }));
+            auto bound = bindings.bind({ vrento::fg::Index(i.to_primitive()) },
+                                       binding_sources[usize(id.value - 1)].clone());
+            if (bound.is_err()) return Err(graph_error(bound.unwrap_err()));
+        }
         auto shared_draws  = inputs.draws.clone();
         auto frame_binding = compiled.frame<ModelPass>({ 1 }, 1, rstd::move(inputs));
         if (frame_binding.is_err()) return Err(graph_error(frame_binding.unwrap_err()));
@@ -2385,7 +2395,7 @@ private:
             frames.push(coverage_binding.unwrap());
         }
         auto prepared_frame = compiled.instantiate(
-            bindings,
+            rstd::move(bindings),
             frames.as_slice(),
             Box<dyn<vk::GraphicsScopeBackend>>::make(ModelScopes { core_.clone() }),
             true,
