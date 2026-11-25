@@ -34,7 +34,7 @@ public:
         return range(DocumentBytes(rstd::move(owner)), offset, length);
     }
     auto bytes() const -> slice<u8> {
-        return slice<u8>::from_raw_parts(owner_->begin() + offset_.to_primitive(), length_);
+        return slice<u8>::from_raw_parts(owner_->data() + offset_.to_primitive(), length_);
     }
     auto owner() const -> DocumentBytes { return owner_.clone(); }
     auto subrange(usize offset, usize length) const -> Option<ResourceBytes> {

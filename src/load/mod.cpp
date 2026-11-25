@@ -70,21 +70,14 @@ struct AssetBuilder {
     auto accessor(unsigned index) const -> const document::Accessor* {
         return index < count(data.accessors) ? &at(data.accessors, index) : nullptr;
     }
-    auto floats(const document::Accessor* value, unsigned components, String location) const
-        -> Result<Vec<float>, Error> {
-        if (! value)
-            return Err(error(ErrorKind::InvalidAsset, rstd::move(location), "missing accessor"));
-        return reader.Floats(
-            unsigned(value - data.accessors.begin()), components, location.as_str());
-    }
-    auto attribute(const Vec<document::Attribute>& attributes,
-                   AttributeType                   type,
-                   unsigned                        set = 0) const -> const document::Accessor* {
+    static auto attribute_index(const Vec<document::Attribute>& attributes,
+                                AttributeType                   type,
+                                unsigned                        set = 0) -> unsigned {
         for (const auto& input : attributes) {
             auto semantic = attribute_semantic(input.name.as_str());
-            if (semantic.type == type && semantic.index == set) return accessor(input.accessor);
+            if (semantic.type == type && semantic.index == set) return input.accessor;
         }
-        return nullptr;
+        return invalid_index;
     }
     auto materials() -> Result<empty, Error> {
         LoadScope scope(options.trace, LoadEvent::Materials);
@@ -205,7 +198,7 @@ struct AssetBuilder {
             return Err(error(ErrorKind::Unsupported,
                              rstd::move(location),
                              "only triangle topologies are supported"));
-        const auto* position = attribute(input.attributes, AttributeType::Position);
+        const auto* position = accessor(attribute_index(input.attributes, AttributeType::Position));
         if (! position || position->count.to_primitive() >
                               options.max_vertices.to_primitive() - vertices.to_primitive())
             return Err(error(ErrorKind::Limit,
@@ -234,7 +227,7 @@ struct AssetBuilder {
         };
         for (const auto* binding : bindings)
             if (binding->texture != invalid_index &&
-                ! attribute(input.attributes, AttributeType::Texcoord, binding->uv))
+                ! accessor(attribute_index(input.attributes, AttributeType::Texcoord, binding->uv)))
                 return Err(error(ErrorKind::InvalidAsset,
                                  rstd::format("{}.attributes.TEXCOORD_{}", location, binding->uv),
                                  "material references a missing texcoord set"));
@@ -285,7 +278,7 @@ struct AssetBuilder {
                         error(ErrorKind::InvalidAsset, location.clone(), "texcoord must be VEC2"));
                 if (semantic.index > 1) {
                     if (! uses_texcoord(unsigned(semantic.index))) continue;
-                    auto values = floats(description, 2, location.clone());
+                    auto values = reader.Floats(attr.accessor, 2, location.as_str());
                     if (values.is_err()) return Err(values.unwrap_err());
                     auto        unpacked = values.unwrap();
                     TexcoordSet stream;
@@ -301,12 +294,12 @@ struct AssetBuilder {
                 (semantic.index != 0 && semantic.type != AttributeType::Texcoord))
                 return Err(
                     error(ErrorKind::Unsupported, location.clone(), "unsupported attribute set"));
-            auto values = floats(description, components, location.clone());
+            auto values = reader.Floats(attr.accessor, components, location.as_str());
             if (values.is_err()) return Err(values.unwrap_err());
             auto unpacked = values.unwrap();
             for (rstd::size_t v = 0; v < position->count.to_primitive(); ++v) {
                 auto&        vertex = at(result.vertices, v);
-                const float* f      = unpacked.begin() + v * components;
+                const float* f      = unpacked.data() + v * components;
                 switch (semantic.type) {
                 case AttributeType::Position:
                     if (components != 3)
@@ -425,14 +418,16 @@ struct AssetBuilder {
                                     AttributeType::Tangent };
             for (unsigned k = 0; k < 3; ++k) {
                 outputs[k]->resize(usize(position->count.to_primitive()), Vec3 {});
-                auto accessor = attribute(src.attributes, types[k]);
-                if (! accessor) continue;
-                if (accessor->count.to_primitive() != position->count.to_primitive() ||
-                    accessor->shape != document::Shape::Vec3 || accessor->component_type != 5126)
+                const auto  index       = attribute_index(src.attributes, types[k]);
+                const auto* description = accessor(index);
+                if (! description) continue;
+                if (description->count.to_primitive() != position->count.to_primitive() ||
+                    description->shape != document::Shape::Vec3 ||
+                    description->component_type != 5126)
                     return Err(error(ErrorKind::InvalidAsset,
                                      location.clone(),
                                      "morph requires matching FLOAT VEC3 accessor"));
-                auto read = floats(accessor, 3, location.clone());
+                auto read = reader.Floats(index, 3, location.as_str());
                 if (read.is_err()) return Err(read.unwrap_err());
                 auto values = read.unwrap();
                 for (rstd::size_t v = 0; v < position->count.to_primitive(); ++v)
@@ -617,7 +612,8 @@ struct AssetBuilder {
                     return Err(error(ErrorKind::InvalidAsset,
                                      rstd::format("skins[{}]", i),
                                      "invalid inverse bind accessor"));
-                auto decoded = floats(values, 16, rstd::format("skins[{}]", i));
+                auto decoded =
+                    reader.Floats(input.inverse_bind, 16, rstd::format("skins[{}]", i).as_str());
                 if (decoded.is_err()) return Err(decoded.unwrap_err());
                 auto unpacked = decoded.unwrap();
                 for (unsigned j = 0; j < count(skin.joints); ++j)
@@ -673,11 +669,14 @@ struct AssetBuilder {
                     return Err(error(ErrorKind::InvalidAsset,
                                      rstd::format("animations[{}].samplers[{}]", i, s),
                                      "invalid animation accessor"));
-                auto times = floats(
-                    input_accessor, 1, rstd::format("animations[{}].samplers[{}].input", i, s));
-                auto values = floats(output_accessor,
-                                     document::components(output_accessor->shape),
-                                     rstd::format("animations[{}].samplers[{}].output", i, s));
+                auto times =
+                    reader.Floats(sampler.input,
+                                  1,
+                                  rstd::format("animations[{}].samplers[{}].input", i, s).as_str());
+                auto values = reader.Floats(
+                    sampler.output,
+                    document::components(output_accessor->shape),
+                    rstd::format("animations[{}].samplers[{}].output", i, s).as_str());
                 if (times.is_err()) return Err(times.unwrap_err());
                 if (values.is_err()) return Err(values.unwrap_err());
                 output.times  = times.unwrap();
